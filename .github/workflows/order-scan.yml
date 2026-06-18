@@ -1,0 +1,62 @@
+name: Weekly order scan
+
+on:
+  schedule:
+    # 06:00 UTC Sunday — deliberately far from the daily cron (14:00 UTC) so the
+    # two never overlap on a wardrobe.json read-modify-write. See concurrency
+    # note in HANDOFF_TRACK_A_WEEKLY_SCAN.md. GitHub Actions cron is UTC-only.
+    - cron: "0 6 * * 0"
+  workflow_dispatch:          # manual trigger for testing from the Actions tab
+
+# Belt-and-suspenders on top of the off-peak slot: never let two order scans
+# (a scheduled run and a manual dispatch) write wardrobe.json at once.
+concurrency:
+  group: order-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Run order scan (headless)
+        env:
+          WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}
+          # order_scan never sends email, but load_config() validates one shared
+          # _REQUIRED set for every command, so these three must be present or it
+          # raises ConfigError before the scan starts. They already exist as repo
+          # secrets (the daily cron uses them); the scan just doesn't read them.
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          # GitHub Actions auto-provides a GITHUB_TOKEN with REPO scope only —
+          # no gist scope. We override it with the gist-scoped PAT stored under
+          # GIST_TOKEN so state.py can PATCH the Gist (same swap as daily.yml).
+          GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          # Shops whose purchases are kept out of the wardrobe entirely. This
+          # headless scan is where it matters most: the ingestion guard skips
+          # excluded order/ship emails and _drop_excluded_items hard-deletes any
+          # already-stored items. A repo secret alone does nothing unless mapped
+          # here. Blank/unset → nothing excluded (default). See CLAUDE.md.
+          EXCLUDED_SHOPS: ${{ secrets.EXCLUDED_SHOPS }}
+        # --scan-only = scan + persist, skip the interactive questionary prompts
+        # (the only headless-safe mode). It writes prices/aliases/codes/wardrobe;
+        # the Gist PATCH leaves all other state files untouched. Do NOT add
+        # --shop / --max-emails here (the historical "burn" bug); a full
+        # incremental scan over last_scanned_at is correct. Never set
+        # SALE_CHECK_DRY_RUN in production — we want the Gist write.
+        run: python -m src.order_scan --scan-only

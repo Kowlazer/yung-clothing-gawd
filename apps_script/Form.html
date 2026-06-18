@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <style>
+    :root { --fg:#222; --muted:#666; --line:#e5e5e5; --accent:#2563eb; --bg:#fff; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, system-ui, sans-serif; color: var(--fg);
+           max-width: 560px; margin: 0 auto; padding: 1.2em 1em 3em; background: var(--bg); }
+    h1 { font-size: 1.3em; margin: 0 0 .15em; }
+    .meta { color: var(--muted); font-size: .92em; margin-bottom: 1em; }
+    .card { border: 1px solid var(--line); border-radius: 10px; padding: .8em 1em; margin: 1em 0; }
+    .card h3 { margin: 0 0 .5em; font-size: .85em; text-transform: uppercase;
+               letter-spacing: .04em; color: var(--muted); }
+    label { display: block; font-weight: 600; margin: 1.1em 0 .35em; }
+    .hint { font-weight: 400; color: var(--muted); font-size: .85em; }
+    select, textarea, input[type=number] { width: 100%; padding: .55em; font-size: 1em;
+            border: 1px solid #ccc; border-radius: 8px; font-family: inherit; background: #fff; }
+    textarea { min-height: 3.2em; resize: vertical; }
+    .fit-opts { display: grid; grid-template-columns: 1fr; gap: .4em; }
+    .fit-opt { display: flex; align-items: center; gap: .6em; border: 1px solid #ccc;
+               border-radius: 8px; padding: .6em .7em; cursor: pointer; }
+    .fit-opt:hover { border-color: var(--accent); }
+    .fit-opt input { margin: 0; }
+    details { margin-top: .6em; }
+    summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: .6em; }
+    .bc { display: grid; grid-template-columns: 1fr 1fr; gap: .3em .8em; font-size: .92em; }
+    .bc b { font-weight: 600; }
+    button { background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+             padding: .75em 1.2em; font-size: 1em; font-weight: 600; cursor: pointer;
+             margin-top: 1.4em; width: 100%; }
+    button[disabled] { opacity: .55; cursor: default; }
+    a { color: var(--accent); }
+    ul.pending { list-style: none; padding: 0; }
+    ul.pending li { border: 1px solid var(--line); border-radius: 10px; padding: .7em .9em;
+                    margin: .6em 0; }
+    ul.pending a { font-weight: 600; text-decoration: none; }
+    .ok { color: #15803d; }
+    .err { color: #b91c1c; margin-top: 1em; }
+    .center { text-align: center; padding-top: 2em; }
+    button.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+    button.inline { width: auto; margin-top: 0; padding: .45em .9em; font-size: .9em; }
+    .btnrow { display: flex; gap: .5em; align-items: center; margin-top: .5em; flex-wrap: wrap; }
+    .docline { word-break: break-all; font-family: ui-monospace, monospace;
+               font-size: .88em; color: var(--muted); margin: .3em 0; }
+  </style>
+</head>
+<body>
+  <div id="root">Loading…</div>
+
+  <script>
+    var MODE = <?!= JSON.stringify(mode) ?>;
+    var DATA = <?!= dataJson ?>;
+
+    var FIT_OPTS = [
+      ['too_small', 'Too small / can’t wear'],
+      ['small',     'Runs small / snug'],
+      ['tts',       'True to size'],
+      ['large',     'Runs large / roomy'],
+      ['too_large', 'Too big']
+    ];
+    var AREAS = [
+      ['length',          'Length',            ['short', 'good', 'long']],
+      ['shoulders_chest', 'Shoulders / chest', ['tight', 'good', 'loose']],
+      ['sleeves',         'Sleeves (length)',  ['short', 'good', 'long']],
+      ['sleeve_opening',  'Sleeve opening',    ['tight', 'good', 'wide']],
+      ['waist_hips',      'Waist / hips',      ['tight', 'good', 'loose']],
+      ['inseam',          'Inseam',            ['short', 'good', 'long']]
+    ];
+    var NEXT_TIME = [
+      ['size_down', 'Size down next time'], ['same', 'Same size'],
+      ['size_up', 'Size up next time'], ['buy_again', 'Buy again (this size)'],
+      ['avoid', 'Avoid / don’t rebuy']
+    ];
+    var VERDICTS = [['keep', 'Keep'], ['return', 'Return'], ['tailor', 'Tailor']];
+
+    function el(tag, attrs, kids) {
+      var n = document.createElement(tag);
+      attrs = attrs || {};
+      for (var k in attrs) {
+        if (k === 'text') { n.textContent = attrs[k]; }
+        else if (k === 'html') { n.innerHTML = attrs[k]; }
+        else { n.setAttribute(k, attrs[k]); }
+      }
+      (kids || []).forEach(function (c) { if (c) n.appendChild(c); });
+      return n;
+    }
+
+    function selectFor(id, values, current) {
+      var s = el('select', { id: id });
+      s.appendChild(el('option', { value: '', text: '— skip —' }));
+      values.forEach(function (pair) {
+        var val = Array.isArray(pair) ? pair[0] : pair;
+        var lab = Array.isArray(pair) ? pair[1] : pair;
+        var o = el('option', { value: val, text: lab });
+        if (current === val) { o.setAttribute('selected', 'selected'); }
+        s.appendChild(o);
+      });
+      return s;
+    }
+
+    function kg2lb(kg) { return Math.round(kg * 2.2046226 * 10) / 10; }
+
+    // -- Mode: message ----------------------------------------------------
+    function renderMessage(root) {
+      root.appendChild(el('div', { class: 'center' }, [
+        el('h1', { text: DATA.title }),
+        el('p', { text: DATA.body }),
+        el('p', { html: '<a href="javascript:history.back()">Go back</a>' })
+      ]));
+    }
+
+    // -- Mode: review-all -------------------------------------------------
+    function renderAll(root) {
+      root.appendChild(el('h1', { text: 'Fit feedback' }));
+      var items = DATA.items || [];
+      if (!items.length) {
+        root.appendChild(el('p', { class: 'ok', text: 'Nothing pending — you’re all caught up.' }));
+        return;
+      }
+      root.appendChild(el('div', { class: 'meta', text: items.length + ' item(s) waiting for a review.' }));
+      var ul = el('ul', { class: 'pending' });
+      items.forEach(function (it) {
+        var sub = [it.shop, it.size ? ('size ' + it.size) : '', it.color]
+                    .filter(Boolean).join(' · ');
+        ul.appendChild(el('li', {}, [
+          el('a', { href: it.url, text: it.name }),
+          sub ? el('div', { class: 'meta', text: sub }) : null
+        ]));
+      });
+      root.appendChild(ul);
+    }
+
+    // -- Mode: item form --------------------------------------------------
+    function renderForm(root) {
+      var item = DATA.item;
+      var prior = item.fit_review || {};
+      root.appendChild(el('h1', { text: item.item_name }));
+      var meta = [item.shop, item.size ? ('size ' + item.size) : '', item.color,
+                  item.purchased_at ? ('bought ' + item.purchased_at) : '']
+                  .filter(Boolean).join(' · ');
+      root.appendChild(el('div', { class: 'meta', text: meta }));
+
+      // Body-comp summary (read-only context).
+      var bc = item.body_comp_summary;
+      if (bc && (bc.weight_kg != null || bc.body_fat_pct != null)) {
+        var grid = el('div', { class: 'bc' });
+        function add(lbl, val) {
+          if (val == null) return;
+          grid.appendChild(el('div', { html: '<b>' + lbl + '</b>' }));
+          grid.appendChild(el('div', { text: val }));
+        }
+        add('Weight', bc.weight_kg != null ? (bc.weight_kg + ' kg (' + kg2lb(bc.weight_kg) + ' lb)') : null);
+        add('Body fat', bc.body_fat_pct != null ? (bc.body_fat_pct + '%') : null);
+        add('Lean', bc.lean_mass_kg != null ? (bc.lean_mass_kg + ' kg') : null);
+        add('Fat', bc.fat_mass_kg != null ? (bc.fat_mass_kg + ' kg') : null);
+        var card = el('div', { class: 'card' }, [
+          el('h3', { text: 'Body comp for this review' }), grid,
+          el('div', { class: 'meta', text: 'Nearest DEXA scan' +
+            (bc.scan_date ? ' (' + bc.scan_date + ')' : '') +
+            ' — attached to this review automatically.' })
+        ]);
+        root.appendChild(card);
+      }
+
+      // Editable shop note.
+      if (item.shop) {
+        root.appendChild(el('label', { html: 'Notes for ' + item.shop +
+          ' <span class="hint">(sizing reminders for this shop — editable)</span>' }));
+        root.appendChild(el('textarea', { id: 'shop_note' }));
+        document.getElementById('shop_note').value = DATA.shop_note || '';
+      }
+
+      // Required overall fit.
+      root.appendChild(el('label', { html: 'Overall fit <span class="hint">(required)</span>' }));
+      var opts = el('div', { class: 'fit-opts' });
+      FIT_OPTS.forEach(function (pair) {
+        var id = 'fit_' + pair[0];
+        var radio = el('input', { type: 'radio', name: 'fit', value: pair[0], id: id });
+        if (prior.fit === pair[0]) { radio.setAttribute('checked', 'checked'); }
+        opts.appendChild(el('label', { class: 'fit-opt', 'for': id }, [
+          radio, el('span', { text: pair[1] })
+        ]));
+      });
+      root.appendChild(opts);
+
+      // Optional detail.
+      var priorAreas = prior.areas || {};
+      var det = el('details', prior.areas || prior.next_time || prior.verdict ? { open: 'open' } : {});
+      det.appendChild(el('summary', { text: 'Add detail (optional)' }));
+      AREAS.forEach(function (a) {
+        det.appendChild(el('label', { text: a[1] }));
+        det.appendChild(selectFor('area_' + a[0], a[2], priorAreas[a[0]]));
+      });
+      var rows = el('div', { class: 'row' });
+      var nt = el('div', {}, [el('label', { text: 'Next time' }),
+        selectFor('next_time', NEXT_TIME, prior.next_time)]);
+      var vd = el('div', {}, [el('label', { text: 'Verdict' }),
+        selectFor('verdict', VERDICTS, prior.verdict)]);
+      rows.appendChild(nt); rows.appendChild(vd);
+      det.appendChild(rows);
+      det.appendChild(el('label', { text: 'Inseam (inches)' }));
+      var inseam = el('input', { type: 'number', step: '0.5', id: 'inseam_inches' });
+      if (prior.inseam_inches != null) { inseam.value = prior.inseam_inches; }
+      det.appendChild(inseam);
+      root.appendChild(det);
+
+      // Free-text notes.
+      root.appendChild(el('label', { text: 'Notes' }));
+      var notes = el('textarea', { id: 'notes' });
+      if (prior.notes) { notes.value = prior.notes; }
+      root.appendChild(notes);
+
+      var btn = el('button', { id: 'submit', text: prior.fit ? 'Update fit review' : 'Save fit review' });
+      root.appendChild(btn);
+      var errBox = el('div', { class: 'err', id: 'err' });
+      root.appendChild(errBox);
+
+      btn.addEventListener('click', function () { submit(item, btn, errBox); });
+    }
+
+    function submit(item, btn, errBox) {
+      errBox.textContent = '';
+      var checked = document.querySelector('input[name=fit]:checked');
+      if (!checked) { errBox.textContent = 'Pick an overall fit first.'; return; }
+
+      var areas = {};
+      AREAS.forEach(function (a) {
+        var v = document.getElementById('area_' + a[0]).value;
+        if (v) { areas[a[0]] = v; }
+      });
+      var noteEl = document.getElementById('shop_note');
+      var payload = {
+        item: item.id,
+        sig: DATA.sig,
+        fit: checked.value,
+        areas: areas,
+        inseam_inches: document.getElementById('inseam_inches').value,
+        next_time: document.getElementById('next_time').value,
+        verdict: document.getElementById('verdict').value,
+        notes: document.getElementById('notes').value,
+        shop_note: noteEl ? noteEl.value : undefined
+      };
+
+      btn.disabled = true;
+      btn.textContent = 'Saving…';
+      google.script.run
+        .withSuccessHandler(function (res) {
+          var root = document.getElementById('root');
+          root.innerHTML = '';
+          root.appendChild(el('div', { class: 'center' }, [
+            el('h1', { class: 'ok', text: '✓ Saved' }),
+            el('p', { text: 'Fit feedback recorded for ' + res.item_name + '.' }),
+            el('p', { text: 'You can close this tab.' })
+          ]));
+        })
+        .withFailureHandler(function (err) {
+          btn.disabled = false;
+          btn.textContent = 'Save fit review';
+          errBox.textContent = (err && err.message) ? err.message : String(err);
+        })
+        .submitFitReview(payload);
+    }
+
+    // -- Watchlist removal: shared submit ---------------------------------
+    function doRemoval(itemId, sig, decision, btns, errBox, onDone) {
+      if (errBox) { errBox.textContent = ''; }
+      var saved = btns.map(function (b) { return b.textContent; });
+      btns.forEach(function (b) { b.disabled = true; b.textContent = 'Working…'; });
+      google.script.run
+        .withSuccessHandler(function (res) { onDone(res); })
+        .withFailureHandler(function (err) {
+          btns.forEach(function (b, i) { b.disabled = false; b.textContent = saved[i]; });
+          var msg = (err && err.message) ? err.message : String(err);
+          if (errBox) { errBox.textContent = msg; } else { alert(msg); }
+        })
+        .submitRemoval({ item: itemId, sig: sig, decision: decision });
+    }
+
+    function removalDoneText(res) {
+      if (res.decision === 'decline') { return 'Kept on the watchlist — won’t ask again.'; }
+      if (res.doc_status === 'removed') { return 'Removed from the watchlist Doc and marked as bought.'; }
+      if (res.doc_status === 'not_found') {
+        return 'Marked as bought. The Doc line wasn’t found (already removed?) — nothing to delete.';
+      }
+      if (res.doc_status === 'ambiguous') {
+        return 'Marked as bought, but the Doc had more than one identical line — remove it manually to be safe.';
+      }
+      return 'Done.';
+    }
+
+    // -- Mode: watchlist removal (single item) ----------------------------
+    function renderRemoval(root) {
+      var item = DATA.item;
+      root.appendChild(el('h1', { text: item.item_name }));
+      var meta = [item.shop, item.size ? ('size ' + item.size) : '', item.color,
+                  item.purchased_at ? ('bought ' + item.purchased_at) : '']
+                  .filter(Boolean).join(' · ');
+      if (meta) { root.appendChild(el('div', { class: 'meta', text: meta })); }
+
+      root.appendChild(el('div', { class: 'card' }, [
+        el('h3', { text: 'Listed in your watchlist Doc as' }),
+        el('div', { class: 'docline', text: item.matched_line || '(unknown line)' })
+      ]));
+      root.appendChild(el('p', { class: 'hint', text: 'Approving deletes this line ' +
+        'from the Doc and marks the item as bought. The item stays in your wardrobe record.' }));
+
+      var approve = el('button', { id: 'approve', text: 'Approve & remove from Doc' });
+      var decline = el('button', { id: 'decline', class: 'secondary', text: 'Keep on watchlist' });
+      var errBox = el('div', { class: 'err', id: 'err' });
+      root.appendChild(approve);
+      root.appendChild(decline);
+      root.appendChild(errBox);
+
+      function done(res) {
+        root.innerHTML = '';
+        root.appendChild(el('div', { class: 'center' }, [
+          el('h1', { class: 'ok', text: '✓ Done' }),
+          el('p', { text: removalDoneText(res) }),
+          el('p', { text: 'You can close this tab.' })
+        ]));
+      }
+      approve.addEventListener('click', function () {
+        doRemoval(item.id, DATA.sig, 'approve', [approve, decline], errBox, done);
+      });
+      decline.addEventListener('click', function () {
+        doRemoval(item.id, DATA.sig, 'decline', [approve, decline], errBox, done);
+      });
+    }
+
+    // -- Mode: watchlist removal review-all (act on each row in place) -----
+    function renderRemovalAll(root) {
+      root.appendChild(el('h1', { text: 'Remove from watchlist' }));
+      var items = DATA.items || [];
+      if (!items.length) {
+        root.appendChild(el('p', { class: 'ok', text: 'Nothing pending — your watchlist is up to date.' }));
+        return;
+      }
+      root.appendChild(el('div', { class: 'meta', text: items.length + ' purchased item(s) still listed.' }));
+      var ul = el('ul', { class: 'pending' });
+      items.forEach(function (it) {
+        var sub = [it.shop, it.size ? ('size ' + it.size) : '', it.color].filter(Boolean).join(' · ');
+        var status = el('span', { class: 'meta' });
+        var approve = el('button', { class: 'inline', text: 'Remove' });
+        var decline = el('button', { class: 'inline secondary', text: 'Keep' });
+        ul.appendChild(el('li', {}, [
+          el('div', {}, [el('strong', { text: it.name })]),
+          sub ? el('div', { class: 'meta', text: sub }) : null,
+          it.matched_line ? el('div', { class: 'docline', text: it.matched_line }) : null,
+          el('div', { class: 'btnrow' }, [approve, decline, status])
+        ]));
+        function resolve(text, cls) {
+          approve.parentNode.removeChild(approve);
+          decline.parentNode.removeChild(decline);
+          status.className = cls;
+          status.textContent = text;
+        }
+        approve.addEventListener('click', function () {
+          doRemoval(it.id, it.sig, 'approve', [approve, decline], null, function (res) {
+            var t = res.doc_status === 'removed' ? '✓ Removed from Doc'
+                  : res.doc_status === 'not_found' ? '✓ Bought (line not found)'
+                  : res.doc_status === 'ambiguous' ? '✓ Bought (remove line manually)'
+                  : '✓ Done';
+            resolve(t, 'ok');
+          });
+        });
+        decline.addEventListener('click', function () {
+          doRemoval(it.id, it.sig, 'decline', [approve, decline], null, function () {
+            resolve('Kept on watchlist', 'meta');
+          });
+        });
+      });
+      root.appendChild(ul);
+    }
+
+    (function main() {
+      var root = document.getElementById('root');
+      root.innerHTML = '';
+      if (MODE === 'message') { renderMessage(root); }
+      else if (MODE === 'all') { renderAll(root); }
+      else if (MODE === 'remove') { renderRemoval(root); }
+      else if (MODE === 'removeall') { renderRemovalAll(root); }
+      else { renderForm(root); }
+    })();
+  </script>
+</body>
+</html>

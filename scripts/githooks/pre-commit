@@ -1,0 +1,14 @@
+#!/bin/sh
+# sale-check privacy guard — blocks a commit that would introduce PII / secrets.
+# Logic lives in scripts/check_pii.py (PII-safe; denylist read from .env).
+# Bypass deliberately with: git commit --no-verify
+if command -v python >/dev/null 2>&1; then
+  PY=python
+elif command -v py >/dev/null 2>&1; then
+  PY=py
+else
+  echo "check_pii: python not found on PATH — cannot run the PII guard." >&2
+  echo "           Fix PATH, or bypass deliberately with: git commit --no-verify" >&2
+  exit 1
+fi
+exec "$PY" scripts/check_pii.py --staged

@@ -1,0 +1,67 @@
+name: Daily sale check
+
+on:
+  schedule:
+    # 13:23 UTC = 8:23am CDT (Mar-Nov) / 7:23am CST (Nov-Mar). Minute :23 (not
+    # :00) dodges the top-of-hour scheduling stampede, so GitHub dispatches the
+    # scheduled run sooner and with less day-to-day variance (delay is still
+    # best-effort, not eliminated). Cron only takes UTC, so DST drifts an hour.
+    - cron: "23 13 * * *"
+  workflow_dispatch:         # allows manual trigger from the Actions tab
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Run sale check
+        env:
+          WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          # GitHub Actions auto-provides a GITHUB_TOKEN with REPO scope only —
+          # no gist scope. We override it with a personal-access-token stored
+          # under the secret name GIST_TOKEN so state.py can PATCH the Gist.
+          GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          # Optional: user's preferred sizes for size-aware OOS detection in
+          # extract.parse. Empty/unset preserves existing page-level OOS
+          # behaviour. PREFERRED_SIZES_PANTS overrides PREFERRED_SIZES for
+          # URLs detected as bottoms (pants/jeans/joggers/shorts/etc.).
+          # See CLAUDE.md → Secrets for details.
+          PREFERRED_SIZES: ${{ secrets.PREFERRED_SIZES }}
+          PREFERRED_SIZES_PANTS: ${{ secrets.PREFERRED_SIZES_PANTS }}
+          # Fit-feedback web form (Apps Script). Both sign the per-item links in
+          # the daily digest section + Friday weekly email. With either blank the
+          # feature stays dormant, so they MUST be mapped in here — a repo secret
+          # alone does nothing unless the workflow injects it. See CLAUDE.md.
+          FIT_FORM_BASE_URL: ${{ secrets.FIT_FORM_BASE_URL }}
+          FIT_LINK_SECRET: ${{ secrets.FIT_LINK_SECRET }}
+          # BodySpec login for the ~weekly DEXA scan-cache refresh (body_scans.json),
+          # which the fit-feedback web form reads to match a body state to a review
+          # the moment it's left. Age-gated + failure-isolated in main: blank creds =
+          # dormant (the cron behaves exactly as before). BODY_SCAN_MAX_AGE_DAYS
+          # (optional, default 7) tunes how stale the cache may get before a refresh.
+          BODYSPEC_USERNAME: ${{ secrets.BODYSPEC_USERNAME }}
+          BODYSPEC_PASSWORD: ${{ secrets.BODYSPEC_PASSWORD }}
+          BODY_SCAN_MAX_AGE_DAYS: ${{ secrets.BODY_SCAN_MAX_AGE_DAYS }}
+          # Shops kept out of the wardrobe (privacy). The daily cron doesn't scan
+          # orders, but it reads the wardrobe for the fit/removal nudges — this
+          # filters excluded shops out of those sections (main._wardrobe_items).
+          # The weekly order-scan workflow is where ingestion/hard-delete happen.
+          EXCLUDED_SHOPS: ${{ secrets.EXCLUDED_SHOPS }}
+        run: python -m src.main

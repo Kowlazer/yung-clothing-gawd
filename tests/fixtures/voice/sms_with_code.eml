@@ -1,0 +1,29 @@
+Delivered-To: testuser@example.com
+MIME-Version: 1.0
+Message-ID: <+15555550100.aaaa1111bbbb2222cccc3333dddd4444eeee5555@txt.voice.google.com>
+Date: Thu, 21 May 2026 14:00:00 +0000
+Subject: New text message from (888) 555-7700
+From: "(888) 555-7700" <15555550100.18885557700.q7xZ91JTlg@txt.voice.google.com>
+To: testuser@example.com
+Content-Type: multipart/alternative; boundary="00000000000040e44406524c5321"
+
+--00000000000040e44406524c5321
+Content-Type: text/plain; charset="UTF-8"; format=flowed; delsp=yes
+
+
+<https://voice.google.com>
+Aniqi: New drop is live! Use code SMS25 for 25% off this weekend.
+To respond to this text message, reply to this email or visit Google Voice.
+YOUR ACCOUNT <https://voice.google.com> HELP CENTER
+<https://support.google.com/voice#topic=1707989> HELP FORUM
+This email was sent to you because you indicated that you'd like to receive
+email notifications for text messages.
+Google LLC
+
+--00000000000040e44406524c5321
+Content-Type: text/html; charset="UTF-8"
+Content-Transfer-Encoding: quoted-printable
+
+<html><body><p>Aniqi: New drop is live! Use code SMS25 for 25% off this wee=
+kend.</p></body></html>
+--00000000000040e44406524c5321--

@@ -1,0 +1,53 @@
+.env
+.env.*
+!.env.example
+.claude/
+*.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+dist/
+*.egg-info/
+digest.md
+fit_digest.md
+/watchlist.txt
+signup_screenshots/
+restock_screenshots/
+# Ad-hoc inspection / sampling scripts + their outputs in the repo root —
+# written per-investigation to read Gist state, sample emails by X-GM-MSGID,
+# diff matcher output, or hold one-shot paste artifacts (e.g. the watchlist
+# Doc paste-back from scripts/remove_watchlist_urls.py). Disposable; not
+# part of the codebase.
+/_*
+
+# Internal dev notes / agent handoffs — kept locally, never shared. These hold
+# personal references (working notes, process, examples) and aren't needed by
+# anyone using the project. Untracked via `git rm --cached`; the files stay on
+# disk. NOT root-anchored, so a handoff doc in any subdir is ignored too.
+CLAUDE.md
+TESTING_NEEDED.md
+HANDOFF_*.md
+BUILD_PLAN.md
+
+# Real-data / state dumps — the Gist holds all the real wardrobe/price/code/etc.
+# data; never let a local inspection copy of a Gist state file get staged. These
+# names are root-anchored (the synthetic test fixtures live under tests/fixtures/
+# with prefixed names like aniqi_trafalgar.json, so they're unaffected).
+/wardrobe.json
+/prices.json
+/codes.json
+/shop_aliases.json
+/email_sales.json
+/fx_rates.json
+/gmail_state.json
+/voice_state.json
+/sms_aliases.json
+/signup_state.json
+/body_scans.json
+/shop_verdicts.json
+/restock_state.json
+# Raw captured emails / state dumps saved to the repo root for inspection.
+/*.eml
+/*_dump.json
+/.pii-denylist

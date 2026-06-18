@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wardrobe</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #f0f2f5;
+    --border: #e2e5ea;
+    --text: #1a1d23;
+    --muted: #6b7280;
+    --accent: #4f46e5;
+    --accent-soft: #eef0fe;
+    --chip: #eef1f5;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --surface: #171a21;
+      --surface-2: #1e222b;
+      --border: #2a2f3a;
+      --text: #e7eaf0;
+      --muted: #9aa3b2;
+      --accent: #818cf8;
+      --accent-soft: #20243a;
+      --chip: #232834;
+      --shadow: 0 1px 2px rgba(0,0,0,.4);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 18px 60px; }
+
+  header.bar {
+    position: sticky; top: 0; z-index: 20;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(6px);
+  }
+  .bar-inner {
+    max-width: 1180px; margin: 0 auto; padding: 14px 18px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .title { display: flex; align-items: baseline; gap: 12px; }
+  .title h1 { font-size: 20px; margin: 0; letter-spacing: -.02em; }
+  .title .sub { color: var(--muted); font-size: 13px; }
+  .spacer { flex: 1; }
+  button.refresh {
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    border-radius: 10px; padding: 8px 14px; cursor: pointer; font-size: 14px;
+    display: inline-flex; align-items: center; gap: 7px; box-shadow: var(--shadow);
+  }
+  button.refresh:hover { background: var(--surface-2); }
+  button.refresh:disabled { opacity: .55; cursor: default; }
+  button.refresh svg { width: 15px; height: 15px; }
+  button.refresh.spin svg { animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  button.refresh.stop:hover { background: #fee2e2; border-color: #ef4444; color: #b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    button.refresh.stop:hover { background: #3a1d1d; border-color: #ef4444; color: #fca5a5; }
+  }
+
+  /* full-screen "server stopped" overlay */
+  .stopped {
+    position: fixed; inset: 0; z-index: 80; display: none;
+    align-items: center; justify-content: center; text-align: center;
+    background: var(--bg); padding: 30px;
+  }
+  .stopped.open { display: flex; }
+  .stopped .inner { max-width: 360px; }
+  .stopped svg { width: 46px; height: 46px; color: var(--muted); opacity: .7; margin-bottom: 14px; }
+  .stopped h2 { margin: 0 0 8px; font-size: 20px; letter-spacing: -.02em; }
+  .stopped p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+  .stopped code { background: var(--chip); padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
+
+  .controls {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    margin: 18px 0 6px;
+  }
+  .search {
+    flex: 1; min-width: 220px; position: relative;
+  }
+  .search input {
+    width: 100%; padding: 11px 36px 11px 38px; font-size: 15px;
+    border: 1px solid var(--border); border-radius: 12px;
+    background: var(--surface); color: var(--text); box-shadow: var(--shadow);
+  }
+  .search input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .search .ico { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--muted); width: 17px; height: 17px; }
+  .search .clear { position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1; padding: 4px; display: none; }
+  .search.has-val .clear { display: block; }
+
+  .segmented { display: inline-flex; background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 3px; }
+  .segmented button {
+    border: none; background: transparent; color: var(--muted); cursor: pointer;
+    padding: 8px 15px; border-radius: 9px; font-size: 14px; font-weight: 500;
+  }
+  .segmented button.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
+
+  .facets { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0 4px; min-height: 4px; }
+  .chip {
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    border-radius: 999px; padding: 6px 13px; cursor: pointer; font-size: 13px;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .chip .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .chip.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .chip.on .n { color: var(--accent); }
+  select.shopsel {
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    border-radius: 10px; padding: 8px 12px; font-size: 14px; max-width: 320px;
+  }
+  /* Brands-tab type-to-filter box: compact (doesn't span the row like .search). */
+  .search.brandsearch { flex: 0 1 340px; min-width: 200px; }
+  .brand-count { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+
+  .result-line { color: var(--muted); font-size: 13px; margin: 14px 2px 6px; }
+
+  .group-head {
+    display: flex; align-items: baseline; gap: 10px; margin: 26px 2px 12px;
+    padding-bottom: 8px; border-bottom: 1px solid var(--border);
+  }
+  .group-head h2 { font-size: 16px; margin: 0; letter-spacing: -.01em; }
+  .group-head .count { color: var(--muted); font-size: 13px; }
+  .group-head .spent { margin-left: auto; color: var(--muted); font-size: 13px; }
+
+  .grid {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    overflow: hidden; box-shadow: var(--shadow); display: flex; flex-direction: column;
+  }
+  .card .thumb {
+    aspect-ratio: 1 / 1; background: var(--surface-2);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); position: relative;
+  }
+  .card .thumb svg { width: 46%; height: 46%; opacity: .55; }
+  .card .thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .card .thumb .cat-tag {
+    position: absolute; top: 8px; left: 8px; background: var(--surface);
+    border: 1px solid var(--border); color: var(--muted); font-size: 11px;
+    padding: 2px 8px; border-radius: 999px;
+  }
+  .card .body { padding: 11px 12px 12px; display: flex; flex-direction: column; gap: 7px; flex: 1; }
+  .card .name { font-weight: 600; font-size: 14px; line-height: 1.3;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .card .shop { color: var(--muted); font-size: 12.5px; }
+  .card .meta { display: flex; gap: 6px; flex-wrap: wrap; }
+  .pill { background: var(--chip); border-radius: 7px; padding: 2px 8px; font-size: 11.5px; color: var(--text); }
+  .pill.dim { color: var(--muted); }
+  .card .foot { margin-top: auto; display: flex; align-items: center; justify-content: space-between; padding-top: 4px; }
+  .card .foot-r { display: flex; align-items: center; gap: 9px; }
+  .card .price { font-weight: 600; font-size: 13.5px; }
+  .card .date { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .cardlink { color: var(--muted); display: inline-flex; align-items: center; line-height: 0; }
+  .cardlink:hover { color: var(--accent); }
+  .cardlink svg { width: 15px; height: 15px; }
+
+  /* spend rollup view */
+  .spend-list { display: flex; flex-direction: column; gap: 2px; }
+  .spend-row {
+    display: flex; align-items: center; gap: 12px; padding: 9px 4px;
+    border-bottom: 1px solid var(--border); font-size: 14px;
+  }
+  .spend-row:last-child { border-bottom: none; }
+  .spend-row.clickable { cursor: pointer; border-radius: 8px; }
+  .spend-row.clickable:hover { background: var(--surface-2); }
+  .spend-row .s-ico { width: 22px; height: 22px; flex: none; color: var(--muted); }
+  .spend-row .s-ico svg { width: 100%; height: 100%; opacity: .7; }
+  .spend-row .s-label { flex: none; width: 150px; font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .spend-row .s-label .n { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
+  .spend-row .s-bar { flex: 1; height: 8px; background: var(--surface-2); border-radius: 999px; overflow: hidden; min-width: 40px; }
+  .spend-row .s-bar i { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+  .spend-row .s-amt { flex: none; width: 130px; text-align: right; font-weight: 600;
+    font-variant-numeric: tabular-nums; }
+  .spend-row .s-avg { flex: none; width: 86px; text-align: right; color: var(--muted);
+    font-size: 12px; font-variant-numeric: tabular-nums; }
+  @media (max-width: 620px) {
+    .spend-row .s-avg { display: none; }
+    .spend-row .s-label { width: 110px; }
+    .spend-row .s-amt { width: 96px; }
+  }
+
+  .empty { text-align: center; color: var(--muted); padding: 70px 20px; }
+  .empty svg { width: 42px; height: 42px; opacity: .5; margin-bottom: 12px; }
+  .toast {
+    position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+    background: #b91c1c; color: #fff; padding: 10px 18px; border-radius: 10px;
+    font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,.25); z-index: 70; display: none;
+  }
+  .toast.ok { background: #15803d; }
+
+  /* collapsible groups */
+  .group { margin-bottom: 2px; }
+  .group-head { cursor: pointer; user-select: none; }
+  .group-head .chev { width: 15px; height: 15px; color: var(--muted); transition: transform .15s; flex: none; align-self: center; }
+  .group.collapsed .chev { transform: rotate(-90deg); }
+  .group.collapsed .grid { display: none; }
+  .card { cursor: pointer; transition: border-color .12s, transform .06s; }
+  .card:hover { border-color: var(--accent); }
+  .card:active { transform: scale(.995); }
+
+  /* detail modal */
+  .modal-back {
+    position: fixed; inset: 0; background: rgba(10,12,16,.55);
+    display: none; align-items: flex-start; justify-content: center;
+    padding: 40px 16px; z-index: 60; overflow-y: auto;
+  }
+  .modal-back.open { display: flex; }
+  .modal {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+    width: 100%; max-width: 520px; box-shadow: 0 12px 40px rgba(0,0,0,.32); overflow: hidden;
+  }
+  .modal .mh { display: flex; gap: 12px; padding: 16px 18px; border-bottom: 1px solid var(--border); align-items: flex-start; }
+  .modal .mthumb { width: 56px; height: 56px; border-radius: 10px; background: var(--surface-2); flex: none; display: flex; align-items: center; justify-content: center; color: var(--muted); overflow: hidden; }
+  .modal .mthumb svg { width: 60%; height: 60%; opacity: .6; }
+  .modal .mthumb img { width: 100%; height: 100%; object-fit: cover; }
+  .modal .mtitle { flex: 1; min-width: 0; }
+  .modal .mh h3 { margin: 0 0 2px; font-size: 16px; line-height: 1.3; }
+  .modal .mh .msub { color: var(--muted); font-size: 13px; }
+  .modal .mclose { border: none; background: transparent; color: var(--muted); font-size: 23px; cursor: pointer; line-height: 1; padding: 0 4px; }
+  .modal .mbody { padding: 14px 18px 18px; display: flex; flex-direction: column; gap: 12px; }
+  .drow { display: flex; gap: 10px; font-size: 13.5px; }
+  .drow .dk { color: var(--muted); min-width: 86px; flex: none; }
+  .drow .dv { color: var(--text); }
+  .dsec { border-top: 1px solid var(--border); padding-top: 12px; }
+  .dsec h4 { margin: 0 0 9px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
+  .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+  .field label { font-size: 12.5px; color: var(--muted); }
+  .field select, .field input, .field textarea {
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    border-radius: 9px; padding: 8px 10px; font-size: 14px; font-family: inherit; width: 100%;
+  }
+  .field textarea { resize: vertical; min-height: 50px; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .btn { border: 1px solid var(--accent); background: var(--accent); color: #fff;
+    border-radius: 10px; padding: 9px 16px; cursor: pointer; font-size: 14px; font-weight: 500; }
+  .btn:disabled { opacity: .55; cursor: default; }
+  .linkbtn { color: var(--accent); font-size: 13.5px; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+  .linkbtn svg { width: 15px; height: 15px; }
+  .more-toggle { color: var(--accent); font-size: 13px; cursor: pointer; background: none; border: none; padding: 0 0 8px; display: inline-block; }
+  .hint { color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+  .hint code { background: var(--chip); padding: 1px 5px; border-radius: 5px; font-size: 11.5px; }
+
+  /* product-review-request callout (detail panel) */
+  .revbox { background: var(--accent-soft); border: 1px solid var(--accent);
+    border-radius: 10px; padding: 11px 12px; display: flex; flex-direction: column; gap: 7px; }
+  .revbox .rev-h { font-size: 13.5px; font-weight: 600; color: var(--accent);
+    display: flex; align-items: center; gap: 6px; }
+  .revbox .rev-h svg { width: 15px; height: 15px; flex: none; }
+  .revbox .rev-ago { font-weight: 400; color: var(--muted); }
+  .revbox .rev-sub { font-size: 13px; color: var(--text); font-style: italic; }
+  a.btn.rev-go { display: inline-block; text-decoration: none; align-self: flex-start; }
+  .rev-fallback { margin-top: 9px; }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="bar-inner">
+    <div class="title">
+      <h1>Wardrobe</h1>
+      <span class="sub" id="subline">loading…</span>
+    </div>
+    <div class="spacer"></div>
+    <button class="refresh" id="refreshBtn" title="Re-fetch the latest wardrobe from the Gist">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+      Refresh
+    </button>
+    <button class="refresh stop" id="stopBtn" title="Stop the local wardrobe server (no more Ctrl-C in the terminal)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v9"/><path d="M6.4 6.4a8 8 0 1 0 11.2 0"/></svg>
+      Stop
+    </button>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="controls">
+    <div class="search" id="searchWrap">
+      <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+      <input id="search" type="search" autocomplete="off" placeholder="Search shop, item, colour, size, category…">
+      <button class="clear" id="clearBtn" title="Clear">×</button>
+    </div>
+    <div class="segmented" id="views">
+      <button data-view="timeline" class="active">Timeline</button>
+      <button data-view="categories">Categories</button>
+      <button data-view="shops">Brands</button>
+      <button data-view="spend">Spend</button>
+    </div>
+    <select class="shopsel" id="sortsel" title="Sort items">
+      <option value="newest">Newest first</option>
+      <option value="oldest">Oldest first</option>
+      <option value="price_hi">Price: high → low</option>
+      <option value="price_lo">Price: low → high</option>
+      <option value="name">Name: A → Z</option>
+    </select>
+  </div>
+  <div class="facets" id="facets"></div>
+  <div class="result-line" id="resultLine"></div>
+  <div id="content"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="modal-back" id="modalBack"><div class="modal" id="modal"></div></div>
+<div class="stopped" id="stoppedOverlay"><div class="inner">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v9"/><path d="M6.4 6.4a8 8 0 1 0 11.2 0"/></svg>
+  <h2>Server stopped</h2>
+  <p>You can close this tab. To browse again, relaunch with <code>python -m src.wardrobe_browser</code>.</p>
+</div></div>
+
+<script>
+// ----- per-category icons (inline SVG, themeable via currentColor) -----
+const SVG_OPEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round">';
+const ICONS = {
+  tshirt: '<path d="M8 3.5 4 6l2 3 2-1.2V21h8V7.8l2 1.2 2-3-4-2.5c-.4 1.8-7.6 1.8-8 0Z"/>',
+  hoodie: '<path d="M8 4 4.5 6.5l2 3.2 1.5-1V21h8V8.7l1.5 1 2-3.2L16 4"/><path d="M8 4c.6 2.4 7.4 2.4 8 0"/><path d="M11 13v3M13 13v3"/>',
+  shirt:  '<path d="M8 3.5 4 6l2 3 2-1.2V21h8V7.8l2 1.2 2-3-4-2.5"/><path d="M12 5.2V21"/><path d="M9 4l3 1.6L15 4"/>',
+  jacket: '<path d="M8 3.5 4 6l2 3 2-1.2V21h5.5V7.8l2 1.2 2-3-4-2.5"/><path d="M12 5.5 9 4M12 5.5 15 4M12 5.5V21"/><path d="M13.6 9.5v9"/>',
+  tank:   '<path d="M9 3 8 7v14h8V7l-1-4"/><path d="M9 3c.6 2 5.4 2 6 0"/>',
+  pants:  '<path d="M8 3h8v4l1 14h-3.6L12 11l-1.4 10H7l1-14V3Z"/><path d="M8 6.5h8"/>',
+  shorts: '<path d="M8 3h8v3l.7 9h-3.5L12 9l-1.2 6H7.3L8 6V3Z"/><path d="M8 6h8"/>',
+  hat:    '<path d="M4 14a8 6 0 0 1 16 0"/><path d="M4 14h17a1 1 0 0 1 0 2H4a1 1 0 0 1 0-2Z"/>',
+  socks:  '<path d="M9 3v8c0 2-1 3-3 4.4l-1.3 1 2.6 3.6 5-3.6C13 18.7 12 16.5 12 13.5V3Z"/><path d="M9 3h3"/>',
+  shoes:  '<path d="M2 16h8.5c1.4 0 2-1 3.8-1.5 2.4-.6 4 .5 6 1.6l1 1.4v1H2v-2.5Z"/><path d="M6.5 16v-3l1.8 1M9.5 16v-2"/>',
+  acc:    '<path d="M4 11 11 4h7v7l-7 7-7-7Z"/><circle cx="14.4" cy="7.6" r="1.3"/>',
+  other:  '<path d="M12 5a1.6 1.6 0 1 1 1.5 2.3c-.9.3-1.5.8-1.5 1.7"/><path d="M12 9 4 15.4c-.8.6-.3 1.6.6 1.6h14.8c.9 0 1.4-1 .6-1.6L12 9Z"/>',
+};
+const CAT_ICON = {
+  tshirt:'tshirt', longsleeve:'tshirt', shirt:'shirt', polo:'shirt',
+  tank:'tank', hoodie:'hoodie', sweatshirt:'tshirt', jacket:'jacket',
+  sweatpants:'pants', pants:'pants', shorts:'shorts',
+  shorts_athletic:'shorts', shorts_casual:'shorts', hat:'hat',
+  socks:'socks', shoes:'shoes', accessory:'acc', underwear:'shorts', other:'other',
+};
+function icon(cat){ return SVG_OPEN + (ICONS[CAT_ICON[cat] || 'other']) + '</svg>'; }
+
+// ----- state -----
+let DATA = { items: [], categories: [], shops: [], stats: {} };
+let view = 'timeline';
+let query = '';
+const selectedCats = new Set();
+let brandFilter = '';   // type-to-filter text on the Brands tab
+let sortBy = localStorage.getItem('wardrobeSort') || 'newest';
+let META = { category_choices: [], fit_enabled: false, review_requests_enabled: false };
+// Detected post-purchase review requests, grouped by brand_key (loaded async
+// from /api/review-requests so the slow Gmail check never blocks the catalogue).
+let REVIEW_REQS = { loaded: false, enabled: false, byBrand: {}, all_url: '', error: null };
+let currentId = null;
+let collapsed = new Set(JSON.parse(localStorage.getItem('wardrobeCollapsed') || '[]'));
+function saveCollapsed(){ try { localStorage.setItem('wardrobeCollapsed', JSON.stringify([...collapsed])); } catch(_){} }
+function saveSort(){ try { localStorage.setItem('wardrobeSort', sortBy); } catch(_){} }
+
+const el = id => document.getElementById(id);
+const esc = s => (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function fmtDate(iso){
+  if(!iso) return '';
+  const p = iso.split('-');
+  if(p.length < 2) return iso;
+  const m = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][parseInt(p[1],10)-1] || '';
+  return p.length>=3 ? `${m} ${parseInt(p[2],10)}, ${p[0]}` : `${m} ${p[0]}`;
+}
+function fmtMonth(ym){
+  const p = (ym||'').split('-');
+  if(p.length<2) return 'Undated';
+  const m = ['January','February','March','April','May','June','July','August','September','October','November','December'][parseInt(p[1],10)-1] || '';
+  return `${m} ${p[0]}`;
+}
+function spentLabel(map){
+  if(!map) return '';
+  const parts = Object.entries(map).filter(([,v])=>v>0)
+    .map(([cur,v]) => (cur==='USD'?'$'+v.toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0}):v.toLocaleString()+' '+cur));
+  return parts.join(' · ');
+}
+
+// ----- sorting -----
+// Items mix currencies but the catalogue is overwhelmingly USD, so price sorts
+// compare the raw amount (no FX); items without a price sort last either way.
+function priceAmt(it){ return (it.price && it.price.amount!=null) ? it.price.amount : null; }
+function sortItems(arr){
+  const a = arr.slice();
+  switch(sortBy){
+    case 'oldest':   a.sort((x,y)=> (x.purchased_at||'').localeCompare(y.purchased_at||'')); break;
+    case 'price_hi': a.sort((x,y)=> (priceAmt(y)??-Infinity)-(priceAmt(x)??-Infinity)); break;
+    case 'price_lo': a.sort((x,y)=> (priceAmt(x)??Infinity)-(priceAmt(y)??Infinity)); break;
+    case 'name':     a.sort((x,y)=> (x.name||'').toLowerCase().localeCompare((y.name||'').toLowerCase())); break;
+    default:         a.sort((x,y)=> (y.purchased_at||'').localeCompare(x.purchased_at||'')); break; // newest
+  }
+  return a;
+}
+
+// ----- filtering -----
+function matches(it){
+  if(view==='categories' && selectedCats.size && !selectedCats.has(it.category)) return false;
+  if(query){
+    const hay = (it.name+' '+it.shop+' '+it.color+' '+it.size+' '+it.category_label).toLowerCase();
+    for(const t of query.toLowerCase().split(/\s+/)) if(t && !hay.includes(t)) return false;
+  }
+  return true;
+}
+
+// ----- card -----
+const EXT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>';
+const PRODUCT_LINK_TITLE = { search: 'Search the web for this product', watchlist: 'Open product page (from your watchlist)' };
+function card(it){
+  const thumb = it.image
+    ? `<img src="${esc(it.image)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('span'),{innerHTML:''}));this.parentElement.insertAdjacentHTML('afterbegin', window.__icon('${it.category}'))">`
+    : icon(it.category);
+  const meta = [];
+  if(it.color) meta.push(`<span class="pill">${esc(it.color)}</span>`);
+  if(it.size) meta.push(`<span class="pill dim">${esc(it.size)}</span>`);
+  if((it.qty||1) > 1) meta.push(`<span class="pill dim">×${it.qty}</span>`);
+  const pl = it.product_link;
+  const ext = pl
+    ? `<a class="cardlink" href="${esc(pl.href)}" target="_blank" rel="noopener" title="${esc(PRODUCT_LINK_TITLE[pl.kind] || 'Open product page')}" onclick="event.stopPropagation()">${EXT_ICON}</a>`
+    : '';
+  return `<div class="card" data-id="${esc(it.id)}">
+    <div class="thumb">${thumb}<span class="cat-tag">${esc(it.category_label)}</span></div>
+    <div class="body">
+      <div class="name" title="${esc(it.name)}">${esc(it.name)||'—'}</div>
+      <div class="shop">${esc(it.shop)}</div>
+      ${meta.length?`<div class="meta">${meta.join('')}</div>`:''}
+      <div class="foot">
+        <span class="price">${it.price_display?esc(it.price_display):'<span class="date">—</span>'}</span>
+        <span class="foot-r">${ext}<span class="date">${fmtDate(it.purchased_at)}</span></span>
+      </div>
+    </div>
+  </div>`;
+}
+window.__icon = icon;
+
+function gridOf(items){ return `<div class="grid">${items.map(card).join('')}</div>`; }
+
+const CHEV = '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>';
+
+// A collapsible group: clickable header (chevron + title + count) over its grid.
+// `gkey` is namespaced by view so collapse state doesn't bleed across tabs; it's
+// persisted in localStorage so a collapsed shop/category stays collapsed.
+function groupSection(gkey, title, count, spent, items){
+  const cls = collapsed.has(gkey) ? 'group collapsed' : 'group';
+  const head = `<div class="group-head">${CHEV}<h2>${esc(title)}</h2>`
+    + `<span class="count">${count} item${count===1?'':'s'}</span>`
+    + `${spent?`<span class="spent">${esc(spent)}</span>`:''}</div>`;
+  return `<section class="${cls}" data-gkey="${esc(gkey)}">${head}${gridOf(items)}</section>`;
+}
+
+// ----- render -----
+function emptyHtml(msg){
+  return `<div class="empty">${SVG_OPEN}<circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg><div>${esc(msg)}</div></div>`;
+}
+
+// The sort dropdown applies to the item views only; hide it on the Spend
+// dashboard, and keep its value in sync with the persisted `sortBy`.
+function syncControls(){
+  const ss = el('sortsel');
+  if(ss){ ss.value = sortBy; ss.style.display = (view==='spend') ? 'none' : ''; }
+}
+
+// render() rebuilds the facets + content. renderContent() rebuilds just the
+// content (+ result line / brand count) — the Brands filter calls only the
+// latter on each keystroke so its input keeps focus (facets aren't re-created).
+function render(){
+  syncControls();
+  renderFacets();
+  renderContent();
+}
+
+function updateBrandCount(shown, total){
+  const c = el('brandCount');
+  if(!c) return;
+  c.textContent = (shown===total)
+    ? `${total} brand${total===1?'':'s'}`
+    : `${shown} of ${total} brands`;
+}
+
+function renderContent(){
+  const all = sortItems(DATA.items.filter(matches));
+  const filtered = !!(query || selectedCats.size);
+  el('resultLine').textContent = filtered
+    ? `Showing ${all.length} of ${DATA.items.length} items`
+    : `${DATA.items.length} items`;
+
+  const content = el('content');
+
+  if(view==='spend'){ content.innerHTML = spendView(all, filtered); return; }
+
+  if(!all.length){ content.innerHTML = emptyHtml('No items match.'); return; }
+
+  if(view==='timeline'){
+    const groups = {};
+    for(const it of all){ (groups[it.month] = groups[it.month]||[]).push(it); }
+    // Month groups stay newest-first (the timeline metaphor) regardless of the
+    // within-group sort; only an explicit oldest-first sort flips them.
+    const keys = Object.keys(groups).sort();
+    if(sortBy!=='oldest') keys.reverse();
+    content.innerHTML = keys.map(k => groupSection('timeline::'+k, fmtMonth(k), groups[k].length, spentLabel(sumSpent(groups[k])), groups[k])).join('');
+  } else if(view==='shops'){   // Brands
+    const groups = {};
+    for(const it of all){ (groups[it.shop] = groups[it.shop]||[]).push(it); }
+    let keys = Object.keys(groups).sort((a,b)=> groups[b].length-groups[a].length || a.toLowerCase().localeCompare(b.toLowerCase()));
+    const totalBrands = keys.length;
+    if(brandFilter){
+      const q = brandFilter.toLowerCase();
+      keys = keys.filter(k => k.toLowerCase().includes(q));
+      const shown = keys.reduce((n,k)=>n+groups[k].length, 0);
+      el('resultLine').textContent = `${shown} item${shown===1?'':'s'} across ${keys.length} of ${totalBrands} brands`;
+    }
+    updateBrandCount(keys.length, totalBrands);
+    if(!keys.length){ content.innerHTML = emptyHtml(`No brands match "${brandFilter}".`); return; }
+    content.innerHTML = keys.map(k => groupSection('shops::'+k, k, groups[k].length, spentLabel(sumSpent(groups[k])), groups[k])).join('');
+  } else { // categories
+    if(selectedCats.size){
+      content.innerHTML = gridOf(all);
+    } else {
+      const order = DATA.categories.map(c=>c.key);
+      const groups = {};
+      for(const it of all){ (groups[it.category] = groups[it.category]||[]).push(it); }
+      content.innerHTML = order.filter(k=>groups[k]).map(k =>
+        groupSection('cat::'+k, catLabel(k), groups[k].length, spentLabel(sumSpent(groups[k])), groups[k])).join('');
+    }
+  }
+}
+
+// ----- spend rollup view -----
+// Naive cross-currency sum — used ONLY for bar widths and row sorting. Money is
+// always *displayed* per-currency via spentLabel (no GBP folded into USD).
+function mapTotal(map){ let t=0; for(const k in map) t+=map[k]; return t; }
+function rollupFromItems(items, keyFn){
+  const g = {};
+  for(const it of items){
+    const k = keyFn(it);
+    let e = g[k]; if(!e){ e = g[k] = { key: k, count: 0, map: {} }; }
+    e.count++;
+    if(it.price && it.price.amount!=null){
+      const c = (it.price.currency||'USD').toUpperCase();
+      e.map[c] = (e.map[c]||0) + it.price.amount*(it.qty||1);
+    }
+  }
+  return Object.values(g);
+}
+// When unfiltered, money comes from the authoritative server-side stat map
+// (stats.spent_by_category / spent_by_month); counts from a cheap pass. When a
+// search/facet filter is active, recompute everything from the filtered items.
+function spendRows(filtered, items, keyFn, statMap){
+  if(filtered) return rollupFromItems(items, keyFn);
+  const counts = {};
+  for(const it of DATA.items){ const k = keyFn(it); counts[k] = (counts[k]||0)+1; }
+  return Object.keys(counts).map(key => ({ key, count: counts[key], map: (statMap||{})[key] || {} }));
+}
+function avgLabel(map, count){
+  const curs = Object.keys(map);
+  if(curs.length !== 1 || !count) return '';            // avg only meaningful single-currency
+  const c = curs[0], v = map[c]/count;
+  return c==='USD' ? '$'+Math.round(v) : Math.round(v)+' '+c;
+}
+function spendRow(r, max, opts){
+  const total = mapTotal(r.map);
+  const pct = max>0 ? Math.round((total/max)*100) : 0;
+  const ico = opts.icon ? `<span class="s-ico">${icon(r.key)}</span>` : '';
+  const avg = opts.avg ? avgLabel(r.map, r.count) : '';
+  const amt = spentLabel(r.map);
+  const cls = opts.click ? 'spend-row clickable' : 'spend-row';
+  const attr = opts.click ? ` data-spendcat="${esc(r.key)}"` : '';
+  return `<div class="${cls}"${attr}>${ico}`
+    + `<span class="s-label">${esc(opts.label(r.key))} <span class="n">${r.count}</span></span>`
+    + `<span class="s-bar"><i style="width:${pct}%"></i></span>`
+    + `<span class="s-amt">${amt?esc(amt):'—'}</span>`
+    + (opts.avg ? `<span class="s-avg">${avg?'~'+esc(avg):''}</span>` : '')
+    + `</div>`;
+}
+function spendSection(title, rows, opts){
+  const max = rows.reduce((m,r)=>Math.max(m, mapTotal(r.map)), 0);
+  const total = {};
+  for(const r of rows){ for(const c in r.map) total[c] = (total[c]||0)+r.map[c]; }
+  const head = `<div class="group-head" style="cursor:default"><h2>${esc(title)}</h2>`
+    + `<span class="count">${rows.length} ${rows.length===1?'group':'groups'}</span>`
+    + `<span class="spent">${esc(spentLabel(total))}</span></div>`;
+  return `<section>${head}<div class="spend-list">${rows.map(r=>spendRow(r,max,opts)).join('')}</div></section>`;
+}
+function spendView(items, filtered){
+  if(!DATA.items.length) return emptyHtml('Nothing to total yet.');
+  const catRows = spendRows(filtered, items, it=>it.category, DATA.stats.spent_by_category);
+  if(!catRows.length) return emptyHtml('No items match.');
+  const monthRows = spendRows(filtered, items, it=>it.month, DATA.stats.spent_by_month);
+  catRows.sort((a,b)=> mapTotal(b.map)-mapTotal(a.map) || b.count-a.count);
+  monthRows.sort((a,b)=> (b.key||'').localeCompare(a.key||''));   // newest month first
+  return spendSection('Spend by category', catRows, { icon:true, label:catLabel, avg:true, click:true })
+       + spendSection('Spend by month', monthRows, { icon:false, label:fmtMonth, avg:true, click:false });
+}
+
+function sumSpent(items){
+  const m = {};
+  for(const it of items){ if(it.price && it.price.amount!=null){ const c=(it.price.currency||'USD').toUpperCase(); m[c]=(m[c]||0)+it.price.amount*(it.qty||1); } }
+  return m;
+}
+function catLabel(k){ const c = DATA.categories.find(c=>c.key===k); return c?c.label:k; }
+
+function renderFacets(){
+  const f = el('facets');
+  if(view==='categories'){
+    const all = `<span class="chip ${selectedCats.size?'':'on'}" data-cat="__all">All <span class="n">${DATA.stats.total||0}</span></span>`;
+    f.innerHTML = all + DATA.categories.map(c =>
+      `<span class="chip ${selectedCats.has(c.key)?'on':''}" data-cat="${c.key}">${esc(c.label)} <span class="n">${c.count}</span></span>`).join('');
+  } else if(view==='shops'){   // Brands
+    f.innerHTML =
+      `<div class="search brandsearch" id="brandWrap">
+         <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+         <input id="brandInput" type="search" autocomplete="off" placeholder="Filter brands…">
+         <button class="clear" id="brandClear" title="Clear">×</button>
+       </div>
+       <span class="brand-count" id="brandCount"></span>`;
+    const bf = el('brandInput');
+    bf.value = brandFilter;
+    el('brandWrap').classList.toggle('has-val', !!brandFilter);
+    bf.oninput = () => {
+      brandFilter = bf.value.trim();
+      el('brandWrap').classList.toggle('has-val', !!bf.value);
+      renderContent();   // content-only so the input keeps focus
+    };
+    el('brandClear').onclick = () => {
+      bf.value = ''; brandFilter = '';
+      el('brandWrap').classList.remove('has-val');
+      bf.focus(); renderContent();
+    };
+  } else {
+    f.innerHTML = '';
+  }
+}
+
+// ----- detail panel -----
+const MAIL_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>';
+const CHECK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+const FIT_LABELS = { too_small:'Too small', small:'Runs small', tts:'True to size', large:'Runs large', too_large:'Too big', dropped:'Dropped' };
+const titleCase = s => (s||'').replace(/_/g,' ');
+
+function findItem(id){ return DATA.items.find(i => i.id === id); }
+
+function gmailSearchUrl(it){
+  const q = `"${it.shop}" (review OR rate OR feedback OR "how did")`;
+  return 'https://mail.google.com/mail/u/0/#search/' + encodeURIComponent(q);
+}
+
+function drow(k, vHtml){ return `<div class="drow"><span class="dk">${esc(k)}</span><span class="dv">${vHtml}</span></div>`; }
+
+// BodySpec stores everything in kg (the canonical body_comp schema shared with
+// the Python + Apps Script blocks); display in pounds. Mirrors the fit form's
+// kg2lb so the two surfaces agree.
+function kg2lb(kg){ return Math.round(kg * 2.2046226 * 10) / 10; }
+
+function bodyCompHtml(b){
+  if(!b) return '';
+  const parts = [];
+  if(b.weight_kg!=null) parts.push(`${kg2lb(b.weight_kg)} lb`);
+  if(b.body_fat_pct!=null) parts.push(`${b.body_fat_pct}% body fat`);
+  if(b.lean_mass_kg!=null) parts.push(`${kg2lb(b.lean_mass_kg)} lb lean`);
+  const tail = b.scan_date ? ` — DEXA ${fmtDate(b.scan_date)}` + (b.matched_to==='fit_review'?' (at review)':'') : '';
+  return `<div class="dsec"><h4>Body composition</h4><div class="hint">${esc(parts.join(' · '))}${esc(tail)}</div></div>`;
+}
+
+function fitReviewView(fr){
+  const lines = [];
+  lines.push(drow('Fit', esc(FIT_LABELS[fr.fit] || fr.fit)));
+  if(fr.next_time) lines.push(drow('Next time', esc(titleCase(fr.next_time))));
+  if(fr.verdict) lines.push(drow('Verdict', esc(titleCase(fr.verdict))));
+  if(fr.inseam_inches!=null) lines.push(drow('Inseam', esc(fr.inseam_inches+'"')));
+  if(fr.areas && Object.keys(fr.areas).length){
+    const a = Object.entries(fr.areas).map(([k,v])=>`${titleCase(k)}: ${v}`).join(', ');
+    lines.push(drow('Areas', esc(a)));
+  }
+  if(fr.notes) lines.push(drow('Notes', esc(fr.notes)));
+  if(fr.reviewed_at) lines.push(drow('Reviewed', esc((fr.reviewed_at||'').slice(0,10))));
+  return lines.join('') + `<button class="more-toggle" id="fitRedo" type="button" style="padding-top:8px">Edit review</button>`;
+}
+
+function fitFormHtml(it){
+  if(!META.fit_enabled){
+    return `<div class="hint">Inline fit reviews aren't configured. Set <code>FIT_FORM_BASE_URL</code> + <code>FIT_LINK_SECRET</code> in <code>.env</code> and deploy the Apps Script <code>doPost</code> to enable. Meanwhile the emailed fit form still works.</div>`;
+  }
+  const opt = (v,l)=>`<option value="${v}">${esc(l)}</option>`;
+  const sel = (id,opts)=>`<select id="${id}">${opts.map(([v,l])=>opt(v,l)).join('')}</select>`;
+  const fitOpts = [['','— pick fit —'],['too_small',"Too small / can't wear"],['small','Runs small / snug'],['tts','True to size'],['large','Runs large / roomy'],['too_large','Too big']];
+  const nextOpts = [['','—'],['size_down','Size down'],['same','Same size'],['size_up','Size up'],['buy_again','Buy again'],['avoid','Avoid']];
+  const verdictOpts = [['','—'],['keep','Keep'],['return','Return'],['tailor','Tailor']];
+  const areaDefs = [['length','Length',['short','good','long']],['shoulders_chest','Shoulders/chest',['tight','good','loose']],['sleeves','Sleeves',['short','good','long']],['sleeve_opening','Sleeve opening',['tight','good','wide']],['waist_hips','Waist/hips',['tight','good','loose']],['inseam','Inseam',['short','good','long']]];
+  const areaFields = areaDefs.map(([k,label,vals]) =>
+    `<div class="field"><label>${esc(label)}</label><select data-area="${k}"><option value="">—</option>${vals.map(v=>opt(v,v)).join('')}</select></div>`).join('');
+  return `
+    <div class="field"><label>Overall fit *</label>${sel('fitSel',fitOpts)}</div>
+    <div class="row2">
+      <div class="field"><label>Next time</label>${sel('nextSel',nextOpts)}</div>
+      <div class="field"><label>Verdict</label>${sel('verdictSel',verdictOpts)}</div>
+    </div>
+    <button class="more-toggle" id="moreToggle" type="button">+ More detail (areas, inseam)</button>
+    <div id="moreWrap" style="display:none">
+      <div class="row2">${areaFields}</div>
+      <div class="field"><label>Inseam (inches)</label><input id="inseamInput" type="number" step="0.1" inputmode="decimal"></div>
+    </div>
+    <div class="field"><label>Notes</label><textarea id="notesInput" placeholder="optional"></textarea></div>
+    <div class="field"><label>Shop sizing note (saved per shop)</label><input id="shopNoteInput" type="text" placeholder="optional"></div>
+    <button class="btn" id="fitSubmit" type="button">Save fit review</button>`;
+}
+
+function productLinkHtml(it){
+  const pl = it.product_link;
+  if(!pl) return '';
+  const label = pl.kind==='search' ? 'Search for this product'
+              : pl.kind==='watchlist' ? 'Open product page (from watchlist)'
+              : 'Open product page';
+  return `<div class="dsec"><a class="linkbtn" href="${esc(pl.href)}" target="_blank" rel="noopener">${EXT_ICON} ${esc(label)}</a></div>`;
+}
+
+// Days-ago in human form for the review callout.
+function agoLabel(n){
+  if(n==null) return '';
+  if(n<=0) return 'today';
+  if(n===1) return 'yesterday';
+  return n+'d ago';
+}
+
+// The product-review section. When Gmail detection found an open review request
+// for this item's shop (matched by brand_key), show a callout linking straight
+// to that email so the user can leave the review on the shop's site. Otherwise
+// fall back to the blind Gmail-search link (and a config hint when detection
+// isn't enabled / errored).
+function reviewSectionHtml(it){
+  const head = '<h4>Product review</h4>';
+  const fallback = `<a class="linkbtn" href="${esc(gmailSearchUrl(it))}" target="_blank" rel="noopener">${MAIL_ICON} Find review email in Gmail</a>`;
+  if(!REVIEW_REQS.loaded){
+    return head + `<div class="hint">Checking Gmail for a review request…</div>`;
+  }
+  if(!REVIEW_REQS.enabled){
+    return head + fallback
+      + `<div class="hint" style="margin-top:7px">Tip: set <code>GMAIL_USERNAME</code> + <code>GMAIL_APP_PASSWORD</code> in <code>.env</code> to auto-detect open review requests.</div>`;
+  }
+  const reqs = REVIEW_REQS.byBrand[it.brand_key] || [];
+  if(!reqs.length){
+    const note = REVIEW_REQS.error
+      ? `<div class="hint">Couldn't check Gmail right now.</div>`
+      : `<div class="hint">No open review request found for ${esc(it.shop)}.</div>`;
+    return head + note + `<div class="rev-fallback">${fallback}</div>`;
+  }
+  const r0 = reqs[0];
+  const ago = agoLabel(r0.days_ago);
+  const go = r0.url
+    ? `<a class="btn rev-go" href="${esc(r0.url)}" target="_blank" rel="noopener">Leave a review →</a>`
+    : fallback;
+  const more = reqs.length > 1
+    ? `<a class="linkbtn rev-fallback" href="${esc(REVIEW_REQS.all_url)}" target="_blank" rel="noopener">${MAIL_ICON} ${reqs.length-1} more review request${reqs.length-1===1?'':'s'} from this shop</a>`
+    : '';
+  return head
+    + `<div class="revbox">`
+    +   `<div class="rev-h">${CHECK_ICON} ${esc(it.shop)} asked you to review this${ago?` · <span class="rev-ago">${esc(ago)}</span>`:''}</div>`
+    +   (r0.subject ? `<div class="rev-sub">${esc(r0.subject)}</div>` : '')
+    +   go
+    + `</div>`
+    + more;
+}
+
+function detailHtml(it){
+  const thumb = it.image ? `<img src="${esc(it.image)}" alt="">` : icon(it.category);
+  const rows = [];
+  if(it.color) rows.push(drow('Colour', esc(it.color)));
+  rows.push(drow('Size', esc(it.size)||'—'));
+  if((it.qty||1)>1) rows.push(drow('Qty', '×'+it.qty));
+  rows.push(drow('Price', it.price_display?esc(it.price_display):'—'));
+  rows.push(drow('Purchased', fmtDate(it.purchased_at)||'—'));
+  if(it.shipped_at){
+    const track = it.tracking_url ? ` · <a class="linkbtn" href="${esc(it.tracking_url)}" target="_blank" rel="noopener">track</a>` : '';
+    rows.push(drow('Shipped', fmtDate(it.shipped_at)+track));
+  }
+  const opts = META.category_choices.map(c => `<option value="${c.key}" ${c.key===it.category?'selected':''}>${esc(c.label)}</option>`).join('');
+  const catField = `<div class="field"><label>Category</label><select id="catSel">${opts}</select></div>`;
+  const fitInner = it.fit_review ? fitReviewView(it.fit_review) : fitFormHtml(it);
+  return `
+    <div class="mh">
+      <div class="mthumb">${thumb}</div>
+      <div class="mtitle"><h3>${esc(it.name)||'—'}</h3><div class="msub">${esc(it.shop)}</div></div>
+      <button class="mclose" id="mclose" title="Close">×</button>
+    </div>
+    <div class="mbody">
+      <div>${rows.join('')}</div>
+      ${catField}
+      ${bodyCompHtml(it.body_comp)}
+      ${productLinkHtml(it)}
+      <div class="dsec" id="fitSec"><h4>Fit feedback</h4>${fitInner}</div>
+      <div class="dsec" id="reviewSec">${reviewSectionHtml(it)}</div>
+    </div>`;
+}
+
+function openDetail(id){
+  const it = findItem(id);
+  if(!it) return;
+  currentId = id;
+  el('modal').innerHTML = detailHtml(it);
+  el('modalBack').classList.add('open');
+  wireDetail(it);
+}
+function closeDetail(){ el('modalBack').classList.remove('open'); currentId = null; }
+
+function wireDetail(it){
+  const close = el('mclose'); if(close) close.onclick = closeDetail;
+  const catSel = el('catSel'); if(catSel) catSel.onchange = () => doCategoryEdit(it.id, catSel.value);
+  const more = el('moreToggle'); if(more) more.onclick = () => { const w=el('moreWrap'); w.style.display = w.style.display==='none'?'block':'none'; };
+  const submit = el('fitSubmit'); if(submit) submit.onclick = () => doFitSubmit(it.id);
+  const redo = el('fitRedo'); if(redo) redo.onclick = () => { el('fitSec').innerHTML = '<h4>Fit feedback</h4>'+fitFormHtml(it); wireDetail(it); };
+}
+
+async function doCategoryEdit(id, category){
+  try {
+    const d = await postJson('/api/item/category', { id, category });
+    DATA = d; setSub();
+    const still = findItem(id);
+    render();
+    if(still){ openDetail(id); toastOk('Category updated'); }
+    else { closeDetail(); toastOk('Saved — item is now hidden as non-clothing'); }
+  } catch(e){ toast('Could not update category: ' + e.message); }
+}
+
+async function doFitSubmit(id){
+  const fitEl = el('fitSel');
+  const fit = fitEl ? fitEl.value : '';
+  if(!fit){ toast('Pick an overall fit first'); return; }
+  const body = { id, fit };
+  const v = id2 => { const x = el(id2); return x && x.value && x.value.trim ? x.value.trim() : (x?x.value:''); };
+  if(el('nextSel') && el('nextSel').value) body.next_time = el('nextSel').value;
+  if(el('verdictSel') && el('verdictSel').value) body.verdict = el('verdictSel').value;
+  if(el('inseamInput') && el('inseamInput').value) body.inseam_inches = el('inseamInput').value;
+  if(el('notesInput') && el('notesInput').value.trim()) body.notes = el('notesInput').value.trim();
+  if(el('shopNoteInput') && el('shopNoteInput').value.trim()) body.shop_note = el('shopNoteInput').value.trim();
+  const areas = {};
+  document.querySelectorAll('#modal [data-area]').forEach(s => { if(s.value) areas[s.dataset.area] = s.value; });
+  if(Object.keys(areas).length) body.areas = areas;
+  const btn = el('fitSubmit'); if(btn){ btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    const d = await postJson('/api/item/fit', body);
+    DATA = d; setSub(); render(); openDetail(id);
+    toastOk('Fit review saved');
+  } catch(e){
+    toast('Could not save fit review: ' + e.message);
+    if(btn){ btn.disabled = false; btn.textContent = 'Save fit review'; }
+  }
+}
+
+// ----- events -----
+el('facets').addEventListener('click', e => {
+  const chip = e.target.closest('.chip'); if(!chip) return;
+  const c = chip.dataset.cat;
+  if(c==='__all'){ selectedCats.clear(); }
+  else if(selectedCats.has(c)){ selectedCats.delete(c); }
+  else { selectedCats.add(c); }
+  render();
+});
+el('views').addEventListener('click', e => {
+  const b = e.target.closest('button'); if(!b) return;
+  view = b.dataset.view;
+  [...el('views').children].forEach(x => x.classList.toggle('active', x===b));
+  render();
+});
+const searchInput = el('search');
+searchInput.addEventListener('input', () => {
+  query = searchInput.value.trim();
+  el('searchWrap').classList.toggle('has-val', !!searchInput.value);
+  render();
+});
+el('clearBtn').addEventListener('click', () => { searchInput.value=''; query=''; el('searchWrap').classList.remove('has-val'); searchInput.focus(); render(); });
+
+// Content delegation: a group header toggles collapse; a spend row jumps to its
+// category; a card opens its detail. (Spend-view headers are `.group-head` but
+// NOT inside a `.group`, so the collapse branch falls through to a no-op.)
+el('content').addEventListener('click', e => {
+  const head = e.target.closest('.group-head');
+  if(head){
+    const sec = head.closest('.group'); if(!sec) return;
+    const gk = sec.dataset.gkey;
+    if(sec.classList.toggle('collapsed')) collapsed.add(gk); else collapsed.delete(gk);
+    saveCollapsed();
+    return;
+  }
+  const srow = e.target.closest('.spend-row.clickable');
+  if(srow && srow.dataset.spendcat){
+    view = 'categories';
+    selectedCats.clear(); selectedCats.add(srow.dataset.spendcat);
+    [...el('views').children].forEach(x => x.classList.toggle('active', x.dataset.view==='categories'));
+    render();
+    return;
+  }
+  const card = e.target.closest('.card');
+  if(card && card.dataset.id) openDetail(card.dataset.id);
+});
+
+el('sortsel').addEventListener('change', e => { sortBy = e.target.value; saveSort(); render(); });
+
+// Modal: click the backdrop or press Escape to close.
+el('modalBack').addEventListener('click', e => { if(e.target === el('modalBack')) closeDetail(); });
+document.addEventListener('keydown', e => { if(e.key === 'Escape' && el('modalBack').classList.contains('open')) closeDetail(); });
+
+async function loadMeta(){
+  try { const r = await fetch('/api/meta'); if(r.ok) META = await r.json(); } catch(_){}
+}
+
+// Pull detected review requests and index them by brand_key. Fire-and-forget
+// (called after the catalogue loads + after each Refresh) so the slow Gmail
+// check never blocks browsing; if a detail modal is already open, refresh just
+// its review section once the result lands.
+async function loadReviewRequests(){
+  try {
+    const r = await fetch('/api/review-requests');
+    if(r.ok){
+      const d = await r.json();
+      const byBrand = {};
+      for(const req of (d.requests||[])){
+        const k = req.brand_key || '';
+        (byBrand[k] = byBrand[k] || []).push(req);
+      }
+      REVIEW_REQS = { loaded:true, enabled:!!d.enabled, byBrand, all_url:d.all_url||'', error:d.error||null };
+    } else {
+      REVIEW_REQS.loaded = true;
+    }
+  } catch(_){
+    REVIEW_REQS.loaded = true;   // stop the "checking…" state; panel uses fallback
+  }
+  if(currentId){
+    const it = findItem(currentId), sec = el('reviewSec');
+    if(it && sec) sec.innerHTML = reviewSectionHtml(it);
+  }
+}
+
+function setSub(){
+  const s = DATA.stats;
+  const range = s.date_min ? `${(s.date_min||'').slice(0,4)}–${(s.date_max||'').slice(0,4)}` : '';
+  const spent = spentLabel(s.total_spent);
+  el('subline').textContent = `${s.total||0} items · ${s.shop_count||0} brands` + (range?` · ${range}`:'') + (spent?` · ${spent} spent`:'');
+}
+
+function toast(msg){ showToast(msg, false); }
+function toastOk(msg){ showToast(msg, true); }
+function showToast(msg, ok){
+  const t=el('toast'); t.textContent=msg; t.classList.toggle('ok', !!ok);
+  t.style.display='block'; clearTimeout(t._t); t._t=setTimeout(()=>{ t.style.display='none'; }, 3800);
+}
+async function postJson(url, body){
+  const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  const d = await r.json().catch(()=>({ error:'bad response' }));
+  if(!r.ok || d.error) throw new Error(d.error || ('HTTP '+r.status));
+  return d;
+}
+
+async function load(initial){
+  const btn = el('refreshBtn');
+  btn.disabled = true; btn.classList.add('spin');
+  try {
+    const r = await fetch(initial ? '/api/wardrobe' : '/api/refresh', { method: initial?'GET':'POST' });
+    const d = await r.json();
+    if(!r.ok || d.error) throw new Error(d.error || ('HTTP '+r.status));
+    DATA = d; setSub(); render();
+    loadReviewRequests();   // refresh detected review requests too (cache was cleared)
+  } catch(e){
+    toast('Could not load wardrobe: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.classList.remove('spin');
+  }
+}
+el('refreshBtn').addEventListener('click', () => load(false));
+
+// ----- stop the local server -----
+// The server replies {ok:true} and *then* shuts down, so the fetch may resolve
+// 200 OR reject as the socket closes — treat both as success and show the inert
+// overlay either way.
+async function stopServer(){
+  if(!confirm('Stop the wardrobe server? You’ll need to relaunch it from the terminal to browse again.')) return;
+  try { await fetch('/api/shutdown', { method: 'POST' }); } catch(_){}
+  showStopped();
+}
+function showStopped(){
+  closeDetail();
+  el('stoppedOverlay').classList.add('open');
+  ['refreshBtn','stopBtn'].forEach(id => { const b = el(id); if(b) b.disabled = true; });
+}
+el('stopBtn').addEventListener('click', stopServer);
+
+loadMeta();
+load(true);
+</script>
+</body>
+</html>
