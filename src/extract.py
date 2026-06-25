@@ -502,6 +502,32 @@ def _jsonld_price(items: list[dict]) -> dict:
     return {}
 
 
+def _extract_label(soup: BeautifulSoup) -> str | None:
+    """Best-effort product name, independent of price (issue #8).
+
+    Price extraction and label extraction are decoupled: a page we can reach but
+    can't pin a price on (zero-price stub, JS-rendered price, odd markup) should
+    still yield its name so the digest's "Could not check" section reads
+    "BibiSama — Wave Shorts: could not check" instead of a bare URL.
+
+    Only the **product-specific** structured meta — ``og:title`` / ``twitter:title``
+    — is consulted, NOT the bare ``<title>`` tag. A real product template emits
+    one of these; a bot-wall / DataDome challenge stub (HTTP 200/403 with a
+    generic ``<title>etsy.com</title>``) emits neither, so a blocked page yields
+    no phantom label (``TestEtsyBlocked::test_no_phantom_data``). Returns None
+    when no product-title meta is present.
+    """
+    for prop in ("og:title", "twitter:title"):
+        tag = (
+            soup.find("meta", attrs={"property": prop})
+            or soup.find("meta", attrs={"name": prop})
+        )
+        content = (tag.get("content") if tag else "") or ""
+        if content.strip():
+            return content.strip()
+    return None
+
+
 def _og_price(soup: BeautifulSoup) -> dict:
     """Extract price from OpenGraph meta tags."""
     tag = soup.find("meta", attrs={"property": "og:price:amount"})
@@ -730,6 +756,16 @@ def parse(
         result["original_price"] = html_structured.get("original_price")
         result["currency"] = html_structured.get("currency")
         result["label"] = html_structured.get("label")
+
+    # --- Label (decoupled from price — issue #8) ---
+    # The merge above only sets a label on the price-source branch it took, and
+    # the regex fallback above can overwrite html_structured (dropping its
+    # og:title). So when no label survived, pull one straight from the page's
+    # meta tags. Runs unconditionally so a blocked/zero-price item still carries
+    # its name into the digest (and persists via prices.json across later failing
+    # runs — detect_sale keeps `label` when extraction returns None).
+    if not result["label"]:
+        result["label"] = shopify.get("label") or _extract_label(soup)
 
     # --- OOS / low-stock ---
     # Shopify JSON 'available' field is authoritative when present.

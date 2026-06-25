@@ -483,6 +483,30 @@ class TestExtractSmsSignals:
         out = extract_sms_signals([sms], {}, ["Aniqi"], now=self._NOW)
         assert out["untracked_senders"] == []
 
+    def test_digit_leading_brand_surfaced_for_discovery(self):
+        # Issue #26: a brand whose name starts with a digit ("100brand") must
+        # still surface in discovery when the body announces a sale — the brand
+        # lead used to require a leading letter and silently dropped it.
+        sms = self._sms(
+            "m1", "44321",
+            "100brand: Hat Restock early access is now live. 20% off today.",
+            subject="New text message from 44321",
+        )
+        out = extract_sms_signals([sms], {}, ["PeakWear"], now=self._NOW)
+        assert len(out["untracked_senders"]) == 1
+        assert out["untracked_senders"][0]["brand"] == "100brand"
+
+    def test_pure_numeric_lead_not_a_brand(self):
+        # Issue #26 guard: a bare numeric short-code prefix ("31354:") carries no
+        # letter, so it must NOT be mistaken for a brand even with a sale lexeme.
+        sms = self._sms(
+            "m1", "31354",
+            "31354: 20% off sitewide today only. Shop now.",
+            subject="New text message from 31354",
+        )
+        out = extract_sms_signals([sms], {}, ["PeakWear"], now=self._NOW)
+        assert out["untracked_senders"] == []
+
     def test_empty_input(self):
         out = extract_sms_signals([], {}, [], now=self._NOW)
         assert out == {"codes": [], "unattributed": [], "sale_signals": [],

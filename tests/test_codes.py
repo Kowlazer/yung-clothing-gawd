@@ -135,6 +135,77 @@ def test_hyphenated_code_shop(codes):
 
 
 # ---------------------------------------------------------------------------
+# Issue #3 — codes in the free-form Notes section (above "Shops and URLs:")
+# are harvested but left unattributed; the scratch headings there aren't shops.
+# ---------------------------------------------------------------------------
+
+def test_notes_section_code_unattributed(codes):
+    # SAVE20! sits in the Notes section under the scratch heading "Orders to
+    # make next:" (above the "Shops and URLs:" marker). It must be harvested
+    # but NOT attributed to that heading as if it were a shop.
+    entry = next(c for c in codes if c["code"] == "SAVE20!")
+    assert entry["shop"] == ""
+
+
+def test_notes_code_not_attributed_to_scratch_heading():
+    # Focused repro of the SBWORLD! case from the issue.
+    from src.codes import harvest_codes
+    text = (
+        "Notes:\n"
+        "Orders to make next:\n"
+        "Snackyboy promo SBWORLD! still good?\n"
+        "\n"
+        "Shops and URLs:\n"
+        "RealShop:\n"
+        "10% off code: REALCODE10\n"
+    )
+    by_code = {c["code"]: c for c in harvest_codes(text)}
+    # Notes-section code: harvested, but not attributed to the scratch heading.
+    assert by_code["SBWORLD!"]["shop"] == ""
+    # Below-marker code: still attributed to its shop header.
+    assert by_code["REALCODE10"]["shop"] == "RealShop"
+
+
+def test_no_marker_keeps_legacy_attribution():
+    # Older docs without the "Shops and URLs:" split: whole text is the
+    # attributed section, so a code under a shop header is still attributed.
+    from src.codes import harvest_codes
+    text = "RealShop:\n10% off code: LEGACY10\n"
+    by_code = {c["code"]: c for c in harvest_codes(text)}
+    assert by_code["LEGACY10"]["shop"] == "RealShop"
+
+
+# ---------------------------------------------------------------------------
+# Issue #5 — hyphen-tolerant token shape must not harvest month+day deadlines.
+# ---------------------------------------------------------------------------
+
+class TestMonthDayDeadline:
+    @pytest.mark.parametrize("token", [
+        "MAY-15", "JUNE-30", "DEC-25", "JAN-1", "July-4", "FEB-28",
+    ])
+    def test_month_day_rejected(self, token):
+        from src.codes import _is_valid_code
+        assert _is_valid_code(token) is False, f"{token!r} should be rejected"
+
+    @pytest.mark.parametrize("code", ["MAY15", "SUMMER25", "JUNE30OFF"])
+    def test_hyphenless_month_code_kept(self, code):
+        # A hyphen-LESS month+number is a common real promo code — keep it.
+        from src.codes import _is_valid_code
+        assert _is_valid_code(code) is True, f"{code!r} should be kept"
+
+    def test_deadline_not_harvested_from_copy(self):
+        from src.codes import harvest_codes
+        text = "RealShop:\nUse your discount before MAY-15 to save big.\n"
+        values = [c["code"] for c in harvest_codes(text)]
+        assert "MAY-15" not in values
+
+    def test_real_multisegment_code_still_whole(self):
+        # Guard: the date rule must not touch genuine multi-segment codes.
+        from src.codes import _is_valid_code
+        assert _is_valid_code("OKRK-RVKAJ-NSZN") is True
+
+
+# ---------------------------------------------------------------------------
 # Mixed-case regex relaxation + uppercase canonicalisation
 #
 # Diagnosis on 2026-05-25 showed PeakWear's ``SummerSale15`` promo was missed

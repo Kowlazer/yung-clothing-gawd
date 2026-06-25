@@ -3,6 +3,12 @@ from __future__ import annotations
 
 import re
 
+# Single source of truth for the "Shops and URLs:" marker that splits the
+# free-form Notes section from the structured shop entries. Imported (not
+# re-defined) so codes harvesting honours the exact same split classify()
+# does. classify imports nothing from codes, so this is cycle-free.
+from src.classify import _SHOPS_AND_URLS_HEADER_RE
+
 # Lines containing code-adjacent keywords
 _CODE_CONTEXT_RE = re.compile(
     r'(?:code|discount|coupon|off|promo)\b',
@@ -99,10 +105,29 @@ _LOW_CONFIDENCE_WORDS = frozenset({
 })
 
 
+# Month-name + day tokens ("MAY-15", "JUNE-30", "DEC-25") are sale *deadlines*,
+# not promo codes. The internal hyphen the token regex now tolerates (so
+# multi-segment codes like OKRK-RVKAJ-NSZN match whole) would otherwise harvest
+# them from marketing copy such as "use code by MAY-15" (issue #5). A
+# hyphen-LESS "MAY15" stays a valid digit-bearing code; only the dated
+# MONTH-DD shape is rejected.
+_MONTH_DAY_RE = re.compile(
+    r"^(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUNE?|JULY?"
+    r"|AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)"
+    r"-\d{1,2}$",
+    re.IGNORECASE,
+)
+
+
 def _looks_like_hex_color(core: str) -> bool:
     """6-char hex-only tokens (F8F8F8, FFFFFF) are CSS color values bleeding
     out of inline styles, not promo codes."""
     return len(core) == 6 and all(c in "0123456789ABCDEFabcdef" for c in core)
+
+
+def _looks_like_date(core: str) -> bool:
+    """A month-name + day token ("MAY-15", "JUNE-30") is a deadline, not a code."""
+    return bool(_MONTH_DAY_RE.match(core))
 
 
 def _classify_confidence(token: str) -> str:
@@ -172,6 +197,8 @@ def _is_valid_code(token: str) -> bool:
         return False  # rejects "DOCTYPE", "PUBLIC", "XHTML" from leaked HTML
     if _looks_like_hex_color(core):
         return False  # rejects "F8F8F8" CSS colours bleeding out of styles
+    if _looks_like_date(core):
+        return False  # rejects "MAY-15" / "JUNE-30" deadlines (issue #5)
     letters = [c for c in core if c.isalpha()]
     if not letters:
         return False  # rejects "2025", "30"
@@ -211,18 +238,46 @@ _SHOP_HEADER_RE = re.compile(r'^([A-Z][A-Za-z0-9\s&]{1,40}?):\s*$', re.M)
 
 
 def harvest_codes(text: str) -> list[dict]:
-    """Return list of {shop, code, context} dicts found in watchlist text."""
-    results: list[dict] = []
-    lines = text.splitlines()
+    """Return list of {shop, code, context} dicts found in watchlist text.
 
+    Honours the same ``Shops and URLs:`` split that ``classify()`` uses (issue
+    #3). Codes in the free-form Notes section *above* the marker are still
+    harvested, but left **unattributed** (``shop=""``): the headings there
+    ("Orders to make next:") are scratch notes the user keeps, not real shops,
+    and attributing a code to one of them is misleading. Codes *below* the
+    marker are attributed to the nearest ``ShopName:`` header as before. When
+    the marker is absent (older docs without the split) the whole text is
+    treated as the attributed section, preserving legacy behaviour.
+    """
+    marker = _SHOPS_AND_URLS_HEADER_RE.search(text)
+    if marker:
+        notes_text, shops_text = text[:marker.start()], text[marker.end():]
+    else:
+        notes_text, shops_text = "", text
+
+    results: list[dict] = []
+    results.extend(_harvest_section(notes_text, attribute=False))
+    results.extend(_harvest_section(shops_text, attribute=True))
+    return results
+
+
+def _harvest_section(text: str, *, attribute: bool) -> list[dict]:
+    """Harvest codes from one section of the watchlist.
+
+    ``attribute=True`` tracks the nearest ``ShopName:`` header and stamps it on
+    each code; ``attribute=False`` (the Notes section) leaves ``shop=""`` since
+    its headings aren't shops.
+    """
+    results: list[dict] = []
     current_shop = ""
-    for line in lines:
+    for line in text.splitlines():
         stripped = line.strip()
 
-        # Update current shop context
-        m = _SHOP_HEADER_RE.match(stripped)
-        if m:
-            current_shop = m.group(1).strip()
+        # Update current shop context (attributed section only).
+        if attribute:
+            m = _SHOP_HEADER_RE.match(stripped)
+            if m:
+                current_shop = m.group(1).strip()
 
         # Only scan lines that look code-adjacent
         if not _CODE_CONTEXT_RE.search(stripped):
@@ -233,7 +288,7 @@ def harvest_codes(text: str) -> list[dict]:
             if not _is_valid_code(raw):
                 continue
             results.append({
-                "shop": current_shop,
+                "shop": current_shop if attribute else "",
                 "code": _canonicalise_code(raw),
                 "context": stripped,
                 "confidence": _classify_confidence(raw),

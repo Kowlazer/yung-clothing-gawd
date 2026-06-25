@@ -595,3 +595,39 @@ class TestSalesTrackingShops:
     def test_case_insensitive_header(self):
         text = "SHOPS TO TRACK SALES FOR:\nLumastep\n"
         assert sales_tracking_shops(text) == ["Lumastep"]
+
+
+class TestGenericSectionResetsShop:
+    """Issue #4: a generic section divider that looks like a "ShopName:" header
+    must reset the shop context so URLs beneath it do not inherit the previous
+    shop (animecollective product URLs were being attributed to "100moons")."""
+
+    def test_animecollective_urls_do_not_inherit_prior_shop(self):
+        text = (
+            "Shops and URLs:\n"
+            "100moons:\n"
+            "https://100moons.com/products/foo\n"
+            "Animecollective stuff from sale:\n"
+            "https://animecollective.com/products/bar\n"
+            "https://animecollective.com/products/baz\n"
+        )
+        by_url = {
+            e.value: e for e in classify(text) if e.category == "PRODUCT_URL"
+        }
+        # The 100moons URL keeps its shop.
+        assert by_url["https://100moons.com/products/foo"].context == "100moons"
+        # The animecollective URLs must NOT inherit "100moons".
+        assert by_url["https://animecollective.com/products/bar"].context == ""
+        assert by_url["https://animecollective.com/products/baz"].context == ""
+
+    def test_divider_does_not_emit_a_shop_name_entry(self):
+        text = (
+            "Shops and URLs:\n"
+            "100moons:\n"
+            "https://100moons.com/products/foo\n"
+            "Orders to make next:\n"
+            "https://elsewhere.com/products/bar\n"
+        )
+        shop_names = {e.value for e in classify(text) if e.category == "SHOP_NAME"}
+        assert "Orders to make next" not in shop_names
+        assert "Animecollective stuff from sale" not in shop_names

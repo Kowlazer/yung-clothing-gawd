@@ -307,14 +307,24 @@ _BODY_SHIP_STRICT_RE = re.compile(
 
 # Explicit past-tense shipment phrasing — every alternative asserts the parcel
 # has ALREADY shipped, language an original order receipt never uses (a receipt
-# says items "will ship" / "as soon as your order ships"). "N items have
-# shipped" / "1 item has shipped" both hit. Paired with a ship marker in
-# _classify, this reclassifies Gap-family "Ship Notification" emails — whose
-# subject is the generic "An update to your order #N" and whose carrier link is
-# dropped during HTML->text — as shipping. Without it they re-list the full
-# order summary and re-extract as a duplicate order.
+# says items "will ship" / "as soon as your order ships"). Paired with a ship
+# marker in _classify, this reclassifies Gap-family "Ship Notification" emails —
+# whose subject is the generic "An update to your order #N" and whose carrier
+# link is dropped during HTML->text — as shipping. Without it they re-list the
+# full order summary and re-extract as a duplicate order.
+#
+# Shape: a shipment noun (item/order/package/parcel/shipment, optional "your")
+# + a perfect/passive auxiliary (has/have/was/were) + an optional "been" +
+# shipped/sent/dispatched. Issue #13 broadened this from the original
+# "(has|have) shipped" so the "have been shipped" / "were sent" / partial-
+# shipment variants (e.g. Old Navy #1LCBWLK) also hit. The auxiliary +
+# past-participle requirement keeps it genuinely past-tense: an original
+# confirmation ("as soon as your order ships", "your order has been *received*",
+# "is on the way") never matches, so pairing it with the loose
+# _BODY_SHIP_MARKER_RE can't flip a real receipt to shipping.
 _BODY_SHIPPED_PAST_RE = re.compile(
-    r"\b(?:item|items|order|package|your\s+order)\s+(?:has|have)\s+shipped\b",
+    r"\b(?:your\s+)?(?:items?|orders?|packages?|parcels?|shipments?)"
+    r"\s+(?:has|have|was|were)\s+(?:been\s+)?(?:shipped|sent|dispatched)\b",
     re.I,
 )
 

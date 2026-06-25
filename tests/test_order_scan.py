@@ -310,6 +310,54 @@ class TestClassify:
         )
         assert _classify(em) == "order"
 
+    def test_oldnavy_have_been_shipped_variant_is_shipping(self):
+        # Issue #13: the #1LCBWLK "An update to your order" ship notification
+        # uses a past-tense variant ("your items have been shipped") that the
+        # original "(has|have) shipped" shape missed — so it re-extracted as a
+        # duplicate of the confirmation. The broadened past-tense regex plus the
+        # loose tracking marker must now classify it as shipping.
+        em = self._em(
+            subject="An update to your order #1LCBWLK",
+            from_="Old Navy <orders@email.oldnavy.com>",
+            body=(
+                "Ship Notification & Receipt\nHi Sam,\n"
+                "Your items have been shipped.\n"
+                "Order #1LCBWLK\nSubtotal $48.00\n"
+                "Crew-Neck T-Shirt L | Black $12.00\n"
+                "Tracking 1Z31350WYW68781988\n"
+            ),
+        )
+        assert _classify(em) == "shipping"
+
+    def test_oldnavy_were_sent_variant_is_shipping(self):
+        # The passive "were sent" variant + a long USPS-style tracking id.
+        em = self._em(
+            subject="An update to your order #1LCBWLK",
+            from_="Old Navy <orders@email.oldnavy.com>",
+            body=(
+                "Ship Notification & Receipt\nYour items were sent.\n"
+                "Order #1LCBWLK\nSubtotal $12.00\n"
+                "Crew-Neck T-Shirt L | Black $12.00\nUSPS 92612909841038\n"
+            ),
+        )
+        assert _classify(em) == "shipping"
+
+    def test_received_confirmation_not_flipped_by_broadened_regex(self):
+        # Guard for the #13 broadening: "has been received" (a confirmation
+        # phrase) shares the auxiliary shape but isn't shipped/sent/dispatched,
+        # so a real receipt with a 13-digit SKU must stay an order.
+        em = self._em(
+            subject="Order Confirmation #1LCBWLK",
+            from_="Old Navy <orders@email.oldnavy.com>",
+            body=(
+                "Your order #1LCBWLK has been received.\n"
+                "We'll send you an email as soon as your order ships.\n"
+                "Subtotal $48.00\n"
+                "Crew-Neck T-Shirt 8554280620003 L | Black $12.00\n"
+            ),
+        )
+        assert _classify(em) == "order"
+
     def test_real_order_confirmation_without_tracking_stays_order(self):
         # Guard: the genuine 5/23 confirmation (item list + "Order #N", no
         # transit phrase, no tracking marker) must keep classifying as order.

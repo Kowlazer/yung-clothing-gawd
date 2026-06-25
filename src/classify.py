@@ -323,6 +323,19 @@ def classify(text: str) -> list[Entry]:
                     )
             continue
 
+        # 1.5. A generic section divider ("Animecollective stuff from sale:",
+        # "Orders to make next:", "Places to buy Rugs:") looks like a
+        # "ShopName:" header but actually opens a new non-shop section. Reset
+        # current_shop so URLs/items beneath it don't inherit the *previous*
+        # shop's context (issue #4: animecollective product URLs were being
+        # attributed to the "100moons" header above them). The line itself is
+        # then dropped, same as before. Must run before the _IGNORE_LINE_RE
+        # check below, which also matches these dividers but continues without
+        # resetting.
+        if _GENERIC_SECTION_RE.match(line):
+            current_shop = ""
+            continue
+
         # 2. Definitely-ignore lines
         if _IGNORE_LINE_RE.search(line):
             continue

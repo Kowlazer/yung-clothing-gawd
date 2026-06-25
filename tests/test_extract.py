@@ -284,6 +284,41 @@ class TestEtsyBlocked:
         assert r["label"] is None
 
 
+class TestLabelDecoupledFromPrice:
+    """Issue #8: label extraction is independent of price extraction. A page we
+    can reach but can't pin a price on still yields its product name (from
+    og:title / twitter:title) so the digest's 'Could not check' section reads
+    'BibiSama — Wave Shorts: could not check' instead of a bare URL."""
+
+    URL = "https://bibisama.example/products/wave-shorts"
+
+    def test_og_title_label_without_price(self):
+        html = (
+            "<html><head>"
+            '<meta property="og:title" content="BibiSama — Wave Shorts">'
+            "</head><body><p>Price loads via JavaScript; nothing in the HTML.</p>"
+            "</body></html>"
+        )
+        r = parse(html, self.URL)
+        assert r["current_price"] is None
+        assert r["label"] == "BibiSama — Wave Shorts"
+
+    def test_twitter_title_fallback(self):
+        html = (
+            "<html><head>"
+            '<meta name="twitter:title" content="Wave Shorts">'
+            "</head><body></body></html>"
+        )
+        r = parse(html, self.URL)
+        assert r["label"] == "Wave Shorts"
+
+    def test_bare_title_is_not_a_phantom_label(self):
+        # A generic <title> (bot-wall / host name) must NOT become a label.
+        html = "<html><head><title>example.com</title></head><body></body></html>"
+        r = parse(html, self.URL)
+        assert r["label"] is None
+
+
 # ---------------------------------------------------------------------------
 # _html_oos behavior — conservative scoping to the cart-add form button
 # ---------------------------------------------------------------------------

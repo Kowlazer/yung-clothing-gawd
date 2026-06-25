@@ -99,7 +99,11 @@ _VERIFICATION_RE = re.compile(
 # watchlist / allowlist shop, we surface the brand so the user can add it to
 # SMS_SALE_SHOPS. Gate on a sale-ish lexeme so transactional/personal texts
 # don't flood the discovery list.
-_BRAND_LEAD_RE = re.compile(r"^\s*([A-Za-z][\w&'.+ -]{1,38}?):")
+# Allow a digit-leading brand ("100brand: …" — issue #26) by opening the first
+# character class to [A-Za-z0-9]; the captured name is then post-filtered to
+# require at least one LETTER (see _brand_lead) so a bare numeric short-code
+# prefix ("31354: …") or a price ("$50: …") doesn't read as a brand.
+_BRAND_LEAD_RE = re.compile(r"^\s*([A-Za-z0-9][\w&'.+ -]{1,38}?):")
 _SALE_HINT_RE = re.compile(
     r"(?:\d+%|\$\d+|\bsale\b|\bdeal\b|\boff\b|\bsave\b|\bclearance\b|\bbogo\b|"
     r"\bpromo\b|\bcoupon\b|\bdiscount\b|free ship|\bmarkdown\b|early access|"
@@ -499,10 +503,10 @@ def extract_sms_signals(
             # Discovery: a "Brand: …" lead + a sale lexeme means a shop we
             # don't track just texted a deal — record it so the digest can
             # prompt the user to add it to SMS_SALE_SHOPS.
-            lead = _BRAND_LEAD_RE.match(body)
-            if lead and _SALE_HINT_RE.search(body):
+            brand = _brand_lead(body)
+            if brand and _SALE_HINT_RE.search(body):
                 untracked_senders.append({
-                    "brand": lead.group(1).strip(),
+                    "brand": brand,
                     "number": number,
                     "excerpt": _excerpt(body, 140),
                     "email_id": eid,
@@ -515,6 +519,22 @@ def extract_sms_signals(
         "untracked_senders": untracked_senders,
         "processed_ids": processed_ids,
     }
+
+
+def _brand_lead(body: str) -> str | None:
+    """Return the leading "Brand:" name from an SMS body, or None.
+
+    Allows a digit-leading brand ("100brand") but requires the captured name to
+    contain at least one letter, so a pure numeric short-code prefix ("31354:")
+    or a price ("$50:") is not mistaken for a brand (issue #26).
+    """
+    m = _BRAND_LEAD_RE.match(body or "")
+    if not m:
+        return None
+    name = m.group(1).strip()
+    if not any(ch.isalpha() for ch in name):
+        return None
+    return name
 
 
 def _excerpt(text: str, limit: int = _BODY_EXCERPT_LIMIT) -> str:
