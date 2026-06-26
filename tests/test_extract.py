@@ -845,6 +845,10 @@ class TestErrorKind:
         from src.extract import _classify_error
         assert _classify_error(None, 503) == "blocked"
 
+    def test_429_is_rate_limited(self):
+        from src.extract import _classify_error
+        assert _classify_error(None, 429) == "rate_limited"
+
     def test_500_is_server_error(self):
         from src.extract import _classify_error
         assert _classify_error(None, 500) == "server_error"
@@ -858,6 +862,125 @@ class TestErrorKind:
     def test_unknown_exception_is_other(self):
         from src.extract import _classify_error
         assert _classify_error(RuntimeError("nope"), None) == "other"
+
+
+# ---------------------------------------------------------------------------
+# Retry-After parsing + 429/503 retry-with-backoff
+# ---------------------------------------------------------------------------
+
+class _FakeResp:
+    def __init__(self, status_code, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
+class _FakeClient:
+    """Hands back a queued sequence of responses for successive .get() calls."""
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def get(self, url):
+        self.calls.append(url)
+        return self._responses.pop(0)
+
+
+class TestParseRetryAfter:
+    def test_none_and_empty(self):
+        from src.extract import _parse_retry_after
+        assert _parse_retry_after(None) is None
+        assert _parse_retry_after("") is None
+        assert _parse_retry_after("   ") is None
+
+    def test_delta_seconds(self):
+        from src.extract import _parse_retry_after
+        assert _parse_retry_after("5") == 5.0
+        assert _parse_retry_after(" 30 ") == 30.0
+
+    def test_http_date_in_future(self):
+        from datetime import datetime, timedelta, timezone
+        from src.extract import _parse_retry_after
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        future = now + timedelta(seconds=42)
+        header = future.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        assert abs(_parse_retry_after(header, now=now) - 42.0) < 1.0
+
+    def test_http_date_in_past_clamps_to_zero(self):
+        from datetime import datetime, timedelta, timezone
+        from src.extract import _parse_retry_after
+        now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        past = now - timedelta(seconds=10)
+        header = past.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        assert _parse_retry_after(header, now=now) == 0.0
+
+    def test_garbage_is_none(self):
+        from src.extract import _parse_retry_after
+        assert _parse_retry_after("not-a-date") is None
+
+
+class TestGetWithRetry:
+    def test_returns_immediately_on_200(self):
+        from src.extract import _get_with_retry
+        client = _FakeClient([_FakeResp(200)])
+        sleeps: list[float] = []
+        resp = _get_with_retry(client, "http://x", sleep=sleeps.append)
+        assert resp.status_code == 200
+        assert len(client.calls) == 1
+        assert sleeps == []
+
+    def test_retries_429_then_succeeds(self):
+        from src.extract import _get_with_retry
+        client = _FakeClient([
+            _FakeResp(429, {"Retry-After": "3"}),
+            _FakeResp(200),
+        ])
+        sleeps: list[float] = []
+        resp = _get_with_retry(client, "http://x", sleep=sleeps.append)
+        assert resp.status_code == 200
+        assert len(client.calls) == 2
+        assert sleeps == [3.0]  # honored the Retry-After header
+
+    def test_backoff_when_no_header(self):
+        from src.extract import _get_with_retry, _MAX_BACKOFF
+        client = _FakeClient([
+            _FakeResp(429), _FakeResp(429), _FakeResp(200),
+        ])
+        sleeps: list[float] = []
+        _get_with_retry(client, "http://x", sleep=sleeps.append)
+        # exponential: 1, 2 (both under the cap)
+        assert sleeps == [1.0, 2.0]
+        assert all(s <= _MAX_BACKOFF for s in sleeps)
+
+    def test_caps_huge_retry_after(self):
+        from src.extract import _get_with_retry, _MAX_BACKOFF
+        client = _FakeClient([
+            _FakeResp(429, {"Retry-After": "9999"}),
+            _FakeResp(200),
+        ])
+        sleeps: list[float] = []
+        _get_with_retry(client, "http://x", sleep=sleeps.append)
+        assert sleeps == [_MAX_BACKOFF]
+
+    def test_returns_last_429_after_exhausting_retries(self):
+        from src.extract import _get_with_retry
+        client = _FakeClient([_FakeResp(429) for _ in range(10)])
+        sleeps: list[float] = []
+        resp = _get_with_retry(client, "http://x", max_retries=3,
+                               sleep=sleeps.append)
+        assert resp.status_code == 429
+        assert len(client.calls) == 4  # 1 initial + 3 retries
+        assert len(sleeps) == 3
+
+    def test_503_is_retried(self):
+        from src.extract import _get_with_retry
+        client = _FakeClient([
+            _FakeResp(503, {"Retry-After": "2"}),
+            _FakeResp(200),
+        ])
+        sleeps: list[float] = []
+        resp = _get_with_retry(client, "http://x", sleep=sleeps.append)
+        assert resp.status_code == 200
+        assert sleeps == [2.0]
 
 
 # ---------------------------------------------------------------------------
