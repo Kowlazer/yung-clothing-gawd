@@ -99,7 +99,12 @@ def _is_shopify_url(url: str) -> bool:
     return "/products/" in url
 
 
-_SHOPIFY_LIMITER = _RateLimiter(2.0)  # ≤1 Shopify product request per 2 s globally
+# ≤1 Shopify product extract per 4 s globally. Conservative on purpose: each
+# extract() fires 2-3 sub-requests (.json/.js/HTML) in a burst, so a 4 s gap
+# keeps the *averaged* rate near ~0.75 req/s — well under Shopify's per-IP
+# threshold. Runtime cost (a few extra minutes) is acceptable; a 429-storm that
+# blanks the digest is not.
+_SHOPIFY_LIMITER = _RateLimiter(4.0)
 
 
 # ---------------------------------------------------------------------------
