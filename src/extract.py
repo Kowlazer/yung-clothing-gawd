@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import email.utils
 import json
 import logging
 import re
-import time
 import warnings
-from datetime import datetime, timezone
 from typing import Any
 
 import extruct
 import httpx
 from bs4 import BeautifulSoup
+
+from src.http_util import get_with_retry
 
 log = logging.getLogger(__name__)
 
@@ -27,15 +26,6 @@ _HEADERS = {
 }
 _TIMEOUT = 15.0
 _LOW_STOCK_THRESHOLD = 5
-
-# Retry policy for rate-limit / transient-unavailable responses. We honor the
-# server's Retry-After header when present (adaptive — no guessing at the
-# threshold), falling back to exponential backoff otherwise. A persistent 429
-# after the retries is classified `rate_limited` for the digest.
-_RETRY_STATUSES = frozenset({429, 503})
-_MAX_RETRIES = 3        # extra attempts after the first GET (up to 4 total)
-_BACKOFF_BASE = 1.0     # seconds; doubles each attempt: 1, 2, 4 ...
-_MAX_BACKOFF = 20.0     # cap on any single wait (also caps a huge Retry-After)
 
 _SCHEMA_OOS = frozenset({
     "http://schema.org/OutOfStock",
@@ -845,62 +835,6 @@ def parse(
     return result
 
 
-def _parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:
-    """Translate a ``Retry-After`` header into seconds to wait.
-
-    Accepts both RFC 7231 forms — delta-seconds (a bare integer) or an
-    HTTP-date — and returns the seconds to wait (never negative), or ``None``
-    when the header is absent or unparseable (caller then uses backoff).
-    """
-    if not value:
-        return None
-    value = value.strip()
-    if value.isdigit():
-        return float(value)
-    try:
-        dt = email.utils.parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    now = now or datetime.now(timezone.utc)
-    return max(0.0, (dt - now).total_seconds())
-
-
-def _get_with_retry(
-    client: httpx.Client,
-    url: str,
-    *,
-    max_retries: int = _MAX_RETRIES,
-    sleep=time.sleep,
-) -> httpx.Response:
-    """GET ``url``, retrying on 429/503 while honoring ``Retry-After``.
-
-    On a retry status, waits the server-instructed ``Retry-After`` (or an
-    exponential backoff when the header is absent/invalid, capped at
-    ``_MAX_BACKOFF``), up to ``max_retries`` extra attempts, then returns the
-    final response — which the caller still classifies, so a persistent 429
-    becomes ``rate_limited``. Network-level exceptions propagate unchanged
-    (handled by ``extract``'s own try/except), so this only adapts to a server
-    that explicitly told us to slow down.
-    """
-    resp = client.get(url)
-    for attempt in range(max_retries):
-        if resp.status_code not in _RETRY_STATUSES:
-            return resp
-        wait = _parse_retry_after(resp.headers.get("Retry-After"))
-        if wait is None:
-            wait = _BACKOFF_BASE * (2 ** attempt)
-        wait = min(wait, _MAX_BACKOFF)
-        log.info("extract: %s -> %s, backing off %.1fs (retry %d/%d)",
-                 url, resp.status_code, wait, attempt + 1, max_retries)
-        sleep(wait)
-        resp = client.get(url)
-    return resp
-
-
 def _classify_error(exc: Exception | None, status: int | None) -> str:
     """Map an httpx exception or HTTP status code to a stable error_kind string."""
     if status is not None:
@@ -955,7 +889,7 @@ def extract(url: str, *, preferred_sizes: tuple[str, ...] = ()) -> dict:
         json_url = _shopify_json_url(url)
         try:
             with httpx.Client(headers=_HEADERS, timeout=_TIMEOUT, follow_redirects=True) as client:
-                resp = _get_with_retry(client, json_url)
+                resp = get_with_retry(client, json_url)
             if resp.status_code == 200:
                 product_json = resp.json()
         except Exception as exc:
@@ -969,7 +903,7 @@ def extract(url: str, *, preferred_sizes: tuple[str, ...] = ()) -> dict:
             js_url = _shopify_js_url(url)
             try:
                 with httpx.Client(headers=_HEADERS, timeout=_TIMEOUT, follow_redirects=True) as client:
-                    js_resp = _get_with_retry(client, js_url)
+                    js_resp = get_with_retry(client, js_url)
                 if js_resp.status_code == 200:
                     _merge_js_availability(product_json, js_resp.json())
             except Exception as exc:
@@ -977,7 +911,7 @@ def extract(url: str, *, preferred_sizes: tuple[str, ...] = ()) -> dict:
 
     try:
         with httpx.Client(headers=_HEADERS, timeout=_TIMEOUT, follow_redirects=True) as client:
-            resp = _get_with_retry(client, url)
+            resp = get_with_retry(client, url)
     except Exception as exc:
         result["error"] = f"fetch failed: {exc}"
         result["error_kind"] = _classify_error(exc, None)

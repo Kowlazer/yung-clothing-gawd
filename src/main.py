@@ -26,7 +26,6 @@ import os
 import random
 import re
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
@@ -52,6 +51,7 @@ from src.watchlist_links import (
     removal_url,
 )
 from src.fx import get_rates
+from src.http_util import RateLimiter
 from src.gmail import (
     extract_signals,
     fetch_promotions,
@@ -74,27 +74,6 @@ _MAX_WORKERS = 10  # ThreadPool size for parallel product-page fetches
 _INTRA_DOMAIN_JITTER = (0.5, 1.5)  # seconds
 
 
-class _RateLimiter:
-    """Thread-safe inter-request delay across all threads.
-
-    Ensures at least ``interval`` seconds between successive acquisitions so
-    concurrent domain threads don't hammer shared platform infrastructure
-    (e.g. all Shopify-hosted stores share the same CDN rate limit by source IP).
-    """
-    def __init__(self, interval: float) -> None:
-        self._lock = threading.Lock()
-        self._last = 0.0
-        self._interval = interval
-
-    def acquire(self) -> None:
-        with self._lock:
-            now = time.monotonic()
-            wait = self._interval - (now - self._last)
-            if wait > 0:
-                time.sleep(wait)
-            self._last = time.monotonic()
-
-
 def _is_shopify_url(url: str) -> bool:
     return "/products/" in url
 
@@ -104,7 +83,7 @@ def _is_shopify_url(url: str) -> bool:
 # keeps the *averaged* rate near ~0.5 req/s — well under Shopify's per-IP
 # threshold. Runtime cost (a few extra minutes) is acceptable; a 429-storm that
 # blanks the digest is not.
-_SHOPIFY_LIMITER = _RateLimiter(5.0)
+_SHOPIFY_LIMITER = RateLimiter(5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -438,9 +417,10 @@ def _extract_many(
             # Shopify hosts many independent stores on shared infrastructure;
             # concurrent requests from one IP across all of them trigger a
             # platform-level 429. Serialise Shopify requests globally with a
-            # minimum inter-request gap. Only active in live runs (jitter set);
-            # tests pass jitter=None to skip all delays.
-            if jitter and _is_shopify_url(url):
+            # minimum inter-request gap. Gated on the same "delays enabled"
+            # signal as the jitter sleep above (jitter set and non-zero), so
+            # tests passing jitter=None or (0, 0) skip all real sleeps.
+            if jitter and jitter[1] > 0 and _is_shopify_url(url):
                 _SHOPIFY_LIMITER.acquire()
             try:
                 out[url] = _call_fn(url)

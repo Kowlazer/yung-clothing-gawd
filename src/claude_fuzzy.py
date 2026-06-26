@@ -80,6 +80,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from src import shop_verdicts
+from src.http_util import RateLimiter, get_with_retry
 
 log = logging.getLogger(__name__)
 
@@ -116,20 +117,36 @@ _SEARCH_RESULT_LIMIT = 5      # candidates per shop-resolve / loose-mention task
 
 _DDG_HTML = "https://html.duckduckgo.com/html/"
 
+# Homepage + on-site-search fetches are sequential (one shop at a time) but had
+# no inter-request gap, so a run of Shopify-hosted shops bursts past the same
+# per-IP rate limit that hits product extraction. A 2 s gap (single request per
+# shop, vs the ~2.3-request burst per product extract gated at 5 s) keeps the
+# averaged rate near the product path's; the Retry-After-aware retry inside
+# get_with_retry then absorbs any residual 429 adaptively. Disabled in tests by
+# the conftest fixture that zeroes the interval.
+_HOMEPAGE_LIMITER = RateLimiter(2.0)
+
 
 # ---------------------------------------------------------------------------
 # Homepage fetch + text cleanup (Step 5 candidate gathering)
 # ---------------------------------------------------------------------------
 
 def _fetch(url: str, *, client: httpx.Client | None = None) -> str | None:
-    """GET ``url`` and return the response text, or None on any failure."""
+    """GET ``url`` and return the response text, or None on any failure.
+
+    Paces sequential fetches through ``_HOMEPAGE_LIMITER`` and retries 429/503
+    honoring ``Retry-After`` (``get_with_retry``) so a burst of same-platform
+    (Shopify) shops doesn't trip a per-IP rate limit.
+    """
+    _HOMEPAGE_LIMITER.acquire()
     try:
         if client is not None:
-            resp = client.get(url, headers=_HEADERS, timeout=_TIMEOUT,
-                              follow_redirects=True)
+            resp = get_with_retry(client, url, headers=_HEADERS, timeout=_TIMEOUT,
+                                  follow_redirects=True)
         else:
             with httpx.Client(timeout=_TIMEOUT) as c:
-                resp = c.get(url, headers=_HEADERS, follow_redirects=True)
+                resp = get_with_retry(c, url, headers=_HEADERS,
+                                      follow_redirects=True)
         if resp.status_code >= 400:
             log.info("claude_fuzzy: fetch %s -> %s", url, resp.status_code)
             return None

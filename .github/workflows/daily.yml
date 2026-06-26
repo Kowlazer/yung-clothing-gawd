@@ -12,7 +12,11 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Raised 15 -> 35: the Shopify per-IP rate-limit fix serialises product
+    # fetches at a 5 s global gap (plus homepage fetches at 2 s + adaptive
+    # Retry-After backoff), so a full run now takes ~15-25 min instead of the
+    # old few-minute fast path. 35 leaves headroom without masking a real hang.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
 
