@@ -82,6 +82,7 @@ _ERROR_KIND_EN: dict[str, str] = {
     "blocked": "blocked by site",
     "timeout": "timed out",
     "server_error": "server error",
+    "rate_limited": "rate limited",
     "other": "fetch failed",
 }
 

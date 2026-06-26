@@ -339,8 +339,8 @@ def test_extract_many_applies_jitter_between_same_domain_requests(monkeypatch):
     monkeypatch.setattr(main_mod.random, "uniform", lambda a, b: 0.42)
 
     urls = [
-        "https://a.com/products/1", "https://a.com/products/2",
-        "https://a.com/products/3", "https://b.com/products/1",
+        "https://a.com/items/1", "https://a.com/items/2",
+        "https://a.com/items/3", "https://b.com/items/1",
     ]
     main_mod._extract_many(
         urls,

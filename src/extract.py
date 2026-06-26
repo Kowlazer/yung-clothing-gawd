@@ -840,6 +840,8 @@ def _classify_error(exc: Exception | None, status: int | None) -> str:
             return "not_found"
         if status in (403, 503):
             return "blocked"
+        if status == 429:
+            return "rate_limited"
         if 500 <= status < 600:
             return "server_error"
         return "other"
