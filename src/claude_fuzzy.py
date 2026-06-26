@@ -119,12 +119,13 @@ _DDG_HTML = "https://html.duckduckgo.com/html/"
 
 # Homepage + on-site-search fetches are sequential (one shop at a time) but had
 # no inter-request gap, so a run of Shopify-hosted shops bursts past the same
-# per-IP rate limit that hits product extraction. A 2 s gap (single request per
-# shop, vs the ~2.3-request burst per product extract gated at 5 s) keeps the
-# averaged rate near the product path's; the Retry-After-aware retry inside
-# get_with_retry then absorbs any residual 429 adaptively. Disabled in tests by
-# the conftest fixture that zeroes the interval.
-_HOMEPAGE_LIMITER = RateLimiter(2.0)
+# per-IP rate limit that hits product extraction. Gated at 5 s to match the
+# product path — deliberately conservative, since the homepage path is a single
+# request per shop (vs the product extract's ~2.3-request burst), so 5 s here is
+# actually *more* cautious than the product gate in averaged-rate terms. The
+# Retry-After-aware retry inside get_with_retry absorbs any residual 429
+# adaptively. Disabled in tests by the conftest fixture that zeroes the interval.
+_HOMEPAGE_LIMITER = RateLimiter(5.0)
 
 
 # ---------------------------------------------------------------------------
