@@ -79,7 +79,7 @@ from urllib.parse import quote_plus, urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-from src import shop_verdicts
+from src import extract, shop_verdicts
 from src.http_util import RateLimiter, get_with_retry
 
 log = logging.getLogger(__name__)
@@ -132,29 +132,83 @@ _HOMEPAGE_LIMITER = RateLimiter(5.0)
 # Homepage fetch + text cleanup (Step 5 candidate gathering)
 # ---------------------------------------------------------------------------
 
-def _fetch(url: str, *, client: httpx.Client | None = None) -> str | None:
-    """GET ``url`` and return the response text, or None on any failure.
+def _http_get(
+    url: str, *, client: httpx.Client | None = None,
+) -> httpx.Response | None:
+    """GET ``url`` through the homepage limiter; return the Response or None.
 
     Paces sequential fetches through ``_HOMEPAGE_LIMITER`` and retries 429/503
     honoring ``Retry-After`` (``get_with_retry``) so a burst of same-platform
-    (Shopify) shops doesn't trip a per-IP rate limit.
+    (Shopify) shops doesn't trip a per-IP rate limit. Returns None only on a
+    transport-level error (the caller classifies the HTTP status itself).
     """
     _HOMEPAGE_LIMITER.acquire()
     try:
         if client is not None:
-            resp = get_with_retry(client, url, headers=_HEADERS, timeout=_TIMEOUT,
+            return get_with_retry(client, url, headers=_HEADERS, timeout=_TIMEOUT,
                                   follow_redirects=True)
-        else:
-            with httpx.Client(timeout=_TIMEOUT) as c:
-                resp = get_with_retry(c, url, headers=_HEADERS,
-                                      follow_redirects=True)
-        if resp.status_code >= 400:
-            log.info("claude_fuzzy: fetch %s -> %s", url, resp.status_code)
-            return None
-        return resp.text
+        with httpx.Client(timeout=_TIMEOUT) as c:
+            return get_with_retry(c, url, headers=_HEADERS, follow_redirects=True)
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
         log.info("claude_fuzzy: fetch %s failed: %s", url, exc)
         return None
+
+
+def _fetch(url: str, *, client: httpx.Client | None = None) -> str | None:
+    """GET ``url`` and return the response text, or None on any failure."""
+    resp = _http_get(url, client=client)
+    if resp is None:
+        return None
+    if resp.status_code >= 400:
+        log.info("claude_fuzzy: fetch %s -> %s", url, resp.status_code)
+        return None
+    return resp.text
+
+
+def _fetch_via_reader_proxy(url: str) -> str | None:
+    """Recover a Cloudflare-blocked homepage's visible text via the reader proxy.
+
+    Some shops run Cloudflare Bot Fight Mode, which 403/503s the GitHub Actions
+    datacenter IP (where the cron runs) while serving residential IPs normally,
+    so the homepage sale-check resolves to "could not fetch homepage" every run
+    (issues #1/#2). The reader proxy fetches from its own un-blocked egress and
+    returns the page's *visible text* — which is exactly what the homepage
+    excerpt needs (no HTML/anchor parsing required, unlike the on-site search) —
+    so a blocked shop's promo signal is recovered instead of being lost. Shares
+    the ``READER_PROXY_*`` config + kill-switch with the product-path fallback
+    in ``extract.py`` (referenced through the module so the env toggle and test
+    monkeypatches both apply). Failure-isolated: returns None on any miss.
+    """
+    if not extract._PROXY_FALLBACK_ENABLED:
+        return None
+    return extract._fetch_via_proxy(url)
+
+
+def _fetch_homepage(url: str, *, client: httpx.Client | None = None) -> str | None:
+    """Fetch a shop homepage's text, with a reader-proxy fallback on a block.
+
+    Same direct GET as ``_fetch``, but when the shop returns a Cloudflare-style
+    block (403/503 — which blocks the datacenter IP while serving residential
+    IPs fine) we retry through the reader proxy and return the recovered visible
+    text, so the homepage sale-check still gets a signal instead of resolving to
+    "could not fetch homepage" on every run (issues #1/#2). Non-block failures
+    (404, DNS, timeout) return None as before — a different egress wouldn't fix
+    those. The proxy hop fires off-path (only after a real block), so the happy
+    path pays nothing.
+    """
+    resp = _http_get(url, client=client)
+    if resp is None:
+        return None
+    if resp.status_code < 400:
+        return resp.text
+    log.info("claude_fuzzy: fetch %s -> %s", url, resp.status_code)
+    if resp.status_code in (403, 503):
+        text = _fetch_via_reader_proxy(url)
+        if text:
+            log.info("claude_fuzzy: recovered blocked homepage via reader proxy: %s",
+                     url)
+        return text
+    return None
 
 
 def _homepage_excerpt(html: str) -> str:
@@ -725,7 +779,7 @@ def resolve_fuzzy(
     task_hash_by_id: dict[str, str] = {}
     for idx, entry in enumerate(shops_to_check):
         shop, url = entry["shop"], entry["url"]
-        html = _fetch(url, client=http_client)
+        html = _fetch_homepage(url, client=http_client)
         if not html:
             skipped_shop_sales.append({
                 "shop": shop, "status": "unclear",

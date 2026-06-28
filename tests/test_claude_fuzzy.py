@@ -410,6 +410,62 @@ class TestSaleSignalPrefilter:
         }
 
 
+class TestHomepageProxyFallback:
+    """Issues #1/#2: a Cloudflare-style block (403/503) on a shop homepage —
+    which 403s the datacenter IP while serving residential IPs fine — is retried
+    through the reader proxy, recovering the page's visible text so the
+    sale-check still gets a signal instead of resolving to "could not fetch
+    homepage". Non-block failures (404, etc.) and a disabled toggle do NOT hit
+    the proxy."""
+
+    _PROXY = claude_fuzzy.extract._READER_PROXY + "https://blocked.com"
+
+    def test_block_recovered_via_reader_proxy(self, httpx_mock):
+        httpx_mock.add_response(url="https://blocked.com", status_code=403)
+        httpx_mock.add_response(
+            url=self._PROXY,
+            json={"code": 200, "data": {"text": "SPRING SALE 30% off sitewide"}},
+        )
+        text = claude_fuzzy._fetch_homepage("https://blocked.com")
+        assert text is not None and "30% off" in text
+
+    def test_404_does_not_hit_proxy(self, httpx_mock):
+        # No proxy response is registered: httpx_mock raises if one is requested.
+        httpx_mock.add_response(url="https://gone.com", status_code=404)
+        assert claude_fuzzy._fetch_homepage("https://gone.com") is None
+
+    def test_proxy_miss_falls_back_to_none(self, httpx_mock):
+        httpx_mock.add_response(url="https://blocked.com", status_code=403)
+        httpx_mock.add_response(url=self._PROXY, status_code=500)
+        assert claude_fuzzy._fetch_homepage("https://blocked.com") is None
+
+    def test_toggle_off_skips_proxy(self, httpx_mock, monkeypatch):
+        monkeypatch.setattr("src.extract._PROXY_FALLBACK_ENABLED", False)
+        httpx_mock.add_response(url="https://blocked.com", status_code=403)
+        assert claude_fuzzy._fetch_homepage("https://blocked.com") is None
+
+    def test_recovered_homepage_reaches_claude(self, httpx_mock):
+        # End-to-end through resolve_fuzzy: a blocked homepage whose proxied text
+        # carries a sale signal is judged by Claude like any other (no longer
+        # dropped as "could not fetch homepage").
+        httpx_mock.add_response(url="https://blocked.com", status_code=403)
+        httpx_mock.add_response(
+            url=self._PROXY,
+            json={"data": {"text": "SPRING SALE 30% off sitewide!"}},
+        )
+        fake = FakeAnthropicClient(_ok_tool_input(shop_sales=[{
+            "id": "shop_0", "shop": "Blocked", "status": "yes",
+            "description": "30% off sitewide",
+        }]))
+        result = resolve_fuzzy(
+            shops_to_check=[{"shop": "Blocked", "url": "https://blocked.com"}],
+            shops_to_resolve=[], loose_mentions=[], client=fake,
+        )
+        body = json.loads(fake.messages.last_kwargs["messages"][0]["content"])
+        assert [t["shop"] for t in body["shop_homepage_tasks"]] == ["Blocked"]
+        assert result["shop_sales"][0]["status"] == "yes"
+
+
 class TestVerdictCache:
     """Cost lever #3: a signal-bearing homepage whose sale-signal hash matches a
     still-fresh cached verdict is reused locally instead of re-sent to Claude; a
