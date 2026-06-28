@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from src import extract
 from src.extract import parse
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1348,3 +1349,107 @@ class TestWooCommerceVariantsMap:
         assert color["available"] == ["Blue"]
         assert color["low"] == ["Blue"]           # qty 3
         assert r["out_of_stock"] is False
+
+
+# ---------------------------------------------------------------------------
+# Reader-proxy fallback for Cloudflare-blocked Shopify products
+# (extract.py: _unwrap_reader_text / _shopify_json_via_proxy / extract()).
+# Cloudflare Bot Fight Mode 403/503s the GitHub Actions datacenter IP while
+# serving residential IPs fine; when the direct fetch is blocked we recover
+# price/variants from the product `.json` fetched through a reader proxy.
+# ---------------------------------------------------------------------------
+
+class _BlockedResp:
+    """Stand-in httpx response: a Cloudflare 403 with no body."""
+    status_code = 403
+    text = ""
+
+    def json(self):
+        raise ValueError("blocked")
+
+
+class TestUnwrapReaderText:
+    def test_json_envelope(self):
+        payload = {"code": 200, "data": {"text": "the body", "title": "x"}}
+        assert extract._unwrap_reader_text(payload) == "the body"
+
+    def test_plain_string(self):
+        assert extract._unwrap_reader_text("raw body") == "raw body"
+
+    def test_data_is_string(self):
+        assert extract._unwrap_reader_text({"data": "inline"}) == "inline"
+
+    def test_empty_text_is_none(self):
+        assert extract._unwrap_reader_text({"data": {"text": ""}}) is None
+
+    def test_garbage_is_none(self):
+        assert extract._unwrap_reader_text({"nope": 1}) is None
+        assert extract._unwrap_reader_text(None) is None
+
+
+class TestShopifyJsonViaProxy:
+    def test_returns_product_payload(self, monkeypatch):
+        raw = (FIXTURES / "hokuro_wave_shorts.json").read_text(encoding="utf-8")
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: raw)
+        out = extract._shopify_json_via_proxy("https://shop.com/products/x.json")
+        assert out["product"]["title"] == "WAVE SHORTS"
+
+    def test_proxy_miss_returns_none(self, monkeypatch):
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: None)
+        assert extract._shopify_json_via_proxy("https://shop.com/products/x.json") is None
+
+    def test_non_product_json_returns_none(self, monkeypatch):
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: '{"errors":"not found"}')
+        assert extract._shopify_json_via_proxy("https://shop.com/products/x.json") is None
+
+    def test_malformed_json_returns_none(self, monkeypatch):
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: "<html>blocked</html>")
+        assert extract._shopify_json_via_proxy("https://shop.com/products/x.json") is None
+
+
+class TestExtractBlockedRecovery:
+    URL = "https://shop.com/products/wave-shorts"
+
+    def _force_block(self, monkeypatch):
+        monkeypatch.setattr(extract, "get_with_retry", lambda client, u: _BlockedResp())
+
+    def test_recovers_via_proxy(self, monkeypatch):
+        self._force_block(monkeypatch)
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
+        raw = (FIXTURES / "hokuro_wave_shorts.json").read_text(encoding="utf-8")
+        # Only the `.json` resolves through the proxy; the `.js` borrow misses.
+        monkeypatch.setattr(extract, "_fetch_via_proxy",
+                            lambda u: raw if u.endswith(".json") else None)
+        d = extract.extract(self.URL)
+        assert d["current_price"] == 26.0
+        assert d["original_price"] == 58.0
+        assert d["on_sale"] is True
+        assert d["error"] is None and d["error_kind"] is None
+
+    def test_disabled_falls_back_to_blocked(self, monkeypatch):
+        self._force_block(monkeypatch)
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", False)
+        called = []
+        monkeypatch.setattr(extract, "_fetch_via_proxy",
+                            lambda u: called.append(u))
+        d = extract.extract(self.URL)
+        assert d["current_price"] is None
+        assert d["error_kind"] == "blocked"
+        assert called == []  # proxy never attempted when disabled
+
+    def test_proxy_miss_stays_blocked(self, monkeypatch):
+        self._force_block(monkeypatch)
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: None)
+        d = extract.extract(self.URL)
+        assert d["current_price"] is None
+        assert d["error_kind"] == "blocked"
+
+    def test_non_product_url_skips_proxy(self, monkeypatch):
+        self._force_block(monkeypatch)
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
+        called = []
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: called.append(u))
+        d = extract.extract("https://shop.com/collections/all")
+        assert d["error_kind"] == "blocked"
+        assert called == []  # only /products/ URLs use the proxy fallback

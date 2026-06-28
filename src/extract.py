@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import warnings
 from typing import Any
@@ -26,6 +27,23 @@ _HEADERS = {
 }
 _TIMEOUT = 15.0
 _LOW_STOCK_THRESHOLD = 5
+
+# Reader-proxy fallback for Cloudflare-blocked Shopify products.
+# Some Shopify stores run Cloudflare Bot Fight Mode, which 403/503s requests
+# from datacenter IPs (GitHub Actions, where the daily cron runs) while serving
+# residential IPs normally — so a product that fetches fine locally fails every
+# cron run with error_kind="blocked". The block is at the *IP* layer, so no
+# endpoint/parser change helps; only a different egress does. When a Shopify
+# product page is blocked we retry its `.json` (and `.js`) through a reader
+# proxy that fetches from its own un-blocked egress and returns the page text.
+# Off-path: only fires after a direct fetch already failed with 403/503, and
+# only for `/products/` URLs, so the normal path pays nothing.
+_READER_PROXY = (os.getenv("READER_PROXY_URL", "https://r.jina.ai/").strip()
+                 or "https://r.jina.ai/").rstrip("/") + "/"
+_PROXY_FALLBACK_ENABLED = os.getenv(
+    "READER_PROXY_FALLBACK", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+_PROXY_TIMEOUT = 30.0
 
 _SCHEMA_OOS = frozenset({
     "http://schema.org/OutOfStock",
@@ -647,6 +665,86 @@ def _merge_js_availability(product_json: dict, js_data: dict) -> None:
             v["available"] = avail
 
 
+def _unwrap_reader_text(payload: Any) -> str | None:
+    """Pull the fetched page text out of a reader-proxy response.
+
+    ``r.jina.ai`` with ``Accept: application/json`` answers with an envelope
+    ``{"code":200, "data":{"text":"<the page body>", ...}}``; a plain-text
+    response (no JSON Accept) is the body itself. Accept both shapes, plus a
+    raw string already passed in. Returns the body, or None when it can't be
+    located / is empty.
+    """
+    if isinstance(payload, str):
+        return payload or None
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            text = data.get("text")
+            return text or None
+        if isinstance(data, str):
+            return data or None
+    return None
+
+
+def _fetch_via_proxy(url: str) -> str | None:
+    """Fetch ``url`` through the reader proxy, returning the page text.
+
+    Failure-isolated: any error (proxy down, non-200, malformed envelope)
+    returns None so the caller falls back to the normal blocked verdict.
+    """
+    proxy_url = _READER_PROXY + url
+    try:
+        with httpx.Client(timeout=_PROXY_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(
+                proxy_url,
+                headers={"Accept": "application/json", "x-respond-with": "text"},
+            )
+        if resp.status_code != 200:
+            log.debug("reader proxy HTTP %s for %s", resp.status_code, url)
+            return None
+        try:
+            payload: Any = resp.json()
+        except (ValueError, TypeError):
+            payload = resp.text
+        return _unwrap_reader_text(payload)
+    except Exception as exc:
+        log.debug("reader proxy failed for %s: %s", url, exc)
+        return None
+
+
+def _shopify_json_via_proxy(json_url: str) -> dict | None:
+    """Fetch + parse a Shopify product ``.json`` through the reader proxy.
+
+    Returns the product payload (the dict carrying ``{"product": {...}}``), or
+    None when the proxy/unwrap/JSON-parse fails or the result isn't a product.
+    """
+    text = _fetch_via_proxy(json_url)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, dict) and data.get("product"):
+        return data
+    return None
+
+
+def _borrow_js_availability_via_proxy(product_json: dict, url: str) -> None:
+    """Best-effort: patch per-variant ``available`` flags from the proxied
+    ``.js`` storefront endpoint, when the proxied ``.json`` omitted them."""
+    variants = (product_json.get("product") or {}).get("variants") or []
+    if not variants or any("available" in v for v in variants):
+        return
+    js_text = _fetch_via_proxy(_shopify_js_url(url))
+    if not js_text:
+        return
+    try:
+        _merge_js_availability(product_json, json.loads(js_text))
+    except (ValueError, TypeError):
+        pass
+
+
 def parse(
     html: str,
     url: str,
@@ -715,16 +813,20 @@ def parse(
     # --- HTML structured-data extraction ---
     soup = BeautifulSoup(html, "lxml")
     html_structured: dict = {}
-    try:
-        data = extruct.extract(html, base_url=url, syntaxes=["json-ld", "opengraph", "microdata"])
-        html_structured = (
-            _jsonld_price(data.get("json-ld", []))
-            or _og_price(soup)
-            or _microdata_price(soup)
-        )
-    except Exception as exc:
-        log.warning("extruct failed for %s: %s", url, exc)
-        html_structured = _og_price(soup) or _microdata_price(soup)
+    # Empty HTML is the proxy-recovery path (a Cloudflare-blocked Shopify page,
+    # parsed from its `.json` alone) — skip extruct, which would log a noisy
+    # "Document is empty" warning and find nothing.
+    if html.strip():
+        try:
+            data = extruct.extract(html, base_url=url, syntaxes=["json-ld", "opengraph", "microdata"])
+            html_structured = (
+                _jsonld_price(data.get("json-ld", []))
+                or _og_price(soup)
+                or _microdata_price(soup)
+            )
+        except Exception as exc:
+            log.warning("extruct failed for %s: %s", url, exc)
+            html_structured = _og_price(soup) or _microdata_price(soup)
 
     # --- WooCommerce inline variation data (the Shopify-JSON analog for Woo
     #     shops: price, compare-at, and per-size availability all live on the
@@ -918,8 +1020,25 @@ def extract(url: str, *, preferred_sizes: tuple[str, ...] = ()) -> dict:
         return result
 
     if resp.status_code != 200:
+        kind = _classify_error(None, resp.status_code)
+        # Cloudflare datacenter-IP block (403/503) on a Shopify product: the
+        # price/variants live in the `.json`, not the blocked HTML, so recover
+        # them via the reader proxy (or the directly-fetched `.json`, if that
+        # one slipped through) and parse with empty HTML. Only here — after a
+        # real block, on a `/products/` URL — so the happy path is untouched.
+        if kind == "blocked" and "/products/" in url:
+            if product_json is None and _PROXY_FALLBACK_ENABLED:
+                product_json = _shopify_json_via_proxy(_shopify_json_url(url))
+                if product_json is not None:
+                    _borrow_js_availability_via_proxy(product_json, url)
+            if product_json is not None:
+                parsed = parse("", url, product_json=product_json,
+                               preferred_sizes=preferred_sizes)
+                result.update(parsed)
+                log.info("recovered blocked Shopify product via .json: %s", url)
+                return result
         result["error"] = f"HTTP {resp.status_code}"
-        result["error_kind"] = _classify_error(None, resp.status_code)
+        result["error_kind"] = kind
         return result
 
     parsed = parse(resp.text, url, product_json=product_json, preferred_sizes=preferred_sizes)
