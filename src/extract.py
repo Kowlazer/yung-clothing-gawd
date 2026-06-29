@@ -33,11 +33,13 @@ _LOW_STOCK_THRESHOLD = 5
 # from datacenter IPs (GitHub Actions, where the daily cron runs) while serving
 # residential IPs normally — so a product that fetches fine locally fails every
 # cron run with error_kind="blocked". The block is at the *IP* layer, so no
-# endpoint/parser change helps; only a different egress does. When a Shopify
-# product page is blocked we retry its `.json` (and `.js`) through a reader
-# proxy that fetches from its own un-blocked egress and returns the page text.
-# Off-path: only fires after a direct fetch already failed with 403/503, and
-# only for `/products/` URLs, so the normal path pays nothing.
+# endpoint/parser change helps; only a different egress does. When a product
+# page is blocked we recover it through a reader proxy that fetches from its own
+# un-blocked egress: a Shopify product via its `.json` (and `.js`); any other
+# shop via the page HTML (asked for in `html` format so the structured-data
+# extractors still see `<script>`/`<meta>`), parsed structured-only.
+# Off-path: only fires after a direct fetch already failed with 403/503, so the
+# normal path pays nothing.
 _READER_PROXY = (os.getenv("READER_PROXY_URL", "https://r.jina.ai/").strip()
                  or "https://r.jina.ai/").rstrip("/") + "/"
 _PROXY_FALLBACK_ENABLED = os.getenv(
@@ -712,6 +714,33 @@ def _fetch_via_proxy(url: str) -> str | None:
         return None
 
 
+def _fetch_html_via_proxy(url: str) -> str | None:
+    """Fetch ``url``'s page *HTML* through the reader proxy.
+
+    Unlike `_fetch_via_proxy` (which returns the visible text/markdown — right
+    for homepages and for the Shopify `.json` body), this asks the proxy for the
+    page HTML (``X-Return-Format: html``) so `parse`'s structured-data
+    extractors (JSON-LD / OpenGraph / microdata / WooCommerce) still have the
+    markup they need: the reader's text output strips every ``<script>`` /
+    ``<meta>`` tag, which is where a non-Shopify product's price lives. The
+    response in this mode is the raw HTML body, not the JSON envelope.
+
+    Failure-isolated: any error (proxy down, non-200) returns None so the caller
+    falls back to the normal blocked verdict.
+    """
+    proxy_url = _READER_PROXY + url
+    try:
+        with httpx.Client(timeout=_PROXY_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(proxy_url, headers={"X-Return-Format": "html"})
+        if resp.status_code != 200:
+            log.debug("reader proxy (html) HTTP %s for %s", resp.status_code, url)
+            return None
+        return resp.text or None
+    except Exception as exc:
+        log.debug("reader proxy (html) failed for %s: %s", url, exc)
+        return None
+
+
 def _shopify_json_via_proxy(json_url: str) -> dict | None:
     """Fetch + parse a Shopify product ``.json`` through the reader proxy.
 
@@ -751,10 +780,19 @@ def parse(
     product_json: dict | None = None,
     *,
     preferred_sizes: tuple[str, ...] = (),
+    trust_regex_fallback: bool = True,
 ) -> dict:
     """
     Parse already-fetched HTML (and optional Shopify product JSON) into a
     price/availability dict.
+
+    ``trust_regex_fallback`` (default True) controls the last-resort whole-page
+    ``$N`` regex used when no structured source (Shopify JSON / WooCommerce /
+    JSON-LD / OpenGraph / microdata) yielded a price. Callers parsing a
+    *proxied* page (the Cloudflare-block recovery in `extract`) pass False: the
+    reader proxy's rendered/partial HTML often surfaces a banner or related-item
+    price first, and adopting a wrong price for a blocked item is worse than
+    keeping its last-known one — so there we trust only structured sources.
 
     Tests call this directly with fixture HTML to avoid network requests.
 
@@ -838,7 +876,8 @@ def parse(
     # banner, a related product), so it's a genuine last resort.
     if not (html_structured.get("current_price") or shopify.get("current_price")
             or woo.get("current_price")):
-        html_structured = _regex_price(soup)
+        if trust_regex_fallback:
+            html_structured = _regex_price(soup)
 
     # --- Merge: Shopify JSON wins for price, then WooCommerce variation JSON,
     #     then HTML structured data. HTML wins for OOS when Shopify doesn't
@@ -1021,22 +1060,40 @@ def extract(url: str, *, preferred_sizes: tuple[str, ...] = ()) -> dict:
 
     if resp.status_code != 200:
         kind = _classify_error(None, resp.status_code)
-        # Cloudflare datacenter-IP block (403/503) on a Shopify product: the
-        # price/variants live in the `.json`, not the blocked HTML, so recover
-        # them via the reader proxy (or the directly-fetched `.json`, if that
-        # one slipped through) and parse with empty HTML. Only here — after a
-        # real block, on a `/products/` URL — so the happy path is untouched.
-        if kind == "blocked" and "/products/" in url:
-            if product_json is None and _PROXY_FALLBACK_ENABLED:
-                product_json = _shopify_json_via_proxy(_shopify_json_url(url))
+        # Cloudflare datacenter-IP block (403/503): the page fetches fine from a
+        # residential IP but 403s the GitHub Actions egress, so the item goes
+        # stale every cron run. Recover through the reader proxy (un-blocked
+        # egress). Only here — after a real block — so the happy path is
+        # untouched.
+        if kind == "blocked" and _PROXY_FALLBACK_ENABLED:
+            # Shopify products: price/variants live in the structured `.json`
+            # (exact compare-at + per-variant availability), so prefer it.
+            if "/products/" in url:
+                if product_json is None:
+                    product_json = _shopify_json_via_proxy(_shopify_json_url(url))
+                    if product_json is not None:
+                        _borrow_js_availability_via_proxy(product_json, url)
                 if product_json is not None:
-                    _borrow_js_availability_via_proxy(product_json, url)
-            if product_json is not None:
-                parsed = parse("", url, product_json=product_json,
-                               preferred_sizes=preferred_sizes)
-                result.update(parsed)
-                log.info("recovered blocked Shopify product via .json: %s", url)
-                return result
+                    parsed = parse("", url, product_json=product_json,
+                                   preferred_sizes=preferred_sizes)
+                    result.update(parsed)
+                    log.info("recovered blocked Shopify product via .json: %s", url)
+                    return result
+            # Non-Shopify shops (no `.json`), and Shopify products whose `.json`
+            # also didn't come through: fetch the page HTML through the proxy and
+            # run it past the same JSON-LD / OG / microdata / WooCommerce
+            # extractors. The regex price fallback is disabled (proxied HTML is
+            # often a rendered/partial blob whose first `$N` is a banner) so we
+            # adopt a recovered price only from a structured source — otherwise
+            # we keep the last-known price (the prior "blocked" verdict).
+            proxied_html = _fetch_html_via_proxy(url)
+            if proxied_html:
+                parsed = parse(proxied_html, url, preferred_sizes=preferred_sizes,
+                               trust_regex_fallback=False)
+                if parsed.get("current_price") is not None:
+                    result.update(parsed)
+                    log.info("recovered blocked product via proxied HTML: %s", url)
+                    return result
         result["error"] = f"HTTP {resp.status_code}"
         result["error_kind"] = kind
         return result

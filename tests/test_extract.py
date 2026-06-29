@@ -1352,11 +1352,13 @@ class TestWooCommerceVariantsMap:
 
 
 # ---------------------------------------------------------------------------
-# Reader-proxy fallback for Cloudflare-blocked Shopify products
-# (extract.py: _unwrap_reader_text / _shopify_json_via_proxy / extract()).
+# Reader-proxy fallback for Cloudflare-blocked products
+# (extract.py: _unwrap_reader_text / _shopify_json_via_proxy /
+#  _fetch_html_via_proxy / extract()).
 # Cloudflare Bot Fight Mode 403/503s the GitHub Actions datacenter IP while
 # serving residential IPs fine; when the direct fetch is blocked we recover
-# price/variants from the product `.json` fetched through a reader proxy.
+# through a reader proxy: a Shopify product from its `.json`, any other shop
+# from its page HTML parsed structured-only (issue #1 residual).
 # ---------------------------------------------------------------------------
 
 class _BlockedResp:
@@ -1438,18 +1440,122 @@ class TestExtractBlockedRecovery:
         assert called == []  # proxy never attempted when disabled
 
     def test_proxy_miss_stays_blocked(self, monkeypatch):
+        # Both recovery routes miss (`.json` and the HTML fallback) → blocked.
         self._force_block(monkeypatch)
         monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
         monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: None)
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy", lambda u: None)
         d = extract.extract(self.URL)
         assert d["current_price"] is None
         assert d["error_kind"] == "blocked"
 
-    def test_non_product_url_skips_proxy(self, monkeypatch):
+    def test_non_product_url_skips_shopify_json(self, monkeypatch):
+        # A non-`/products/` URL has no Shopify `.json`, so that route is never
+        # tried; recovery goes straight to the HTML proxy (issue #1 residual).
         self._force_block(monkeypatch)
         monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
-        called = []
-        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: called.append(u))
-        d = extract.extract("https://shop.com/collections/all")
+        json_called, html_called = [], []
+        monkeypatch.setattr(extract, "_fetch_via_proxy",
+                            lambda u: json_called.append(u))
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy",
+                            lambda u: html_called.append(u))
+        d = extract.extract("https://shop.com/shop/mens-tee")
+        assert d["error_kind"] == "blocked"  # HTML proxy returned None
+        assert json_called == []             # no `.json` route for non-Shopify
+        assert html_called == ["https://shop.com/shop/mens-tee"]
+
+
+# Structured product HTML (JSON-LD Product/Offer) as a non-Shopify shop would
+# emit — the price lives in <script>, not visible text, so the proxy must be
+# asked for `html` (not the reader's text output) for this to be recoverable.
+_JSONLD_PRODUCT_HTML = """<html><head>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"Product","name":"Ronin Cargo Pant",
+ "offers":{"@type":"Offer","price":"48.00","priceCurrency":"USD",
+           "availability":"https://schema.org/InStock"}}
+</script>
+</head><body><h1>Ronin Cargo Pant</h1></body></html>"""
+
+# No structured data — only a `$` in a shipping banner plus the real price. The
+# whole-page regex grabs the banner's $75 first, which is exactly why the
+# proxied-recovery path disables it.
+_REGEX_ONLY_HTML = """<html><body>
+<div class="banner">Free shipping over $75</div>
+<span class="price">$42.00</span>
+</body></html>"""
+
+
+class TestParseRegexFallbackToggle:
+    URL = "https://shop.com/shop/cargo-pant"
+
+    def test_structured_price_kept_when_regex_disabled(self):
+        d = parse(_JSONLD_PRODUCT_HTML, self.URL, trust_regex_fallback=False)
+        assert d["current_price"] == 48.0
+        assert d["currency"] == "USD"
+
+    def test_regex_price_dropped_when_disabled(self):
+        # On by default the regex grabs the $75 banner; off, no price survives.
+        assert parse(_REGEX_ONLY_HTML, self.URL)["current_price"] == 75.0
+        assert parse(_REGEX_ONLY_HTML, self.URL,
+                     trust_regex_fallback=False)["current_price"] is None
+
+
+class TestExtractBlockedHtmlRecovery:
+    """Issue #1 residual: a blocked *non-Shopify* product recovers its price
+    from page HTML fetched through the reader proxy, structured-only."""
+
+    URL = "https://shop.com/shop/ronin-cargo-pant"  # no `/products/` → non-Shopify
+
+    def _force_block(self, monkeypatch):
+        monkeypatch.setattr(extract, "get_with_retry", lambda client, u: _BlockedResp())
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
+
+    def test_recovers_structured_price_from_proxied_html(self, monkeypatch):
+        self._force_block(monkeypatch)
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy",
+                            lambda u: _JSONLD_PRODUCT_HTML)
+        d = extract.extract(self.URL)
+        assert d["current_price"] == 48.0
+        assert d["currency"] == "USD"
+        assert d["error"] is None and d["error_kind"] is None
+
+    def test_regex_only_html_stays_blocked(self, monkeypatch):
+        # Proxied HTML has a price only the (disabled) regex would find → we
+        # keep the last-known price rather than adopt a banner number.
+        self._force_block(monkeypatch)
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy",
+                            lambda u: _REGEX_ONLY_HTML)
+        d = extract.extract(self.URL)
+        assert d["current_price"] is None
         assert d["error_kind"] == "blocked"
-        assert called == []  # only /products/ URLs use the proxy fallback
+
+    def test_html_proxy_miss_stays_blocked(self, monkeypatch):
+        self._force_block(monkeypatch)
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy", lambda u: None)
+        d = extract.extract(self.URL)
+        assert d["current_price"] is None
+        assert d["error_kind"] == "blocked"
+
+    def test_shopify_json_miss_falls_through_to_html(self, monkeypatch):
+        # A Shopify `/products/` URL whose `.json` recovery misses still gets a
+        # second chance via the page HTML.
+        monkeypatch.setattr(extract, "get_with_retry",
+                            lambda client, u: _BlockedResp())
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: None)  # .json miss
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy",
+                            lambda u: _JSONLD_PRODUCT_HTML)
+        d = extract.extract("https://shop.com/products/ronin-cargo-pant")
+        assert d["current_price"] == 48.0
+        assert d["error_kind"] is None
+
+    def test_disabled_skips_html_proxy(self, monkeypatch):
+        monkeypatch.setattr(extract, "get_with_retry",
+                            lambda client, u: _BlockedResp())
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", False)
+        called = []
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy",
+                            lambda u: called.append(u))
+        d = extract.extract(self.URL)
+        assert d["error_kind"] == "blocked"
+        assert called == []
