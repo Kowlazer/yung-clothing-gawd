@@ -468,6 +468,152 @@ class TestPriorityMarker:
 
 
 # ---------------------------------------------------------------------------
+# Dedicated "Priority:" section — 2nd designation path (issue #21)
+# ---------------------------------------------------------------------------
+
+class TestPrioritySection:
+    def test_section_flags_listed_url(self):
+        text = (
+            "Shops and URLs:\n"
+            "Priority:\n"
+            "https://peakwear.com/products/joggers\n"
+        )
+        entries = classify(text)
+        urls = [e for e in entries if e.category == "PRODUCT_URL"]
+        assert len(urls) == 1
+        assert urls[0].value == "https://peakwear.com/products/joggers"
+        assert urls[0].priority is True
+
+    def test_priority_only_url_has_empty_context_and_is_clothing(self):
+        # A URL that lives ONLY in the Priority section has no shop context of
+        # its own (downstream derives the shop from the domain); it defaults to
+        # clothing.
+        text = (
+            "Shops and URLs:\n"
+            "Priority:\n"
+            "https://newshop.com/products/thing\n"
+        )
+        entries = classify(text)
+        url = next(e for e in entries if e.category == "PRODUCT_URL")
+        assert url.context == ""
+        assert url.priority is True
+        assert url.is_clothing is True
+
+    def test_url_in_both_shop_and_section_dedups_to_one_flagged_entry(self):
+        # The crux of issue #21: the same URL pasted under a shop header AND the
+        # Priority section must yield exactly ONE entry — the shop-context one,
+        # flagged priority — so it isn't detected/shown twice.
+        text = (
+            "Shops and URLs:\n"
+            "PeakWear:\n"
+            "https://peakwear.com/products/joggers\n"
+            "\n"
+            "Priority:\n"
+            "https://peakwear.com/products/joggers\n"
+        )
+        entries = classify(text)
+        urls = [
+            e for e in entries
+            if e.category == "PRODUCT_URL"
+            and e.value == "https://peakwear.com/products/joggers"
+        ]
+        assert len(urls) == 1
+        assert urls[0].priority is True
+        assert urls[0].context == "PeakWear"  # shop context preserved, not lost
+
+    def test_section_can_sit_above_shops_marker(self):
+        # Pulled from the full doc, so it works even above the "Shops and URLs:"
+        # marker that classify() otherwise discards.
+        text = (
+            "Priority:\n"
+            "https://peakwear.com/products/joggers\n"
+            "\n"
+            "Shops and URLs:\n"
+            "PeakWear:\n"
+            "https://peakwear.com/products/other\n"
+        )
+        entries = classify(text)
+        by_value = {e.value: e for e in entries if e.category == "PRODUCT_URL"}
+        assert by_value["https://peakwear.com/products/joggers"].priority is True
+        assert by_value["https://peakwear.com/products/other"].priority is False
+
+    def test_section_ends_at_blank_line(self):
+        text = (
+            "Shops and URLs:\n"
+            "Priority:\n"
+            "https://peakwear.com/products/a\n"
+            "\n"
+            "PeakWear:\n"
+            "https://peakwear.com/products/b\n"
+        )
+        entries = classify(text)
+        by_value = {e.value: e for e in entries if e.category == "PRODUCT_URL"}
+        assert by_value["https://peakwear.com/products/a"].priority is True
+        assert by_value["https://peakwear.com/products/b"].priority is False
+        assert by_value["https://peakwear.com/products/b"].context == "PeakWear"
+
+    def test_section_ends_at_next_section_header(self):
+        text = (
+            "Shops and URLs:\n"
+            "Priority:\n"
+            "https://peakwear.com/products/a\n"
+            "Non-clothing Shops and URLs:\n"
+            "Logitech:\n"
+            "https://logitech.com/products/mouse\n"
+        )
+        entries = classify(text)
+        by_value = {e.value: e for e in entries if e.category == "PRODUCT_URL"}
+        assert by_value["https://peakwear.com/products/a"].priority is True
+        mouse = by_value["https://logitech.com/products/mouse"]
+        assert mouse.priority is False
+        assert mouse.is_clothing is False  # parsed normally under non-clothing
+
+    def test_marker_and_punctuation_stripped_from_section_url(self):
+        text = (
+            "Shops and URLs:\n"
+            "Priority:\n"
+            "https://peakwear.com/products/joggers ⭐\n"
+        )
+        entries = classify(text)
+        url = next(e for e in entries if e.category == "PRODUCT_URL")
+        assert url.value == "https://peakwear.com/products/joggers"
+        assert url.priority is True
+
+    def test_header_variants_accepted(self):
+        for header in ("Priority:", "Priority URLs:", "Priority items:", "priority watch:"):
+            text = f"Shops and URLs:\n{header}\nhttps://peakwear.com/products/x\n"
+            entries = classify(text)
+            url = next((e for e in entries if e.category == "PRODUCT_URL"), None)
+            assert url is not None and url.priority is True, f"failed for {header!r}"
+
+    def test_duplicate_url_within_section_collapses(self):
+        text = (
+            "Shops and URLs:\n"
+            "Priority:\n"
+            "https://peakwear.com/products/a\n"
+            "https://peakwear.com/products/a\n"
+        )
+        entries = classify(text)
+        urls = [e for e in entries if e.category == "PRODUCT_URL"]
+        assert len(urls) == 1
+
+    def test_header_not_emitted_as_shop_name(self):
+        # "Priority:" matches the generic ShopName: shape — make sure it's
+        # consumed as a section header, not surfaced as a SHOP_NAME entry.
+        text = "Shops and URLs:\nPriority:\nhttps://peakwear.com/products/a\n"
+        entries = classify(text)
+        assert not any(
+            e.category == "SHOP_NAME" and e.value.lower() == "priority"
+            for e in entries
+        )
+
+    def test_no_priority_section_leaves_everything_unmarked(self):
+        text = "Shops and URLs:\nPeakWear:\nhttps://peakwear.com/products/joggers\n"
+        entries = classify(text)
+        assert all(e.priority is False for e in entries)
+
+
+# ---------------------------------------------------------------------------
 # Amazon product URLs → UNTRACKED_URL (can't be crawled; surface-only)
 # ---------------------------------------------------------------------------
 

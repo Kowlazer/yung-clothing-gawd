@@ -205,6 +205,7 @@ def _bucket_entries(
                            their own digest block, never extracted or sale-checked
     """
     product_urls: list[tuple[str, str]] = []
+    seen_product_urls: set[str] = set()  # global dedup — see below
     untracked_urls: list[dict[str, Any]] = []
     untracked_shop_labels: set[str] = set()  # shops whose only entries are untracked
     shops_map: dict[str, str] = {}        # shop label -> homepage URL
@@ -213,6 +214,16 @@ def _bucket_entries(
     # First pass: PRODUCT_URL and SHOP_URL entries
     for e in entries:
         if e.category == "PRODUCT_URL":
+            # Dedup by URL (keep first occurrence's shop context). A product URL
+            # belongs to one shop, so a duplicate — e.g. the user pasted it under
+            # a shop header AND a dedicated "Priority:" section, or twice by
+            # accident — would otherwise be extracted + sale-detected twice and
+            # show two lines in the digest. The priority *flag* is captured
+            # separately (priority_urls below ORs across all entries), so dropping
+            # the duplicate here never loses the pin.
+            if e.value in seen_product_urls:
+                continue
+            seen_product_urls.add(e.value)
             product_urls.append((e.value, e.context))
             # Many watchlists list "ShopName:" (→ SHOP_NAME) followed directly
             # by product URLs (no bare-domain SHOP_URL entry). Derive the

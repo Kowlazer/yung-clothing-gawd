@@ -192,15 +192,29 @@ _SALES_TRACK_HEADER_RE = re.compile(
 # Leading list bullet to tolerate on a sales-track name ("- Vitaly" → "Vitaly").
 _SALES_TRACK_BULLET_RE = re.compile(r'^[-•*]\s*')
 
+# "Priority:" section — a SECOND designation path for the digest's top
+# "⭐ Watching now" block, alongside the inline ⭐/[priority] marker on a URL's
+# own line. The user pastes the product URLs they want pinned under this header
+# as a grouped list, instead of hunting individual lines to star. Every URL
+# beneath it is flagged priority=True (see _split_priority_section + the reconcile
+# in classify()). A trailing descriptor word ("Priority URLs:", "Priority items:",
+# "Priority watch:") is tolerated. The section ends at a blank line, the next known
+# section header, or end of doc — so it can live anywhere in the Doc.
+_PRIORITY_HEADER_RE = re.compile(
+    r'^\s*Priority(?:\s+(?:URLs?|items?|watch(?:list)?))?\s*:\s*$',
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def _is_known_section_header(line: str) -> bool:
     """A line that opens one of the Doc's recognised top-level sections — used to
-    terminate the flat "Shops to track sales for:" list when the user puts it
-    above another section without a separating blank line."""
+    terminate the flat "Shops to track sales for:" / "Priority:" lists when the
+    user puts one above another section without a separating blank line."""
     return bool(
         _SHOPS_AND_URLS_HEADER_RE.match(line)
         or _NON_CLOTHING_HEADER_RE.match(line)
         or _SALES_TRACK_HEADER_RE.match(line)
+        or _PRIORITY_HEADER_RE.match(line)
     )
 
 
@@ -254,6 +268,53 @@ def _split_sales_track_section(text: str) -> tuple[str, list[str]]:
     return "\n".join(out_lines), uniq
 
 
+def _split_priority_section(text: str) -> tuple[str, list[str]]:
+    """Pull the dedicated "Priority:" section out of ``text``.
+
+    Returns ``(text_without_that_section, [clean priority URLs])`` — the URLs the
+    user wants pinned to the digest's "⭐ Watching now" block via a grouped list
+    (the second designation path alongside the inline ⭐/[priority] marker on a
+    URL's own line). URLs are de-duplicated (first-seen order preserved) and any
+    inline marker / trailing punctuation is stripped so the stored URL stays
+    fetchable. The header and the section's lines are removed from the returned
+    text so ``classify()`` doesn't parse them a second time as context-less
+    entries — it re-adds (via the reconcile pass) any priority URL that appears
+    *only* here. The section ends at a blank line, the next known section header,
+    or end of doc.
+    """
+    out_lines: list[str] = []
+    urls: list[str] = []
+    in_section = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if in_section:
+            if not line:
+                in_section = False
+                out_lines.append(raw)
+                continue
+            if not _is_known_section_header(line):
+                for url in _URL_RE.findall(line):
+                    clean = _PRIORITY_MARKER_RE.sub('', url).rstrip('.,;)')
+                    if clean:
+                        urls.append(clean)
+                continue
+            in_section = False
+            # A new section header ends the list; fall through so the header
+            # stays in the returned text and is handled normally.
+        if _PRIORITY_HEADER_RE.match(line):
+            in_section = True
+            continue
+        out_lines.append(raw)
+
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return "\n".join(out_lines), uniq
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -280,6 +341,13 @@ def classify(text: str) -> list[Entry]:
     keeps as a memory aid, and we don't want to spend DDG queries / Claude
     tokens resolving them or surface them in the digest.
     """
+    # Pull the dedicated "Priority:" section out of the FULL doc first — it may
+    # sit anywhere, including above the "Shops and URLs:" marker that the next
+    # step discards. Removing it here keeps its URLs from being parsed as
+    # context-less entries; the reconcile pass below re-flags them (or re-adds
+    # any that appear ONLY here).
+    text, priority_section_urls = _split_priority_section(text)
+
     marker = _SHOPS_AND_URLS_HEADER_RE.search(text)
     if marker:
         text = text[marker.end():]
@@ -397,6 +465,31 @@ def classify(text: str) -> list[Entry]:
             continue
 
         # Default: IGNORE
+
+    # Reconcile the dedicated "Priority:" section (a 2nd designation path
+    # alongside the inline ⭐/[priority] marker). A URL listed there is pinned
+    # just like a starred line. If it ALSO appears in a normal shop section, flip
+    # the flag on that existing entry — keeping its shop context + is_clothing
+    # and creating no duplicate (the dedup the user asked for). A URL that lives
+    # ONLY in the Priority section is added as a fresh context-less entry
+    # (downstream derives the shop from the URL's domain), defaulting to
+    # is_clothing=True since it carries no section context of its own.
+    if priority_section_urls:
+        wanted = set(priority_section_urls)
+        matched: set[str] = set()
+        for i, e in enumerate(entries):
+            if e.category in ("PRODUCT_URL", "SHOP_URL", "UNTRACKED_URL") and e.value in wanted:
+                matched.add(e.value)
+                if not e.priority:
+                    entries[i] = e._replace(priority=True)
+        for url in priority_section_urls:
+            if url in matched:
+                continue
+            cat = _classify_url(url)
+            if cat == "IGNORE":
+                continue
+            entries.append(Entry(cat, url, "", True, True))
+            matched.add(url)
 
     # Drop SHOP_NAME entries that gained no children — these are
     # placeholder headers the user keeps as a memory aid for shops they've

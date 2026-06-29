@@ -43,6 +43,20 @@ def test_bucket_entries_product_url_to_extract_list():
     assert out["product_urls"] == [("https://aniqi.com/products/joggers", "Aniqi")]
 
 
+def test_bucket_entries_dedups_duplicate_product_url_keeps_first_context():
+    """Issue #21: the same product URL pasted under a shop header AND flagged via
+    the dedicated Priority section yields two PRODUCT_URL entries. _bucket_entries
+    must collapse them to one (keeping the first, shop-context occurrence) so the
+    item isn't extracted / sale-detected twice — while still capturing the pin."""
+    entries = [
+        Entry("PRODUCT_URL", "https://aniqi.com/products/joggers", "Aniqi"),
+        Entry("PRODUCT_URL", "https://aniqi.com/products/joggers", "", priority=True),
+    ]
+    out = main_mod._bucket_entries(entries, aliases={})
+    assert out["product_urls"] == [("https://aniqi.com/products/joggers", "Aniqi")]
+    assert "https://aniqi.com/products/joggers" in out["priority_urls"]
+
+
 def test_bucket_entries_product_url_seeds_shops_map():
     """Regression: shop names that only have PRODUCT_URLs under them (no
     bare-domain SHOP_URL entry) used to fall through to resolve_fuzzy's DDG
