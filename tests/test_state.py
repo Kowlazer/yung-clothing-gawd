@@ -663,3 +663,70 @@ class TestReadStateTruncatedFile:
         result = read_state(GIST_ID, TOKEN)
         assert result["prices"] == {"x": 1}
         assert len(httpx_mock.get_requests()) == 1
+
+
+# ---------------------------------------------------------------------------
+# read_state(fresh=True) — cache-busts so a long-lived process (the wardrobe
+# browser) never serves a stale revision from GitHub's s-maxage=60 edge cache
+# after an external writer updates the Gist (issue #20).
+# ---------------------------------------------------------------------------
+
+import re  # noqa: E402  (kept local to this section for clarity)
+
+_API_RE = re.compile(r"https://api\.github\.com/gists/abc123")
+_RAW_RE = re.compile(r"https://gist\.githubusercontent\.com/")
+
+
+class TestReadStateFresh:
+    def test_default_read_has_no_cache_buster(self, httpx_mock):
+        # Regression: the daily-cron path (fresh omitted) is byte-identical —
+        # no query param, exact-URL mock still matches.
+        httpx_mock.add_response(url=_API_URL, json=_gist_response(prices={"x": 1}))
+        result = read_state(GIST_ID, TOKEN)
+        assert result["prices"] == {"x": 1}
+        req = httpx_mock.get_requests()[0]
+        assert "_cb=" not in str(req.url)
+        assert "Cache-Control" not in req.headers
+
+    def test_fresh_appends_cache_buster_and_no_cache_headers(self, httpx_mock):
+        httpx_mock.add_response(url=_API_RE, json=_gist_response(prices={"x": 1}))
+        result = read_state(GIST_ID, TOKEN, fresh=True)
+        assert result["prices"] == {"x": 1}
+        req = httpx_mock.get_requests()[0]
+        assert "_cb=" in str(req.url)
+        assert req.headers["Authorization"] == f"Bearer {TOKEN}"
+        assert req.headers["Cache-Control"] == "no-cache"
+        assert req.headers["Pragma"] == "no-cache"
+
+    def test_fresh_cache_busts_truncated_raw_url_too(self, httpx_mock):
+        full = {"items": [{"id": "a", "body_comp": {"weight_kg": 70.0}}]}
+        raw_url = "https://gist.githubusercontent.com/u/abc/raw/deadbeef/wardrobe.json"
+        files = {"wardrobe.json": {
+            "truncated": True, "raw_url": raw_url,
+            "content": "<<<TRUNCATED",  # invalid — must follow raw_url
+        }}
+        httpx_mock.add_response(url=_API_RE, json={"files": files})
+        httpx_mock.add_response(url=_RAW_RE, text=json.dumps(full))
+
+        result = read_state(GIST_ID, TOKEN, fresh=True)
+
+        assert result["wardrobe"] == full
+        raw_req = next(r for r in httpx_mock.get_requests()
+                       if "gist.githubusercontent.com" in str(r.url))
+        assert "_cb=" in str(raw_req.url)               # cache-busted
+        assert raw_req.url.path.endswith("/wardrobe.json")  # original path intact
+        assert raw_req.headers["Authorization"] == f"Bearer {TOKEN}"
+        assert raw_req.headers["Cache-Control"] == "no-cache"
+
+    def test_default_does_not_cache_bust_raw_url(self, httpx_mock):
+        # Regression: the non-fresh truncation path is unchanged (exact-URL mock).
+        full = {"items": [{"id": "a"}]}
+        raw_url = "https://gist.githubusercontent.com/u/abc/raw/deadbeef/wardrobe.json"
+        files = {"wardrobe.json": {
+            "truncated": True, "raw_url": raw_url, "content": "<<<TRUNCATED"}}
+        httpx_mock.add_response(url=_API_URL, json={"files": files})
+        httpx_mock.add_response(url=raw_url, text=json.dumps(full))
+        result = read_state(GIST_ID, TOKEN)
+        assert result["wardrobe"] == full
+        raw_req = next(r for r in httpx_mock.get_requests() if str(r.url) == raw_url)
+        assert "_cb=" not in str(raw_req.url)

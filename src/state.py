@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -59,6 +60,10 @@ _GITHUB_HEADERS = {
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
 }
+# Belt-and-suspenders request headers asking any intermediary cache to
+# revalidate. Paired with the cache-buster query param (the reliable lever —
+# Fastly may ignore client Cache-Control on requests) for ``fresh=True`` reads.
+_NO_CACHE_HEADERS = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
 _PRUNE_DAYS = 30           # prices + email/sms-sourced codes
 _GMAIL_PRUNE_DAYS = 14     # processed-email-id dedupe window
 _VOICE_PRUNE_DAYS = 14     # processed-sms-id dedupe window
@@ -69,7 +74,27 @@ def _auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", **_GITHUB_HEADERS}
 
 
-def _file_content(f: dict, client: httpx.Client | None, token: str | None) -> str:
+def _cache_bust(url: str) -> str:
+    """Append a unique query param so a shared edge cache can't serve a stale copy.
+
+    The Gist-API metadata GET returns ``Cache-Control: private, max-age=60,
+    s-maxage=60`` — that ``s-maxage`` lets GitHub's Fastly edge serve a cached
+    ``/gists/{id}`` response (and thus a stale file revision / ``raw_url``) for
+    up to a minute after an external writer updates the Gist. A long-lived
+    process (the wardrobe browser) can keep hitting that warm edge entry over a
+    keep-alive connection and so keep serving pre-write data even across a
+    Refresh, while a freshly-started process reads correctly (issue #20). A
+    unique query string is a unique cache key → guaranteed miss → fresh origin
+    read. Harmless: GitHub ignores the extra param (verified 200 + correct body
+    on both the API and the raw CDN).
+    """
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}_cb={time.time_ns()}"
+
+
+def _file_content(
+    f: dict, client: httpx.Client | None, token: str | None, *, fresh: bool = False,
+) -> str:
     """Full text content of one Gist file.
 
     GitHub truncates a file's inline ``content`` once it exceeds 1 MB and sets
@@ -79,12 +104,18 @@ def _file_content(f: dict, client: httpx.Client | None, token: str | None) -> st
     BodySpec ``body_comp`` block (see src/bodyspec.py), so without this the whole
     wardrobe would silently read back as ``{}`` — a data-loss trap for the next
     read-modify-write. The secret-gist ``raw_url`` requires the bearer token.
+
+    ``fresh=True`` cache-busts the ``raw_url`` fetch too (see ``_cache_bust``).
+    The ``raw_url`` is SHA-content-addressed so it's immutable per revision, but
+    busting it costs nothing and defends against an unversioned URL / odd cache.
     """
     if f.get("truncated") and f.get("raw_url") and client is not None:
-        resp = client.get(
-            f["raw_url"],
-            headers={"Authorization": f"Bearer {token}"} if token else None,
-        )
+        url = f["raw_url"]
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        if fresh:
+            url = _cache_bust(url)
+            headers = {**headers, **_NO_CACHE_HEADERS}
+        resp = client.get(url, headers=headers or None)
         resp.raise_for_status()
         return resp.text
     return f.get("content") or ""
@@ -93,6 +124,7 @@ def _file_content(f: dict, client: httpx.Client | None, token: str | None) -> st
 def _parse_gist_file(
     files: dict, name: str, default: Any = None,
     *, client: httpx.Client | None = None, token: str | None = None,
+    fresh: bool = False,
 ) -> Any:
     """Parse one file out of a Gist payload. Returns ``default`` (or ``{}``)
     when the file is missing, empty, or malformed JSON. Follows ``raw_url`` for
@@ -102,7 +134,7 @@ def _parse_gist_file(
     f = files.get(name)
     if not f:
         return default
-    content = _file_content(f, client, token)
+    content = _file_content(f, client, token, fresh=fresh)
     if not content.strip():
         return default
     try:
@@ -112,27 +144,39 @@ def _parse_gist_file(
         return default
 
 
-def read_state(gist_id: str, token: str) -> dict:
-    """Fetch the Gist and return all state blobs as a dict."""
+def read_state(gist_id: str, token: str, *, fresh: bool = False) -> dict:
+    """Fetch the Gist and return all state blobs as a dict.
+
+    ``fresh=True`` cache-busts the reads so a long-lived process never serves a
+    stale revision from GitHub's edge cache (issue #20 — see ``_cache_bust``).
+    The daily cron leaves it ``False`` (a fresh process per run; never affected),
+    so its behaviour is unchanged; the wardrobe browser passes ``True``.
+    """
     with httpx.Client(timeout=_TIMEOUT) as client:
-        resp = client.get(f"{_GIST_API}/{gist_id}", headers=_auth_headers(token))
+        url = f"{_GIST_API}/{gist_id}"
+        headers = _auth_headers(token)
+        if fresh:
+            url = _cache_bust(url)
+            headers = {**headers, **_NO_CACHE_HEADERS}
+        resp = client.get(url, headers=headers)
         resp.raise_for_status()
         files = resp.json().get("files", {})
         # Keep the client open: truncated (>1 MB) files are re-fetched via raw_url.
+        opts = {"client": client, "token": token, "fresh": fresh}
         return {
-            "prices": _parse_gist_file(files, "prices.json", default={}, client=client, token=token),
-            "aliases": _parse_gist_file(files, "shop_aliases.json", default={}, client=client, token=token),
-            "codes": _parse_gist_file(files, "codes.json", default=[], client=client, token=token),
-            "email_sales": _parse_gist_file(files, "email_sales.json", default=[], client=client, token=token),
-            "fx": _parse_gist_file(files, "fx_rates.json", default={}, client=client, token=token),
-            "gmail": _parse_gist_file(files, "gmail_state.json", default={}, client=client, token=token),
-            "voice": _parse_gist_file(files, "voice_state.json", default={}, client=client, token=token),
-            "sms_aliases": _parse_gist_file(files, "sms_aliases.json", default={}, client=client, token=token),
-            "signup": _parse_gist_file(files, "signup_state.json", default={}, client=client, token=token),
-            "wardrobe": _parse_gist_file(files, "wardrobe.json", default={}, client=client, token=token),
-            "body_scans": _parse_gist_file(files, "body_scans.json", default={}, client=client, token=token),
-            "shop_verdicts": _parse_gist_file(files, "shop_verdicts.json", default=[], client=client, token=token),
-            "restock": _parse_gist_file(files, "restock_state.json", default={}, client=client, token=token),
+            "prices": _parse_gist_file(files, "prices.json", default={}, **opts),
+            "aliases": _parse_gist_file(files, "shop_aliases.json", default={}, **opts),
+            "codes": _parse_gist_file(files, "codes.json", default=[], **opts),
+            "email_sales": _parse_gist_file(files, "email_sales.json", default=[], **opts),
+            "fx": _parse_gist_file(files, "fx_rates.json", default={}, **opts),
+            "gmail": _parse_gist_file(files, "gmail_state.json", default={}, **opts),
+            "voice": _parse_gist_file(files, "voice_state.json", default={}, **opts),
+            "sms_aliases": _parse_gist_file(files, "sms_aliases.json", default={}, **opts),
+            "signup": _parse_gist_file(files, "signup_state.json", default={}, **opts),
+            "wardrobe": _parse_gist_file(files, "wardrobe.json", default={}, **opts),
+            "body_scans": _parse_gist_file(files, "body_scans.json", default={}, **opts),
+            "shop_verdicts": _parse_gist_file(files, "shop_verdicts.json", default=[], **opts),
+            "restock": _parse_gist_file(files, "restock_state.json", default={}, **opts),
         }
 
 

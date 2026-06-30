@@ -514,8 +514,12 @@ def fetch_wardrobe(gist_id: str, token: str) -> dict:
     Reuses ``state.read_state`` so the >1 MB truncation handling (follow
     ``raw_url`` with the bearer token) is shared — a wardrobe carrying full
     body-comp blocks crosses 1 MB and would otherwise read back as ``{}``.
+
+    ``fresh=True``: this is a long-lived process, so a Refresh after an external
+    writer (an ``order_scan`` in another terminal) must not be served a stale
+    revision from GitHub's edge cache (issue #20).
     """
-    return state.read_state(gist_id, token).get("wardrobe") or {}
+    return state.read_state(gist_id, token, fresh=True).get("wardrobe") or {}
 
 
 def _review_request_days(raw: str | None, default: int = 30) -> int:
@@ -625,7 +629,10 @@ class _Catalogue:
         """
         if not (item_id or "").strip():
             raise ValueError("missing item id")
-        st = state.read_state(self._gist_id, self._token)
+        # fresh=True: read-modify-write must start from the current revision, not
+        # a stale edge-cached one, or a concurrent cron write could be clobbered
+        # (issue #20).
+        st = state.read_state(self._gist_id, self._token, fresh=True)
         wardrobe = st.get("wardrobe") or {}
         item = apply_category_edit(wardrobe, item_id, category)
         if item is None:

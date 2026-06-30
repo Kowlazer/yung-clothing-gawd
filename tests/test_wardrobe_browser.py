@@ -503,7 +503,7 @@ class TestCatalogueWrites:
     def test_edit_category_writes_and_returns_payload(self, monkeypatch):
         st = self._state()
         written = {}
-        monkeypatch.setattr(wb.state, "read_state", lambda g, t: st)
+        monkeypatch.setattr(wb.state, "read_state", lambda g, t, **k: st)
         monkeypatch.setattr(wb.state, "write_state",
                             lambda g, t, **kw: written.update(kw))
         cat = wb._Catalogue("g", "t", None)
@@ -512,7 +512,7 @@ class TestCatalogueWrites:
         assert payload["items"][0]["category"] == "hoodie"
 
     def test_edit_category_unknown_id_raises_keyerror(self, monkeypatch):
-        monkeypatch.setattr(wb.state, "read_state", lambda g, t: self._state())
+        monkeypatch.setattr(wb.state, "read_state", lambda g, t, **k: self._state())
         monkeypatch.setattr(wb.state, "write_state", lambda *a, **k: None)
         cat = wb._Catalogue("g", "t", None)
         with pytest.raises(KeyError):
