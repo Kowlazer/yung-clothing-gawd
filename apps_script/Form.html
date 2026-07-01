@@ -154,8 +154,8 @@
         }
         add('Weight', bc.weight_kg != null ? (bc.weight_kg + ' kg (' + kg2lb(bc.weight_kg) + ' lb)') : null);
         add('Body fat', bc.body_fat_pct != null ? (bc.body_fat_pct + '%') : null);
-        add('Lean', bc.lean_mass_kg != null ? (bc.lean_mass_kg + ' kg') : null);
-        add('Fat', bc.fat_mass_kg != null ? (bc.fat_mass_kg + ' kg') : null);
+        add('Lean', bc.lean_mass_kg != null ? (kg2lb(bc.lean_mass_kg) + ' lb') : null);
+        add('Fat', bc.fat_mass_kg != null ? (kg2lb(bc.fat_mass_kg) + ' lb') : null);
         var card = el('div', { class: 'card' }, [
           el('h3', { text: 'Body comp for this review' }), grid,
           el('div', { class: 'meta', text: 'Nearest DEXA scan' +
