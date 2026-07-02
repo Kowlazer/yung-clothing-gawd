@@ -105,6 +105,110 @@ class TestIsValidCode:
         assert _is_valid_code(token) is False
 
 
+class TestUrlBleedRejected:
+    """Machine identifiers that bleed in from tracking/unsubscribe URLs
+    rendered as visible text are the dominant real-inbox false-positive class
+    (2026-07-01 output: ~35 ShawnCraft UUIDs, Staples 40-char blobs, Amazon
+    %-encoding fragments, an Old Navy ISO timestamp). None is ever a code."""
+
+    @pytest.mark.parametrize("token", [
+        # 8-4-4-4-12 hex UUIDs (ESP/message event ids).
+        "B925132A-E64E-40B3-98CE-B7D9ADC00D69",
+        "0420AAE2-4D91-4C10-89D3-CF3680E36783",
+        "5A41118C-E682-4FA9-9098-84057F317DA9",
+        "17D7DAA7-CEDB-4C22-94E3-529A01B12DD9",
+    ])
+    def test_uuid_rejected(self, token):
+        from src.codes import _is_valid_code
+        assert _is_valid_code(token) is False, f"{token!r} (UUID) should reject"
+
+    @pytest.mark.parametrize("token", [
+        # 40+ char per-recipient tracking blobs (Staples).
+        "ETD0Q1O-O4ALLB6VPXFFZZ-OBXLVQZU8JJL0Q5MRLFK",
+        "NED9SGTTIDD9-YXEVADYQJCQLOR2RZMM02MU1B3G7JW",
+    ])
+    def test_overlong_tracking_blob_rejected(self, token):
+        from src.codes import _is_valid_code
+        assert _is_valid_code(token) is False, f"{token!r} too long to be a code"
+
+    @pytest.mark.parametrize("token", [
+        # Percent-encoding leftovers split off the "%" boundary.
+        "2522MAX", "2522PERCENTOFF", "253A1", "253A100",   # double-encoded
+        "3DHTTPS", "3DMMKDUDE", "3DXSUBBW", "3FADS",        # = / ? single
+        "8BTHE", "8BAND",                                   # zero-width-space tail
+    ])
+    def test_url_encoded_fragment_rejected(self, token):
+        from src.codes import _is_valid_code
+        assert _is_valid_code(token) is False, f"{token!r} (URL fragment) rejects"
+
+    @pytest.mark.parametrize("token", [
+        "2026-06-19T00", "2026-06-19", "2025-12-31T23",
+    ])
+    def test_iso_timestamp_rejected(self, token):
+        from src.codes import _is_valid_code
+        assert _is_valid_code(token) is False, f"{token!r} (timestamp) rejects"
+
+    @pytest.mark.parametrize("token", [
+        "A2F0FD2D453F4F314", "5CBE30B7027949055", "0123456789AB",
+    ])
+    def test_hex_blob_rejected(self, token):
+        from src.codes import _is_valid_code
+        assert _is_valid_code(token) is False, f"{token!r} (hex id) rejects"
+
+    @pytest.mark.parametrize("token", [
+        "250TH", "100TH", "1900S", "1950S", "2020S",  # ordinals / decades
+    ])
+    def test_ordinal_or_decade_rejected(self, token):
+        from src.codes import _is_valid_code
+        assert _is_valid_code(token) is False, f"{token!r} (ordinal/decade) rejects"
+
+    @pytest.mark.parametrize("code", [
+        # Codes ending in digits must NOT be mistaken for ordinals/decades.
+        "SPRING30", "WELCOME10", "SAVE20", "MAY15", "SUMMER25", "OFFER60",
+    ])
+    def test_digit_suffix_codes_not_ordinals(self, code):
+        from src.codes import _is_valid_code
+        assert _is_valid_code(code) is True, f"{code!r} should be kept"
+
+    @pytest.mark.parametrize("code", [
+        # Guard: these look superficially similar but are REAL codes and must
+        # survive the new rejects.
+        "VILLAGE108CDG5DRD",   # 17 chars, alnum, has non-hex letters
+        "OKRK-RVKAJ-NSZN",     # hyphenated, not a UUID shape
+        "LOOT-XIJX2K",         # one hyphen
+        "40OFF", "20OFF", "2FOR1", "25OFF",  # numeric-leading — NOT %-encodings
+        "MAY15", "SUMMER25",
+    ])
+    def test_real_codes_survive(self, code):
+        from src.codes import _is_valid_code
+        assert _is_valid_code(code) is True, f"{code!r} should be kept"
+
+
+class TestUrlStripping:
+    """URLs rendered as visible text are dropped before tokenizing, so a pasted
+    product/tracking URL can't seed fake codes — while a real code sharing the
+    line survives."""
+
+    def test_tracking_url_fragments_not_harvested(self):
+        from src.codes import harvest_codes
+        text = (
+            "ShawnCraft:\n"
+            "20% off — https://shawncraft.com/collections/all%2Fbest-seller"
+            "?utm=3Dads&id=B925132A-E64E-40B3-98CE-B7D9ADC00D69\n"
+        )
+        values = [c["code"] for c in harvest_codes(text)]
+        assert values == [], f"URL fragments leaked as codes: {values}"
+
+    def test_real_code_survives_alongside_url(self):
+        from src.codes import harvest_codes
+        text = (
+            "ShawnCraft:\n"
+            "Use code SAVE20 at https://shawncraft.com/discount/SAVE20\n"
+        )
+        values = [c["code"] for c in harvest_codes(text)]
+        assert "SAVE20" in values
+
+
 def test_digit_leading_code_extracted_from_sms_body():
     """Regression for real-world Postscript-style code in a SMS body."""
     from src.codes import harvest_codes

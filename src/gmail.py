@@ -51,6 +51,7 @@ from src.codes import (
     _canonicalise_code,
     _classify_confidence,
     _is_valid_code,
+    _strip_urls,
 )
 
 log = logging.getLogger(__name__)
@@ -615,9 +616,13 @@ def _extract_codes_from_text(text: str) -> list[dict]:
         ctx_start = max(0, i - 1)
         ctx_end = min(len(lines), i + 2)
         ctx_window = " ".join(lines[ctx_start:ctx_end])
-        if not _CODE_CONTEXT_RE.search(ctx_window):
+        # Scan URL-stripped copies so a tracking/unsubscribe URL rendered as
+        # visible text can't leak percent-encoded fragments or slugs as codes,
+        # nor supply false "off"/"code" context from a URL path. The stored
+        # ctx_window keeps the original text for display.
+        if not _CODE_CONTEXT_RE.search(_strip_urls(ctx_window)):
             continue
-        for token in _CODE_TOKEN_RE.finditer(line):
+        for token in _CODE_TOKEN_RE.finditer(_strip_urls(line)):
             raw = token.group(1)
             if not _is_valid_code(raw):
                 continue
