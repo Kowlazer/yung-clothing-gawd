@@ -31,6 +31,24 @@ class TestIsRestockEmail:
         "The item you signed up for is back in stock",
         # Restock + urgency in one subject — scarcity must not disqualify it.
         "Back in stock — selling fast!",
+        # --- classes observed in the 2026-07-02 real-inbox audit (issue #15):
+        # Hyphenated personal BIS alerts (Klaviyo-style) — the core payoff.
+        "Your back-in-stock notification just came through",
+        "Your back-in-stock notification is here",
+        # Curly apostrophe must not break the it's-back positive.
+        "It’s back: Golden Roe Tin",
+        # Live restock-noun announcements.
+        "RESTOCK! 🔥 Blaze Spade Sweatpants",
+        "Saiyan Tee Restock",
+        "🚨 SECRET DROP GOODIES & HAWK RESTOCK🚨",   # trailing after emoji strip
+        "Grab Your Favorites Again: Restock is Now Live!",
+        "Restock + sale now live.",
+        "A huge restock hits now",
+        "A massive restock, just for the guys",
+        "Confirmed: a huge restock just hit",
+        "The restock you’ve been waiting for",
+        "The sold-out tees are back",
+        "IT'S HERE: Our July Restock",
     ])
     def test_positive(self, subject):
         assert re_.is_restock_email(subject)
@@ -44,6 +62,30 @@ class TestIsRestockEmail:
         "Thanks for signing up for back in stock alerts",
         "Low stock on your favorites",
         "20% off everything this weekend",
+        # --- classes observed in the 2026-07-02 real-inbox audit (issue #15):
+        # Curly apostrophe must not break the you'll-be-notified EXCLUDE either.
+        "You’ll be notified when the Hoodie is back in stock",
+        # Non-product "now available": documents, tickets, platform features.
+        "Your latest statement is now available",
+        "Tickets now available for the premiere!",
+        "New assistant features now available on your plan",
+        "The model is now available on the Platform",
+        # Support-thread replies about restocks.
+        "Re: Question about alpaca hoodie restock",
+        "Re:[## 12345 ##] Question about tiger joggers restock",
+        # Replenishment marketing, not BIS.
+        "Time to restock? We made it easy.",
+        "Time to restock! Get 50% off socks & MORE",
+        # Future restocks / hype for a drop that hasn't happened.
+        "Update: Backorders in our upcoming restock",
+        "Restock 2026 Date Confirmed: May 1st!",
+        "Be the First: Restock Drops Tomorrow! Armor Hoodie is Back",
+        "Hyped Hoodie Restock Alert! Get Early Access",
+        "RESTOCK: NEXT DROP INCOMING + PASSWORD",
+        "Join the Hype: Hoodie Restock Coming!",
+        # Scarcity fetched by the new "sold out" net term must stay rejected.
+        "Something you like is almost sold out!",
+        "Many Sizes Sold Out! Only a few jackets left!",
     ])
     def test_negative(self, subject):
         assert not re_.is_restock_email(subject)
@@ -68,6 +110,40 @@ class TestExtractItem:
 
     def test_unrecognised_returns_none(self):
         assert re_.extract_item("It's back!") is None
+
+    # --- shapes observed in the 2026-07-02 real-inbox audit (issue #15):
+
+    def test_leading_restock_bang(self):
+        assert re_.extract_item("RESTOCK! 🔥 Blaze Spade Sweatpants") == \
+            "Blaze Spade Sweatpants"
+
+    def test_trailing_restock_noun(self):
+        assert re_.extract_item("Saiyan Tee Restock") == "Saiyan Tee"
+
+    def test_trailing_restocked_after_colon(self):
+        assert re_.extract_item("Falcon Chain: Restocked") == "Falcon Chain"
+
+    def test_bracketed_restocked(self):
+        assert re_.extract_item("[Restocked] NEON WEEK 5 Drop") == "NEON WEEK 5 Drop"
+
+    def test_adverb_before_restocked_not_captured(self):
+        assert re_.extract_item("‼️Pirate Tees Just Restocked!") == "Pirate Tees"
+
+    def test_dangling_conjunction_stripped(self):
+        assert re_.extract_item("Website Unlocked & Restocked") == "Website Unlocked"
+
+    def test_possessive_leadin_stripped_on_trailing_shape(self):
+        assert re_.extract_item("Your summer rotation, restocked") == "summer rotation"
+
+    def test_pronoun_tail_is_debris(self):
+        assert re_.extract_item("You asked, we restocked") is None
+
+    def test_colon_capture_is_debris(self):
+        assert re_.extract_item("IT'S HERE: Our July Restock") is None
+
+    def test_generic_item_nouns_refused(self):
+        assert re_.extract_item("The wait is over - your item is back in stock") is None
+        assert re_.extract_item("Notice that the product is back in stock") is None
 
 
 # ---------------------------------------------------------------------------

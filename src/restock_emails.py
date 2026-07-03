@@ -33,6 +33,11 @@ _SUBJECT_TERMS: tuple[str, ...] = (
     "restock", "restocked",
     '"back in stock"', '"now available"', '"available again"',
     '"in stock again"', '"back in your size"', '"it\'s back"',
+    # "The sold-out tees are back" (observed live 2026-07-02): fetch the
+    # scarcity-word class so the sold-out…back positive has something to judge;
+    # plain scarcity mail ("almost sold out!") carries no positive and is
+    # rejected by the classifier as before.
+    '"sold out"',
 )
 _SUBJECT_QUERY = "subject:(" + " OR ".join(_SUBJECT_TERMS) + ")"
 
@@ -53,19 +58,50 @@ _ALL_TIME_QUERY = (
 # new-product launches, and the signup *acknowledgement* a Back-in-Stock app
 # sends ("you'll be notified when X is back in stock") — which would otherwise
 # match the positive phrase inside a future-tense sentence.
+#
+# Tuned against a real 365-day inbox 2026-07-02 (issue #15) — the classes below
+# were all observed; don't loosen casually:
+#   * "back in stock" is often HYPHENATED in personal BIS alerts ("Your
+#     back-in-stock notification just came through") — the very emails this
+#     feature exists to catch — so the phrase allows either separator.
+#   * Curly apostrophes (U+2018/2019) are the norm in marketing subjects
+#     ("It’s back", "you’ll be notified"): they broke BOTH the it's-back
+#     positive and the you'll-be-notified excludes, so subjects are normalised
+#     to ASCII quotes before matching (``_normalize_subject_text``).
+#   * Live restock-noun announcements ("RESTOCK! <item>", "<item> Restock",
+#     "Restock is Now Live!", "a huge restock just hit") carried no positive
+#     phrase at all; matched now via ``_STANDALONE_RESTOCK_RE`` + the
+#     restock-verb patterns, with excludes guarding the noisy noun.
+#   * bare "now available" flooded in from non-shopping mail (bank statements,
+#     movie tickets, software "now available on your plan / on the Platform")
+#     → document/ticket word excludes + the "now available on/in your|the"
+#     platform-launch shape.
 _RESTOCK_RE = re.compile(
-    r"\bback in stock\b"
+    r"\bback[- ]in[- ]stock\b"
     r"|\bnow available\b"
-    r"|\brestocked?\b"
+    r"|\brestocked\b"
     r"|\bavailable again\b"
     r"|\bin stock again\b"
     r"|\bback in (?:your )?size\b"
     r"|\bit'?s back\b"
-    r"|\bwe (?:found|got|have) more\b",
+    r"|\bwe (?:found|got|have) more\b"
+    r"|\brestock\b[^.\n]{0,20}\b(?:now\s+)?live\b"   # "Restock is Now Live!"
+    r"|\brestock (?:just )?(?:hits?|dropped|landed)\b"  # "restock just hit"
+    r"|\brestock you'?ve been waiting for\b"
+    r"|\ba (?:huge|massive|big|major) restock\b"
+    r"|\bsold[- ]?out\b[^.\n]{0,30}\bback\b",        # "the sold-out tees are back"
     re.IGNORECASE,
 )
-# Disqualifiers: future ("not yet back"), launch (different email type), and
-# the signup *acknowledgement*. Deliberately NOT scarcity ("low stock",
+# A subject that *leads or ends* with the bare noun ("RESTOCK! <item>",
+# "<item> Restock") is an announcement; mid-sentence "restock" (support-ticket
+# replies, "time to restock" replenishment nudges) is not. Checked after emoji
+# stripping so a trailing 🚨/💡 doesn't hide the tail position.
+_STANDALONE_RESTOCK_RE = re.compile(
+    r"^restock\b|\brestock\s*[!:]*\s*$", re.IGNORECASE,
+)
+# Disqualifiers: future ("not yet back"), launch (different email type), the
+# signup *acknowledgement*, support-thread replies, replenishment marketing,
+# and non-product "now available" mail. Deliberately NOT scarcity ("low stock",
 # "selling fast", "almost gone") — those never match a positive on their own, so
 # excluding them only does harm by dropping legit "back in stock — selling fast"
 # emails. And NOT a bare "signed up": the most common BIS subject is "the item
@@ -77,23 +113,43 @@ _EXCLUDE_RE = re.compile(
     r"|thank(?:s| you)[^.\n]{0,40}signing up"
     r"|you'?ll be notified|you are now signed|you'?re signed up"
     r"|we'?ll (?:notify|email|let you know|text)|notify you when"
-    r"|will be back|when (?:it'?s|this is|they'?re) back",
+    r"|will be back|when (?:it'?s|this is|they'?re) back"
+    # observed 2026-07-02 (issue #15):
+    r"|^\s*(?:re|fwd|fw)\s*:"            # support-thread replies
+    r"|question about"
+    r"|time to restock"                   # replenishment marketing, not BIS
+    r"|upcoming restock|restock (?:is )?coming|\bincoming\b"
+    r"|drops? tomorrow|date confirmed|get early access"
+    r"|\b(?:statements?|invoices?|bills?|tax (?:forms?|documents?)|1099|w-?2"
+    r"|tickets?)\b"                       # documents + movie/support tickets
+    r"|now available (?:on|in) (?:your|the)\b",  # platform/feature launches
     re.IGNORECASE,
 )
+
+
+def _normalize_subject_text(subject: str) -> str:
+    """Normalise a subject for classification: unify curly apostrophes to
+    ASCII (they broke both positives and excludes — observed live), strip
+    emoji so decorations don't hide a leading/trailing token, and collapse
+    whitespace."""
+    s = (subject or "").replace("’", "'").replace("‘", "'")
+    s = _EMOJI_RE.sub("", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def is_restock_email(subject: str, from_header: str = "", body: str = "") -> bool:
     """True when a message announces an item is *currently* back in stock.
 
     Precision authority over the broad Gmail fetch: the subject must carry a
-    present-tense restock phrase (``_RESTOCK_RE``) and must not read as a
-    future alert / scarcity / signup acknowledgement (``_EXCLUDE_RE``).
+    present-tense restock phrase (``_RESTOCK_RE``, or the standalone
+    restock-noun announcement shape) and must not read as a future alert /
+    scarcity / signup acknowledgement / support thread (``_EXCLUDE_RE``).
     ``from_header`` / ``body`` are accepted for parity / future tuning but
     classification is subject-anchored (restock emails always signal there)."""
-    s = subject or ""
+    s = _normalize_subject_text(subject)
     if _EXCLUDE_RE.search(s):
         return False
-    return bool(_RESTOCK_RE.search(s))
+    return bool(_RESTOCK_RE.search(s) or _STANDALONE_RESTOCK_RE.search(s))
 
 
 # --- Shop / item / size parsing ---------------------------------------------
@@ -124,21 +180,49 @@ def _shop_from_sender(from_header: str) -> str:
 # Subject decorations stripped before pulling out the item name.
 _LEADING_FILLER_RE = re.compile(
     r"^\s*(?:good news|great news|guess what|psst|hey|hooray|woohoo|yay|"
-    r"the wait is over|you'?re in luck|it'?s back)\s*[!,:\-–—]*\s*",
+    r"the wait is over|you'?re in luck|it'?s back|notice that|"
+    r"(?:just a )?heads up)\s*[!,:\-–—]*\s*",
     re.IGNORECASE,
 )
-# "Back in stock: Item" / "Now available: Item" → capture the trailing item.
+# "Back in stock: Item" / "RESTOCK! Item" / "[Restocked] Item" → trailing item.
 _AFTER_COLON_RE = re.compile(
-    r"(?:back in stock|now available|restocked|available again|in stock again)"
-    r"\s*[:\-–—]\s*(.+)$",
+    r"(?:back[- ]in[- ]stock|now available|restock(?:ed)?|available again"
+    r"|in stock again)"
+    r"\s*[:!\-–—\]]\s*(.+)$",
     re.IGNORECASE,
 )
 # "Item is back in stock" / "Item is now available" → capture the leading item.
 _BEFORE_PHRASE_RE = re.compile(
-    r"^(.+?)\s+is\s+(?:now\s+)?(?:back in stock|now available|available again"
-    r"|back|in stock again|restocked)\b",
+    r"^(.+?)\s+is\s+(?:now\s+)?(?:back[- ]in[- ]stock|now available"
+    r"|available again|back|in stock again|restocked)\b",
     re.IGNORECASE,
 )
+# "Item Restocked" / "Ransom Chain: Restocked" → capture the leading item.
+# An adverb before the verb ("Tees Just Restocked!") is eaten, not captured.
+_TRAILING_RESTOCK_RE = re.compile(
+    r"^(.+?)[\s:\-–—,]+(?:just|now|finally|officially)?\s*restock(?:ed)?"
+    r"\s*[!.]*\s*$",
+    re.IGNORECASE,
+)
+# A leading capture that ends in a pronoun is sentence debris ("You asked, we
+# restocked"), not a product name.
+_PRONOUN_TAIL_RE = re.compile(r"\b(?:you|we|they|it|i)$", re.IGNORECASE)
+# Placeholder nouns that name no actual product ("your item is back in stock");
+# better to show the subject line than a bogus item called "item".
+_GENERIC_ITEMS = frozenset({
+    "item", "items", "product", "products", "order", "favorites", "favourites",
+    "favorite", "favourite",
+})
+
+
+def _finalize_item(item: str) -> str | None:
+    """Last-pass tidy of an extracted item: drop a dangling conjunction
+    ("Website Unlocked &") and refuse placeholder nouns."""
+    item = re.sub(r"(?:\s*(?:&|\+|and))+\s*$", "", item, flags=re.IGNORECASE)
+    item = item.strip()
+    if not item or item.lower() in _GENERIC_ITEMS:
+        return None
+    return item
 # Size tokens. "size: X" / "size - X" trusts a separator; bare "size X" requires
 # the value to look like a size (digits or 1-4 of X/S/M/L) so "size guide" /
 # "size up?" don't read as a size.
@@ -149,30 +233,42 @@ _SIZE_RE = re.compile(
     r"|\(\s*(?:size\s*)?([0-9]{1,2}|XX?S|S|M|L|XX?X?L)\s*\)",
     re.IGNORECASE,
 )
-_EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF☀-➿️]")
+# Covers the main emoji planes plus ‼/⁉ and the ⭐-class symbol block, all
+# observed as subject decoration ("‼️One Piece Tees Just Restocked!").
+_EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF☀-➿️‼⁉⬀-⯿]")
 
 
 def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", _EMOJI_RE.sub("", text or "")).strip(" \t—–-:!,")
 
 
+def _strip_leadin(item: str) -> str:
+    """Drop a possessive lead-in ("Your <item>", "The <item>")."""
+    return re.sub(r"^(?:your|the|a|an)\s+", "", item, flags=re.IGNORECASE).strip()
+
+
 def extract_item(subject: str) -> str | None:
     """Best-effort product name from a restock subject, or ``None``.
 
-    Handles the two common shapes ("Back in stock: <item>" and "<item> is back
-    in stock"), stripping leading filler ("Good news —") and emoji. Returns
-    ``None`` when nothing recognisable remains."""
-    s = _EMOJI_RE.sub("", subject or "").strip()
+    Handles the three common shapes ("Back in stock: <item>", "<item> is back
+    in stock", "<item> Restocked"), stripping leading filler ("Good news —")
+    and emoji. Returns ``None`` when nothing recognisable remains."""
+    s = _normalize_subject_text(subject)
     s = _LEADING_FILLER_RE.sub("", s)
     m = _AFTER_COLON_RE.search(s)
     if m:
-        return _clean(m.group(1)) or None
+        return _finalize_item(_clean(m.group(1)))
     m = _BEFORE_PHRASE_RE.search(s)
     if m:
-        item = _clean(m.group(1))
-        # Drop a possessive lead-in ("Your <item>", "The <item>").
-        item = re.sub(r"^(?:your|the|a|an)\s+", "", item, flags=re.IGNORECASE).strip()
-        return item or None
+        return _finalize_item(_strip_leadin(_clean(m.group(1))))
+    m = _TRAILING_RESTOCK_RE.search(s)
+    if m:
+        item = _strip_leadin(_clean(m.group(1)))
+        # A colon inside the capture is sentence debris ("IT'S HERE: Our July
+        # Restock"), as is a pronoun tail — this shape is the loosest of the
+        # three, so it gets the extra guards.
+        if item and ":" not in item and not _PRONOUN_TAIL_RE.search(item):
+            return _finalize_item(item)
     return None
 
 
