@@ -103,13 +103,75 @@ class TestHomepageExcerpt:
         big = "<body>" + ("x " * 5000) + "</body>"
         out = _homepage_excerpt(big)
         assert out.endswith("...[truncated]")
-        # Body capped at the limit; only the marker is appended past it.
+        # No sale signal past the head → body capped at the limit; only the
+        # marker is appended past it (no promo windows).
         assert len(out) == _HOMEPAGE_TEXT_LIMIT + len(" ...[truncated]")
 
     def test_handles_no_body(self):
         # Malformed HTML still produces something rather than crashing.
         out = _homepage_excerpt("just text, no tags")
         assert "just text" in out
+
+
+class TestPromoWindows:
+    """Cost lever #4: sale signals past the head slice are appended as small
+    context windows instead of being lost to a flat truncation."""
+
+    @staticmethod
+    def _page(tail: str) -> str:
+        filler = "x " * ((_HOMEPAGE_TEXT_LIMIT + 400) // 2)
+        return f"<body>{filler}{tail}</body>"
+
+    def test_signal_past_head_is_kept(self):
+        out = _homepage_excerpt(self._page(
+            "mid page hero banner 30% off everything this week only"))
+        assert "[sale mentions further down the page:]" in out
+        assert "30% off everything" in out
+        # And the pre-filter now sees it — under the old flat slice this page
+        # would have been wrongly recorded "no".
+        assert claude_fuzzy._has_sale_signal(out)
+
+    def test_window_carries_surrounding_context(self):
+        out = _homepage_excerpt(self._page(
+            "SUMMER EVENT our biggest clearance yet ends Sunday midnight"))
+        # Not just the bare lexeme — the neighbouring words come along so
+        # Claude can actually judge the mention.
+        assert "biggest clearance yet ends Sunday" in out
+
+    def test_no_windows_when_signals_only_in_head(self):
+        html = ("<body>Big sale 30% off today "
+                + "x " * ((_HOMEPAGE_TEXT_LIMIT + 400) // 2) + "</body>")
+        out = _homepage_excerpt(html)
+        assert "[sale mentions further down the page:]" not in out
+        assert out.endswith("...[truncated]")
+
+    def test_adjacent_signals_merge_into_one_window(self):
+        out = _homepage_excerpt(self._page(
+            "sale sale sale 20% off use code SAVE20 discount deals"))
+        assert out.count("[sale mentions further down the page:]") == 1
+        # One merged window, not one snippet per lexeme (no " ... " joins).
+        tail = out.split("[sale mentions further down the page:]")[1]
+        assert " ... " not in tail
+
+    def test_total_window_budget_is_capped(self):
+        # Many far-apart signals: appended windows must respect the cap.
+        tail = ("y " * 400).join(f"promo {i} 30% off" for i in range(20))
+        out = _homepage_excerpt(self._page(tail))
+        appended = out.split("[sale mentions further down the page:]")[1]
+        assert len(appended) <= claude_fuzzy._PROMO_WINDOWS_LIMIT + 200
+
+    def test_boundary_straddling_signal_survives(self):
+        # Place a signal exactly across the head cut so the head slice holds
+        # only its first half — the window must still carry it whole.
+        filler = "x" * (_HOMEPAGE_TEXT_LIMIT - 4)
+        out = _homepage_excerpt(f"<body>{filler} 30% off sitewide now</body>")
+        assert "30% off sitewide" in out
+        assert claude_fuzzy._has_sale_signal(out)
+
+    def test_short_pages_unchanged(self):
+        out = _homepage_excerpt("<body>Spring sale 20% off</body>")
+        assert out == "Spring sale 20% off"
+        assert "[sale mentions" not in out
 
 
 class TestHasSaleSignal:

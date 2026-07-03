@@ -108,11 +108,19 @@ _TIMEOUT = 15.0
 
 # chars of cleaned visible text per shop. This is the dominant input-token
 # cost — one excerpt per watchlist shop, on-sale or not. Promo/announcement
-# bars sit at the top of body text (the first ~1500 chars), so 2500 keeps
-# comfortable headroom while cutting ~half the per-shop input vs the old 6000.
-# If a known sale lower on a page starts getting missed, raise this or switch
-# to a promo-region-prioritised excerpt (see HANDOFF_TOKEN_SPEND.md).
-_HOMEPAGE_TEXT_LIMIT = 2500
+# bars sit at the top of body text (the first ~1500 chars), so the head slice
+# carries almost every real signal — and the excerpt is promo-region-
+# prioritised (cost lever #4): sale-signal matches PAST the head slice are
+# appended as small context windows, so shrinking the head from the old flat
+# 2500 loses no recall (it gains some — a promo past the old cutoff was
+# invisible before).
+_HOMEPAGE_TEXT_LIMIT = 1500
+# Context kept either side of a sale-signal match found past the head slice.
+_PROMO_WINDOW_RADIUS = 120
+# Combined budget for those appended windows. 900 fits ~3-4 distinct promo
+# regions; worst case the excerpt totals head + windows ≈ the old flat 2500,
+# and only on signal-dense pages that genuinely need the space.
+_PROMO_WINDOWS_LIMIT = 900
 _SEARCH_RESULT_LIMIT = 5      # candidates per shop-resolve / loose-mention task
 
 _DDG_HTML = "https://html.duckduckgo.com/html/"
@@ -214,9 +222,16 @@ def _fetch_homepage(url: str, *, client: httpx.Client | None = None) -> str | No
 def _homepage_excerpt(html: str) -> str:
     """Reduce homepage HTML to a Claude-friendly visible-text excerpt.
 
-    Strips <script>/<style>/<noscript>, collapses whitespace, and truncates to
-    ``_HOMEPAGE_TEXT_LIMIT`` chars. Promo bars are almost always in the first
-    ~2KB of body text, so the cap is more than enough headroom.
+    Strips <script>/<style>/<noscript>/<svg>, collapses whitespace, and keeps
+    the first ``_HOMEPAGE_TEXT_LIMIT`` chars — promo/announcement bars sit at
+    the top of body text, so the head slice carries almost every real signal.
+
+    Text past the head isn't blindly dropped though (cost lever #4, the
+    promo-region-prioritised excerpt): every ``_SALE_SIGNAL_RE`` match beyond
+    the slice is appended as a small context window (``_promo_windows``), so a
+    promo announced mid-page — invisible under the old flat slice — is still
+    seen by the pre-filter, the verdict hash, and Claude, at a fraction of the
+    cost of a bigger flat cap.
     """
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "noscript", "svg"]):
@@ -224,9 +239,52 @@ def _homepage_excerpt(html: str) -> str:
     body = soup.body or soup
     text = body.get_text(separator=" ", strip=True)
     text = re.sub(r"\s+", " ", text)
-    if len(text) > _HOMEPAGE_TEXT_LIMIT:
-        text = text[:_HOMEPAGE_TEXT_LIMIT] + " ...[truncated]"
-    return text
+    if len(text) <= _HOMEPAGE_TEXT_LIMIT:
+        return text
+    excerpt = text[:_HOMEPAGE_TEXT_LIMIT] + " ...[truncated]"
+    windows = _promo_windows(text, _HOMEPAGE_TEXT_LIMIT)
+    if windows:
+        excerpt += (" [sale mentions further down the page:] "
+                    + " ... ".join(windows))
+    return excerpt
+
+
+def _promo_windows(text: str, head_end: int) -> list[str]:
+    """Context windows around sale-signal matches past the head slice.
+
+    Returns document-order snippets of ±``_PROMO_WINDOW_RADIUS`` chars around
+    each ``_SALE_SIGNAL_RE`` match not already fully inside ``text[:head_end]``
+    (a match straddling the boundary keeps its whole window so the lexeme isn't
+    split in half). Overlapping/adjacent windows are merged so a promo region
+    with several signals costs one snippet. Combined length is capped at
+    ``_PROMO_WINDOWS_LIMIT``: whole windows are appended until one doesn't fit;
+    if even the FIRST window overflows the budget it's clipped rather than
+    dropped, so an out-of-head signal is never invisible to the pre-filter.
+    """
+    spans: list[list[int]] = []
+    for m in _SALE_SIGNAL_RE.finditer(text):
+        if m.end() <= head_end:
+            continue  # already fully visible in the head slice
+        start = max(0, m.start() - _PROMO_WINDOW_RADIUS)
+        end = min(len(text), m.end() + _PROMO_WINDOW_RADIUS)
+        if spans and start <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], end)
+        else:
+            spans.append([start, end])
+
+    out: list[str] = []
+    used = 0
+    for start, end in spans:
+        remaining = _PROMO_WINDOWS_LIMIT - used
+        if remaining <= 0:
+            break
+        if end - start > remaining:
+            if not out:
+                out.append(text[start:start + remaining])
+            break
+        out.append(text[start:end])
+        used += end - start
+    return out
 
 
 # Deterministic "no-signal" pre-filter (cost lever #1). A homepage whose
@@ -415,8 +473,12 @@ never reply with free-form text.
 # Task type 1: shop_sales — homepage sale detection
 
 For each shop you'll receive its name, homepage URL, and a visible-text
-excerpt of the homepage. Decide whether the shop is running a meaningful
-sitewide or major-section sale right now.
+excerpt of the homepage. A long page is truncated; snippets after a
+"[sale mentions further down the page:]" marker are context windows around
+sale-like wording found past the truncation point — judge them with the same
+rules as the main excerpt (they are often just footer/nav links). Decide
+whether the shop is running a meaningful sitewide or major-section sale
+right now.
 
 Status values:
   - "yes"     A real promotion is clearly active. Set `description` to a
