@@ -141,12 +141,33 @@ def _try_visible(locator: Any, timeout_ms: int) -> bool:
         return False
 
 
+# How far the scroll nudge travels. Klaviyo/Privy scroll triggers fire on a
+# fraction of page scrolled; one long wheel swipe down (and back up, so the
+# popup renders against the top-of-page state) is enough on real shops.
+_SCROLL_NUDGE_PX = 4_000
+
+
+def _scan_for_popup(page: Any, per_selector_timeout_ms: int) -> tuple[Any, str | None]:
+    """One pass over the vendor selectors, then the generic-dialog fallback."""
+    for vendor, selector in VENDOR_SELECTORS.items():
+        loc = page.locator(selector).first
+        if _try_visible(loc, per_selector_timeout_ms):
+            return loc, vendor
+
+    loc = page.locator(GENERIC_DIALOG_SELECTOR).first
+    if _try_visible(loc, per_selector_timeout_ms):
+        return loc, "generic"
+
+    return None, None
+
+
 def detect_popup(
     page: Any,
     *,
     initial_wait_ms: int = 3_000,
     per_selector_timeout_ms: int = 500,
     trigger_exit_intent: bool = True,
+    trigger_scroll: bool = True,
 ) -> tuple[Any, str | None]:
     """Look for a newsletter popup on ``page``.
 
@@ -154,14 +175,32 @@ def detect_popup(
     if nothing fired. ``vendor_name`` is one of the keys of ``VENDOR_SELECTORS``
     or ``"generic"`` when the dialog fallback matched.
 
-    Strategy:
-      1. ``page.wait_for_timeout(initial_wait_ms)`` — let scroll-/time-trigger
-         popups fire on their own.
-      2. Optionally move the mouse to ``(0, 0)`` to fake exit-intent.
-      3. Try each vendor selector with a short timeout. First visible wins.
-      4. Fall back to the generic dialog selector.
+    Staged — scan after each successive nudge, first visible match wins:
+      1. ``page.wait_for_timeout(initial_wait_ms)`` — let time-trigger popups
+         fire on their own — then scan.
+      2. Scroll down and back (scroll-trigger popups), scan again.
+      3. Move the mouse to ``(0, 0)`` to fake exit-intent, scan again.
+    An already-visible popup is returned by the first scan without any mouse
+    activity. Both nudges are best-effort (a failure falls through to the scan).
     """
     page.wait_for_timeout(initial_wait_ms)
+    popup, vendor = _scan_for_popup(page, per_selector_timeout_ms)
+    if popup is not None:
+        log.info("popup detected: vendor=%s stage=initial", vendor)
+        return popup, vendor
+
+    if trigger_scroll:
+        try:
+            page.mouse.wheel(0, _SCROLL_NUDGE_PX)
+            page.wait_for_timeout(2_000)
+            page.mouse.wheel(0, -_SCROLL_NUDGE_PX)
+            page.wait_for_timeout(1_000)
+        except Exception:  # noqa: BLE001 — scroll nudge is best-effort
+            pass
+        popup, vendor = _scan_for_popup(page, per_selector_timeout_ms)
+        if popup is not None:
+            log.info("popup detected: vendor=%s stage=scroll", vendor)
+            return popup, vendor
 
     if trigger_exit_intent:
         try:
@@ -169,17 +208,10 @@ def detect_popup(
             page.wait_for_timeout(700)
         except Exception:  # noqa: BLE001 — exit-intent is best-effort
             pass
-
-    for vendor, selector in VENDOR_SELECTORS.items():
-        loc = page.locator(selector).first
-        if _try_visible(loc, per_selector_timeout_ms):
-            log.info("popup detected: vendor=%s selector=%s", vendor, selector)
-            return loc, vendor
-
-    loc = page.locator(GENERIC_DIALOG_SELECTOR).first
-    if _try_visible(loc, per_selector_timeout_ms):
-        log.info("popup detected: vendor=generic selector=%s", GENERIC_DIALOG_SELECTOR)
-        return loc, "generic"
+        popup, vendor = _scan_for_popup(page, per_selector_timeout_ms)
+        if popup is not None:
+            log.info("popup detected: vendor=%s stage=exit-intent", vendor)
+            return popup, vendor
 
     return None, None
 
@@ -194,9 +226,52 @@ def find_phone_field(popup: Any, *, timeout_ms: int = 500) -> Any | None:
     return field if _try_visible(field, timeout_ms) else None
 
 
+# Button texts that mark a decline / close control, never a submit.
+_DECLINE_BUTTON_RE = re.compile(
+    r"no,?\s*thanks|not now|maybe later|dismiss|close|decline|^\s*[x×✕]\s*$",
+    re.I,
+)
+
+_BUTTONISH_SELECTOR = "button, input[type='submit'], [role='button']"
+
+
+def _sole_actionable_button(popup: Any, timeout_ms: int) -> Any | None:
+    """Fallback: the one visible, labelled, non-decline button in the popup.
+
+    Vendor forms often submit via ``type=button`` with campaign-specific text
+    ("Get 10% Off" — observed live, issue #14) that no enumerated text
+    selector can cover. When exactly one visible button with real text
+    survives the decline/close filter, it must be the submit; two or more
+    surviving → ambiguous, stay conservative and return None.
+    """
+    try:
+        btns = popup.locator(_BUTTONISH_SELECTOR)
+        n = btns.count()
+    except Exception:  # noqa: BLE001 — defensive against detached handles
+        return None
+
+    candidate = None
+    for i in range(min(n, 12)):
+        btn = btns.nth(i)
+        if not _try_visible(btn, timeout_ms):
+            continue
+        try:
+            text = (btn.inner_text(timeout=timeout_ms) or "").strip()
+        except Exception:  # noqa: BLE001 — stale handle mid-iteration
+            continue
+        if not text or _DECLINE_BUTTON_RE.search(text):
+            continue
+        if candidate is not None:
+            return None
+        candidate = btn
+    return candidate
+
+
 def find_submit_button(popup: Any, *, timeout_ms: int = 500) -> Any | None:
     btn = popup.locator(SUBMIT_BUTTON_SELECTOR).first
-    return btn if _try_visible(btn, timeout_ms) else None
+    if _try_visible(btn, timeout_ms):
+        return btn
+    return _sole_actionable_button(popup, timeout_ms)
 
 
 # ---------------------------------------------------------------------------

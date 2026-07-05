@@ -101,7 +101,15 @@ DEFAULT_SCREENSHOT_DIR = "signup_screenshots"
 # cadence across the batch, not just within a single visit.
 _INTER_SHOP_JITTER = (5.0, 15.0)
 _PAGE_TIMEOUT_MS = 20_000
-_POPUP_WAIT_MS = 3_000          # delay before scanning for vendor-popup
+# Delay before scanning for vendor-popup. Klaviyo popups are commonly
+# configured with 5-10s show delays: a live probe (2026-07-05, issue #14)
+# found several real shops whose popup a 3s wait misses but a ~10s+ wait
+# catches. Scroll-triggered popups are handled by detect_popup's
+# scroll-nudge stage, not this wait.
+_POPUP_WAIT_MS = 12_000
+# Settle wait before re-scanning a detected popup whose fields/submit were
+# not visible on the first pass (entrance animation still running).
+_FORM_SETTLE_MS = 2_000
 _POST_SUBMIT_WAIT_MS = 4_000    # delay after clicking submit before success-detect
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -396,10 +404,21 @@ def _signup_in_popup(
     phone_field = find_phone_field(popup) if want_phone else None
     submit_btn = find_submit_button(popup)
 
+    # A popup container can match its vendor selector while the inputs are
+    # still animating in, so the first field scan may run against a
+    # half-rendered form (observed live, issue #14). Settle briefly and
+    # re-find once before declaring the popup unusable.
+    if submit_btn is None or (email_field is None and phone_field is None):
+        page.wait_for_timeout(_FORM_SETTLE_MS)
+        email_field = find_email_field(popup) if want_email else None
+        phone_field = find_phone_field(popup) if want_phone else None
+        submit_btn = find_submit_button(popup)
+
     # Not a usable form: no submit button, or none of our target fields.
     if submit_btn is None or (email_field is None and phone_field is None):
-        log.info("popup at %s (vendor=%s) not a fillable form for %s",
-                 shop, vendor, ",".join(channels))
+        missing = "submit button" if submit_btn is None else "target fields"
+        log.info("popup at %s (vendor=%s) not a fillable form for %s (missing %s)",
+                 shop, vendor, ",".join(channels), missing)
         out: list[dict] = []
         if want_email:
             out.append(rec("email", "form_fill_failed"))
@@ -528,7 +547,10 @@ def _signup_phone_step2(
     field = find_phone_field(popup)
     step2 = popup
     if field is None:
-        step2, _ = detect_popup(page, initial_wait_ms=500, trigger_exit_intent=False)
+        step2, _ = detect_popup(
+            page, initial_wait_ms=500,
+            trigger_exit_intent=False, trigger_scroll=False,
+        )
         field = find_phone_field(step2) if step2 is not None else None
     if field is None:
         log.info("no phone step at %s (vendor=%s)", shop, vendor)
@@ -626,7 +648,7 @@ def _visit(
                     return visit_rec("captcha_blocked")
 
                 # The popup wait has already happened, so detect_popup only
-                # needs to trigger exit-intent and scan.
+                # needs to run its staged scans (scroll nudge + exit-intent).
                 popup, vendor = detect_popup(page, initial_wait_ms=0)
                 if popup is None:
                     log.info("no popup at %s", shop)

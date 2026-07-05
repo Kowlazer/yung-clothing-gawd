@@ -99,9 +99,13 @@ class FakeLocator:
 class FakeMouse:
     def __init__(self) -> None:
         self.moves: list[tuple[int, int]] = []
+        self.wheels: list[tuple[int, int]] = []
 
     def move(self, x: int, y: int) -> None:
         self.moves.append((x, y))
+
+    def wheel(self, dx: int, dy: int) -> None:
+        self.wheels.append((dx, dy))
 
 
 class FakeFrame:
@@ -219,6 +223,37 @@ class TestDetectPopup:
         _, vendor = pd.detect_popup(page, initial_wait_ms=10)
         assert vendor == "klaviyo"
 
+    def test_already_visible_popup_needs_no_mouse_activity(self):
+        """The first scan runs before any nudge, so an on-load popup is
+        found without wheel scrolls or exit-intent mouse moves."""
+        klaviyo = FakeLocator(selector="klaviyo", visible=True)
+        page = FakePage(selectors={pd.VENDOR_SELECTORS["klaviyo"]: klaviyo})
+        _, vendor = pd.detect_popup(page, initial_wait_ms=10)
+        assert vendor == "klaviyo"
+        assert page.mouse.moves == []
+        assert page.mouse.wheels == []
+
+    def test_scroll_nudge_reveals_scroll_triggered_popup(self):
+        loc = FakeLocator(selector="klaviyo", visible=False)
+        page = FakePage(selectors={pd.VENDOR_SELECTORS["klaviyo"]: loc})
+        page.mouse.wheel = lambda dx, dy: setattr(loc, "_visible", True)
+        popup, vendor = pd.detect_popup(page, initial_wait_ms=10)
+        assert vendor == "klaviyo"
+        assert popup is loc
+
+    def test_scrolls_before_exit_intent(self):
+        page = FakePage()
+        pd.detect_popup(page, initial_wait_ms=10)
+        assert page.mouse.wheels == [
+            (0, pd._SCROLL_NUDGE_PX), (0, -pd._SCROLL_NUDGE_PX),
+        ]
+        assert (0, 0) in page.mouse.moves
+
+    def test_skips_scroll_when_disabled(self):
+        page = FakePage()
+        pd.detect_popup(page, initial_wait_ms=10, trigger_scroll=False)
+        assert page.mouse.wheels == []
+
 
 # ---------------------------------------------------------------------------
 # Field-finding helpers
@@ -250,6 +285,68 @@ class TestFindFields:
     def test_finds_submit_button(self):
         popup = self._popup_with(submit=True)
         assert pd.find_submit_button(popup) is not None
+
+
+class _ButtonList:
+    """Locator fake holding N distinct button locators (FakeLocator.nth
+    returns self, which can't model per-index differences)."""
+
+    def __init__(self, buttons: list[FakeLocator]) -> None:
+        self._buttons = buttons
+
+    def count(self) -> int:
+        return len(self._buttons)
+
+    def nth(self, idx: int) -> FakeLocator:
+        return self._buttons[idx]
+
+
+class TestSoleActionableButtonFallback:
+    """find_submit_button's last tier: vendor buttons with campaign-specific
+    text ('Get 10% Off') that the enumerated selectors can't cover."""
+
+    def _popup(self, buttons: list[FakeLocator]) -> FakeLocator:
+        return FakeLocator(
+            visible=True,
+            children={pd._BUTTONISH_SELECTOR: _ButtonList(buttons)},
+        )
+
+    def test_sole_labelled_button_wins(self):
+        # Shape observed live: empty close ×, decline, campaign-text accept.
+        accept = FakeLocator(visible=True, text="Get 10% Off")
+        popup = self._popup([
+            FakeLocator(visible=True, text=""),
+            FakeLocator(visible=True, text="No, thanks"),
+            accept,
+        ])
+        assert pd.find_submit_button(popup) is accept
+
+    def test_two_candidates_is_ambiguous(self):
+        popup = self._popup([
+            FakeLocator(visible=True, text="Get 10% Off"),
+            FakeLocator(visible=True, text="Shop bestsellers"),
+        ])
+        assert pd.find_submit_button(popup) is None
+
+    def test_all_decline_or_unlabelled_yields_none(self):
+        popup = self._popup([
+            FakeLocator(visible=True, text="✕"),
+            FakeLocator(visible=True, text="Not now"),
+            FakeLocator(visible=False, text="Get 10% Off"),  # hidden
+        ])
+        assert pd.find_submit_button(popup) is None
+
+    def test_selector_tier_still_preferred(self):
+        selector_btn = FakeLocator(visible=True)
+        fallback_btn = FakeLocator(visible=True, text="Get 10% Off")
+        popup = FakeLocator(
+            visible=True,
+            children={
+                pd.SUBMIT_BUTTON_SELECTOR: selector_btn,
+                pd._BUTTONISH_SELECTOR: _ButtonList([fallback_btn]),
+            },
+        )
+        assert pd.find_submit_button(popup) is selector_btn
 
 
 # ---------------------------------------------------------------------------

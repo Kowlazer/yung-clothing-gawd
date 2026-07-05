@@ -827,9 +827,15 @@ class TestSignupInPopup:
         monkeypatch.setattr(ns, "_screenshot", lambda page, path: None)
         monkeypatch.setattr(ns, "detect_popup", lambda page, **k: (None, None))
 
+    class _Page:
+        """Bare page stand-in: only the settle-retry's wait is ever called."""
+
+        def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
+            pass
+
     def _call(self, channels, **kw):
         return ns._signup_in_popup(
-            page=object(), popup=object(), vendor="klaviyo",
+            page=self._Page(), popup=object(), vendor="klaviyo",
             email="user@gmail.com", phone="+15555550100",
             channels=channels, dry_run=kw.pop("dry_run", False),
             now_iso=_ISO, shop="https://s.com", **kw,
@@ -899,6 +905,24 @@ class TestSignupInPopup:
         out = self._call(["email"])
         assert [(r["channel"], r["result"]) for r in out] == [("email", "form_fill_failed")]
         assert ef.fills == []  # never filled — no submit button
+
+    def test_settle_retry_recovers_late_rendering_form(self, monkeypatch):
+        """A popup whose fields render in late (entrance animation) is
+        re-scanned once after a settle wait instead of being written off
+        as unfillable — observed live (issue #14)."""
+        ef, sb = FakeField(), FakeField()
+        self._patch(monkeypatch, email_field=None, submit=None)
+        email_seq = iter([None, ef])
+        submit_seq = iter([None, sb])
+        monkeypatch.setattr(
+            ns, "find_email_field", lambda popup, **k: next(email_seq, ef),
+        )
+        monkeypatch.setattr(
+            ns, "find_submit_button", lambda popup, **k: next(submit_seq, sb),
+        )
+        out = self._call(["email"])
+        assert [(r["channel"], r["result"]) for r in out] == [("email", "success")]
+        assert ef.fills == ["user@gmail.com"] and sb.clicks == 1
 
     def test_dry_run_reports_without_submitting(self, monkeypatch):
         ef, pf, sb = FakeField(), FakeField(), FakeField()
