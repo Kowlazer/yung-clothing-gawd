@@ -1,6 +1,6 @@
 """Read and write state to GitHub Gist.
 
-Gist files (13):
+Gist files (14):
   * prices.json       — per-URL price history, pruned after 30 days
   * shop_aliases.json — known shop name → homepage URL
   * codes.json        — promo codes (source: "watchlist" | "email" |
@@ -41,6 +41,13 @@ Gist files (13):
                                {signed_up_at, vendor} | null},
                                attempts: [{at, size, result, vendor}, ...]}}.
                         Written by the manual src/restock_signup.py command.
+  * shadow_runs.json  — shadow A/B verdict-diff log (cost lever #5, issue
+                        #16): {runs: [{at, primary_model, shadow_model,
+                        summary, disagreements, primary_usage,
+                        shadow_usage}, ...]}. Appended only while the
+                        SHADOW_MODEL env var is set; owned + pruned by
+                        src/shadow_compare.py; reviewed via
+                        `python -m src.shadow_report`.
 """
 
 from __future__ import annotations
@@ -177,6 +184,7 @@ def read_state(gist_id: str, token: str, *, fresh: bool = False) -> dict:
             "body_scans": _parse_gist_file(files, "body_scans.json", default={}, **opts),
             "shop_verdicts": _parse_gist_file(files, "shop_verdicts.json", default=[], **opts),
             "restock": _parse_gist_file(files, "restock_state.json", default={}, **opts),
+            "shadow_runs": _parse_gist_file(files, "shadow_runs.json", default={}, **opts),
         }
 
 
@@ -282,16 +290,19 @@ def write_state(
     body_scans: dict | None = None,
     shop_verdicts: list | None = None,
     restock: dict | None = None,
+    shadow_runs: dict | None = None,
 ) -> None:
     """Prune stale entries, then update Gist files in one PATCH.
 
     ``fx``, ``gmail``, ``voice``, ``sms_aliases``, ``signup``, ``wardrobe``,
-    ``email_sales``, ``body_scans``, ``shop_verdicts``, and ``restock`` are
+    ``email_sales``, ``body_scans``, ``shop_verdicts``, ``restock``, and
+    ``shadow_runs`` are
     optional — pass None to leave the corresponding file untouched (e.g. when
     the FX fetch failed
     and the cache shouldn't be overwritten, when Gmail/Voice/signup was
-    skipped/failed this run, when the wardrobe scan didn't run, or when the
-    BodySpec scan cache wasn't refreshed this run).
+    skipped/failed this run, when the wardrobe scan didn't run, when the
+    BodySpec scan cache wasn't refreshed this run, or when no shadow A/B call
+    was made).
 
     ``email_sales`` and ``shop_verdicts`` are expected already pruned by the
     caller (via ``src/email_sales.py`` / ``src/shop_verdicts.py``, which own the
@@ -326,6 +337,8 @@ def write_state(
         files["shop_verdicts.json"] = {"content": json.dumps(shop_verdicts, indent=2)}
     if restock is not None:
         files["restock_state.json"] = {"content": json.dumps(restock, indent=2)}
+    if shadow_runs is not None:
+        files["shadow_runs.json"] = {"content": json.dumps(shadow_runs, indent=2)}
     with httpx.Client(timeout=_TIMEOUT) as client:
         resp = client.patch(
             f"{_GIST_API}/{gist_id}",

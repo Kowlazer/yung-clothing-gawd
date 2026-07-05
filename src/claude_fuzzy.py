@@ -59,6 +59,12 @@ Output:
         "usage":         {"input_tokens", "output_tokens",
                           "cache_read_input_tokens",
                           "cache_creation_input_tokens"} | None,
+        "shadow":        {"model", "usage", "summary", "disagreements"} | None,
+                          # cost lever #5 (issue #16): when shadow_model is set,
+                          # the SAME payload is also judged by that model and
+                          # the verdicts diffed (src/shadow_compare.py). None
+                          # when disabled, when no API call happened, or when
+                          # the shadow call failed (failure-isolated).
     }
 
 If all four input lists are empty the function short-circuits and returns the
@@ -79,7 +85,7 @@ from urllib.parse import quote_plus, urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-from src import extract, shop_verdicts
+from src import extract, shadow_compare, shop_verdicts
 from src.http_util import RateLimiter, get_with_retry
 
 log = logging.getLogger(__name__)
@@ -745,6 +751,38 @@ def _call_claude(
     return tool_input, getattr(response, "usage", None)
 
 
+def _run_shadow(
+    client: Any,
+    shadow_model: str,
+    payload: str,
+    primary_tool_input: dict,
+) -> dict | None:
+    """Judge the SAME payload with the shadow model and diff the verdicts.
+
+    Cost lever #5 (issue #16): before swapping the daily call off Sonnet, run
+    the candidate model side-by-side for a week and diff every decision. The
+    digest is built exclusively from the primary result — this call only
+    produces a comparison record (``src/shadow_compare.py``), so it is
+    failure-isolated: any error (API, truncation, refusal to use the tool)
+    logs a warning and returns None, leaving the daily run untouched.
+    """
+    try:
+        shadow_input, shadow_usage = _call_claude(client, shadow_model, payload)
+    except Exception as exc:  # noqa: BLE001 — shadow must never break the run
+        log.warning(
+            "claude_fuzzy: shadow call (%s) failed — primary result "
+            "unaffected: %s", shadow_model, exc,
+        )
+        return None
+    diff = shadow_compare.compare(primary_tool_input, shadow_input)
+    return {
+        "model": shadow_model,
+        "usage": _usage_dict(shadow_usage),
+        "summary": diff["summary"],
+        "disagreements": diff["disagreements"],
+    }
+
+
 def _usage_dict(usage: Any) -> dict | None:
     """Coerce the SDK usage object to a plain dict (for logging / cost trace)."""
     if usage is None:
@@ -771,6 +809,7 @@ def _empty_result() -> dict:
         "unresolved": [],
         "shop_verdicts": [],
         "usage": None,
+        "shadow": None,
     }
 
 
@@ -792,6 +831,7 @@ def resolve_fuzzy(
     http_client: httpx.Client | None = None,
     prior_verdicts: list[dict] | None = None,
     today: date | None = None,
+    shadow_model: str | None = None,
 ) -> dict:
     """Run the batched fuzzy-judgement step.
 
@@ -819,6 +859,12 @@ def resolve_fuzzy(
                           persist.
         today             Reference date for the verdict-cache freshness check.
                           Defaults to today (UTC).
+        shadow_model      Optional model ID for the shadow A/B run (cost lever
+                          #5, issue #16). When set AND the primary API call
+                          fires, the same payload is also judged by this model
+                          and the verdict diff returned under ``shadow``.
+                          Failure-isolated — a shadow error never affects the
+                          primary result. Default None → no shadow call.
 
     Returns the dict described in the module docstring. Never raises for
     candidate-gathering failures — those degrade into empty candidate lists
@@ -955,11 +1001,20 @@ def resolve_fuzzy(
             "unresolved": unresolved,
             "shop_verdicts": [],
             "usage": None,
+            "shadow": None,
         }
 
     payload = _build_payload(shop_tasks, resolve_tasks, loose_tasks, email_tasks)
     api_client = _get_client(client)
     tool_input, usage = _call_claude(api_client, model, payload)
+
+    # Cost lever #5 (issue #16): shadow-judge the identical payload with the
+    # candidate cheaper model and record the verdict diff. Fires only when the
+    # primary call fired (no tasks → nothing to compare) and never raises.
+    shadow = (
+        _run_shadow(api_client, shadow_model, payload, tool_input)
+        if shadow_model else None
+    )
 
     # Strip ids from the response (callers don't need them) and merge with
     # the pre-API skipped buckets.
@@ -994,6 +1049,7 @@ def resolve_fuzzy(
         "unresolved":    unresolved,
         "shop_verdicts": fresh_verdicts,
         "usage":         _usage_dict(usage),
+        "shadow":        shadow,
     }
 
 

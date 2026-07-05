@@ -179,6 +179,12 @@ class Config:
     # digest's email-sourced "Back in stock" lines cover.
     restock_emails_daily: bool = True
     restock_email_days: int = 7
+    # Shadow A/B model for the daily fuzzy call (cost lever #5, issue #16).
+    # When set (e.g. "claude-haiku-4-5-20251001"), resolve_fuzzy also sends the
+    # identical payload to this model and the verdict diff accumulates in
+    # shadow_runs.json for `python -m src.shadow_report` to review before any
+    # model swap. The digest is never affected. Blank/unset → no shadow call.
+    shadow_model: str = ""
 
 
 def _parse_sizes(raw: str | None) -> tuple[str, ...]:
@@ -300,4 +306,5 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         restock_signup_enabled=_truthy(src.get("RESTOCK_SIGNUP_ENABLED")),
         restock_emails_daily=_truthy_or(src.get("RESTOCK_EMAILS_DAILY"), True),
         restock_email_days=_parse_int_or(src.get("RESTOCK_EMAIL_DAYS"), 7),
+        shadow_model=(src.get("SHADOW_MODEL") or "").strip(),
     )

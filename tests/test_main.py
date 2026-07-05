@@ -635,7 +635,8 @@ def test_run_threads_data_through_pipeline(monkeypatch):
     monkeypatch.setattr(main_mod, "extract", fake_extract)
 
     def fake_resolve_fuzzy(*, shops_to_check, shops_to_resolve, loose_mentions,
-                           email_signals=None, prior_verdicts=None, today=None):
+                           email_signals=None, prior_verdicts=None, today=None,
+                           shadow_model=None):
         captured["resolve_fuzzy_input"] = {
             "shops_to_check": shops_to_check,
             "shops_to_resolve": shops_to_resolve,
@@ -643,6 +644,7 @@ def test_run_threads_data_through_pipeline(monkeypatch):
             "email_signals": email_signals,
             "prior_verdicts": prior_verdicts,
             "today": today,
+            "shadow_model": shadow_model,
         }
         return {
             "shop_sales": [{"shop": "Aniqi", "status": "yes",
@@ -662,13 +664,14 @@ def test_run_threads_data_through_pipeline(monkeypatch):
 
     def fake_write_state(gist_id, token, *, prices, aliases, codes, fx,
                           gmail=None, voice=None, sms_aliases=None,
-                          email_sales=None, body_scans=None, shop_verdicts=None):
+                          email_sales=None, body_scans=None, shop_verdicts=None,
+                          shadow_runs=None):
         captured["write_state"] = {
             "prices": prices, "aliases": aliases,
             "codes": codes, "fx": fx, "gmail": gmail,
             "voice": voice, "sms_aliases": sms_aliases,
             "email_sales": email_sales, "body_scans": body_scans,
-            "shop_verdicts": shop_verdicts,
+            "shop_verdicts": shop_verdicts, "shadow_runs": shadow_runs,
         }
 
     monkeypatch.setattr(main_mod, "write_state", fake_write_state)

@@ -921,3 +921,113 @@ class TestResolveFuzzyErrors:
                 shops_to_check=[{"shop": "Aniqi", "url": "https://aniqi.com"}],
                 shops_to_resolve=[], loose_mentions=[], client=broken,
             )
+
+
+# ---------------------------------------------------------------------------
+# Shadow A/B run (cost lever #5, issue #16)
+# ---------------------------------------------------------------------------
+
+def _make_response(tool_input, usage=None):
+    content = [SimpleNamespace(type="tool_use", name="submit_results",
+                               input=tool_input)]
+    return SimpleNamespace(
+        content=content,
+        usage=SimpleNamespace(**usage) if usage else None,
+        stop_reason=None,
+    )
+
+
+class _RoutingMessages:
+    """Routes .create(model=...) to per-model scripted responses."""
+
+    def __init__(self, responses_by_model, fail_models=()):
+        self._responses = responses_by_model
+        self._fail = set(fail_models)
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        model = kwargs["model"]
+        if model in self._fail:
+            raise RuntimeError(f"boom from {model}")
+        return self._responses[model]
+
+
+def _email_signal():
+    return [{"email_id": "msg_1", "shop": "Aniqi",
+             "subject": "Sale!", "body_excerpt": "30% off",
+             "email_date": "2026-07-04"}]
+
+
+def _email_result(status):
+    return _ok_tool_input(email_sales=[{
+        "id": "email_0", "email_id": "msg_1", "shop": "Aniqi",
+        "status": status, "description": None,
+        "starts_on": None, "ends_on": None,
+    }])
+
+
+class TestResolveFuzzyShadow:
+    PRIMARY = claude_fuzzy.DEFAULT_MODEL
+    SHADOW = "claude-haiku-4-5-20251001"
+
+    def _client(self, primary_input, shadow_input, fail_models=()):
+        messages = _RoutingMessages({
+            self.PRIMARY: _make_response(
+                primary_input, usage={"input_tokens": 100, "output_tokens": 10}),
+            self.SHADOW: _make_response(
+                shadow_input, usage={"input_tokens": 100, "output_tokens": 8}),
+        }, fail_models=fail_models)
+        return SimpleNamespace(messages=messages)
+
+    def test_shadow_gets_identical_payload(self):
+        fake = self._client(_email_result("yes"), _email_result("yes"))
+        result = resolve_fuzzy([], [], [], email_signals=_email_signal(),
+                               client=fake, shadow_model=self.SHADOW)
+        calls = fake.messages.calls
+        assert [c["model"] for c in calls] == [self.PRIMARY, self.SHADOW]
+        # Byte-identical payload + system prompt — a true A/B.
+        assert calls[0]["messages"] == calls[1]["messages"]
+        assert calls[0]["system"] == calls[1]["system"]
+        shadow = result["shadow"]
+        assert shadow["model"] == self.SHADOW
+        assert shadow["summary"] == {
+            "total": 1, "agree": 1,
+            "by_type": {"email_sales": {"total": 1, "agree": 1}},
+        }
+        assert shadow["disagreements"] == []
+        assert shadow["usage"] == {"input_tokens": 100, "output_tokens": 8}
+
+    def test_disagreement_recorded_primary_result_untouched(self):
+        fake = self._client(_email_result("no"), _email_result("yes"))
+        result = resolve_fuzzy([], [], [], email_signals=_email_signal(),
+                               client=fake, shadow_model=self.SHADOW)
+        # The digest-facing result carries the PRIMARY verdict only.
+        assert result["email_sales"][0]["status"] == "no"
+        shadow = result["shadow"]
+        assert shadow["summary"]["agree"] == 0
+        assert shadow["disagreements"][0]["primary"]["status"] == "no"
+        assert shadow["disagreements"][0]["shadow"]["status"] == "yes"
+
+    def test_shadow_failure_is_isolated(self):
+        fake = self._client(_email_result("yes"), _email_result("yes"),
+                            fail_models={self.SHADOW})
+        result = resolve_fuzzy([], [], [], email_signals=_email_signal(),
+                               client=fake, shadow_model=self.SHADOW)
+        # Primary result intact; shadow slot None (logged, not raised).
+        assert result["email_sales"][0]["status"] == "yes"
+        assert result["shadow"] is None
+
+    def test_no_shadow_model_no_second_call(self):
+        fake = self._client(_email_result("yes"), _email_result("yes"))
+        result = resolve_fuzzy([], [], [], email_signals=_email_signal(),
+                               client=fake)
+        assert [c["model"] for c in fake.messages.calls] == [self.PRIMARY]
+        assert result["shadow"] is None
+
+    def test_no_tasks_no_shadow_call(self):
+        fake = self._client(_ok_tool_input(), _ok_tool_input())
+        result = resolve_fuzzy([], [], [], email_signals=[], client=fake,
+                               shadow_model=self.SHADOW)
+        assert fake.messages.calls == []
+        assert result["shadow"] is None

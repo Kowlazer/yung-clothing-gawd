@@ -33,6 +33,8 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from src import bodyspec
+from src import shadow_compare
+from src.claude_fuzzy import DEFAULT_MODEL as CLAUDE_DEFAULT_MODEL
 from src.claude_fuzzy import resolve_fuzzy
 from src.classify import Entry, classify, sales_tracking_shops
 from src.codes import harvest_codes
@@ -1026,6 +1028,7 @@ def run(cfg: Config | None = None) -> str:
     prior_codes = state.get("codes") or []
     prior_email_sales = state.get("email_sales") or []
     prior_verdicts = state.get("shop_verdicts") or []
+    prior_shadow_runs = state.get("shadow_runs") or {}
     prior_gmail = state.get("gmail") or {}
     prior_voice = state.get("voice") or {}
     sms_aliases = dict(state.get("sms_aliases") or {})
@@ -1136,9 +1139,37 @@ def run(cfg: Config | None = None) -> str:
         email_signals=combined_signals,
         prior_verdicts=prior_verdicts,
         today=today,
+        shadow_model=cfg.shadow_model or None,
     )
     if fuzzy.get("usage"):
         log.info("claude usage: %s", fuzzy["usage"])
+
+    # Cost lever #5 (issue #16): fold this run's shadow A/B verdict diff into
+    # the persisted experiment log. None ⇒ shadow disabled / no API call /
+    # shadow call failed ⇒ leave shadow_runs.json untouched.
+    shadow_runs_store = None
+    if fuzzy.get("shadow"):
+        shadow = fuzzy["shadow"]
+        shadow_summary = shadow.get("summary") or {}
+        log.info(
+            "shadow diff (%s vs %s): %d/%d verdicts agree; %d disagreement(s): %s",
+            shadow.get("model"), CLAUDE_DEFAULT_MODEL,
+            shadow_summary.get("agree", 0), shadow_summary.get("total", 0),
+            len(shadow.get("disagreements") or []),
+            shadow.get("usage"),
+        )
+        shadow_runs_store = shadow_compare.prune(
+            shadow_compare.append_run(prior_shadow_runs, {
+                "at": now_iso,
+                "primary_model": CLAUDE_DEFAULT_MODEL,
+                "shadow_model": shadow.get("model"),
+                "summary": shadow.get("summary"),
+                "disagreements": shadow.get("disagreements"),
+                "primary_usage": fuzzy.get("usage"),
+                "shadow_usage": shadow.get("usage"),
+            }),
+            today,
+        )
 
     aliases = _merge_aliases(aliases, fuzzy.get("resolutions", []))
 
@@ -1307,6 +1338,7 @@ def run(cfg: Config | None = None) -> str:
             email_sales=email_sales_store,
             body_scans=body_scans_out,
             shop_verdicts=shop_verdicts_store,
+            shadow_runs=shadow_runs_store,
         )
 
     subject = _digest_subject(shop_sales, items, active_email_sales, today=now)
