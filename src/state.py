@@ -60,6 +60,8 @@ from typing import Any
 
 import httpx
 
+from src.log_privacy import redact_value
+
 log = logging.getLogger(__name__)
 
 _GIST_API = "https://api.github.com/gists"
@@ -233,9 +235,11 @@ def _prune_codes(codes: Any) -> list:
                 try:
                     ts = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00")).timestamp()
                     if ts < cutoff:
+                        # redact_value: promo-code values are a privacy leak
+                        # class and must not print in public Actions logs.
                         log.info(
                             "state: pruning stale %s code %s (last_seen=%s)",
-                            source, entry.get("code"), last_seen,
+                            source, redact_value(entry.get("code")), last_seen,
                         )
                         continue
                 except (ValueError, AttributeError):

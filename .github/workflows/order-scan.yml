@@ -31,6 +31,10 @@ jobs:
 
       - name: Run order scan (headless)
         env:
+          # Public repo ⇒ public Actions log. Same redaction flag as
+          # daily.yml: URLs in log records reduce to scheme://host so the
+          # log never carries watchlist/product paths. See src/log_privacy.py.
+          SALE_CHECK_REDACT_LOGS: "1"
           WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}
           # order_scan never sends email, but load_config() validates one shared
           # _REQUIRED set for every command, so these three must be present or it

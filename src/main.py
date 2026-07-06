@@ -33,6 +33,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from src import bodyspec
+from src import log_privacy
 from src import shadow_compare
 from src.claude_fuzzy import DEFAULT_MODEL as CLAUDE_DEFAULT_MODEL
 from src.claude_fuzzy import resolve_fuzzy
@@ -1375,6 +1376,9 @@ def main() -> None:
         level=os.environ.get("SALE_CHECK_LOG", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Public-repo Actions runs set SALE_CHECK_REDACT_LOGS=1 so the (publicly
+    # readable) workflow log never carries watchlist URLs. Inert locally.
+    log_privacy.install()
     # Local runs: load .env from sale-check/. GitHub Actions injects vars
     # directly into the environment, so load_dotenv is a no-op there.
     # override=True lets .env beat blank/stale shell values (some local shells

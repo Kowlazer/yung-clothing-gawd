@@ -122,7 +122,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlunparse
 
-from src import bodyspec, order_classify
+from src import bodyspec, log_privacy, order_classify
 from src.classify import _NON_CLOTHING_HEADER_RE
 from src.config import Config, load_config
 from src.wardrobe_categories import NON_CLOTHING, normalise_category
@@ -3308,6 +3308,9 @@ def main() -> None:
         level=os.environ.get("SALE_CHECK_LOG", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # The weekly headless scan runs on public Actions too — same redaction
+    # flag as src.main so its log never carries watchlist/product URLs.
+    log_privacy.install()
     try:
         from dotenv import load_dotenv
         load_dotenv(override=True)

@@ -51,6 +51,14 @@ jobs:
 
       - name: Run sale check
         env:
+          # This repo is PUBLIC: Actions logs are readable by any logged-in
+          # GitHub user for ~90 days, and httpx logs every request URL at
+          # INFO — without this flag each run republishes the entire private
+          # watchlist. src/log_privacy.py rewrites URLs in every log record
+          # (incl. tracebacks) to scheme://host and masks promo-code values.
+          # Never set this locally: full URLs at INFO are the local
+          # debugging contract.
+          SALE_CHECK_REDACT_LOGS: "1"
           WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
