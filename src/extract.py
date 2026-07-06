@@ -13,6 +13,7 @@ import extruct
 import httpx
 from bs4 import BeautifulSoup
 
+from src import browser_fetch
 from src.http_util import get_with_retry
 
 log = logging.getLogger(__name__)
@@ -46,6 +47,16 @@ _PROXY_FALLBACK_ENABLED = os.getenv(
     "READER_PROXY_FALLBACK", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
 _PROXY_TIMEOUT = 30.0
+
+# Browser-render fallback (issue #1's last holdout): a JS-hydrated SPA
+# storefront injects its Product JSON-LD client-side, so even the proxy's
+# HTML snapshot has no price — only a real browser executing the page's JS
+# does. Fires strictly after every proxy route above has missed; budgeted +
+# failure-isolated in src/browser_fetch.py. Same kill-switch convention as
+# the proxy (read at import; tests monkeypatch _BROWSER_FALLBACK_ENABLED).
+_BROWSER_FALLBACK_ENABLED = os.getenv(
+    "BROWSER_FALLBACK", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
 
 _SCHEMA_OOS = frozenset({
     "http://schema.org/OutOfStock",
@@ -551,19 +562,28 @@ def _extract_label(soup: BeautifulSoup) -> str | None:
 
 
 def _og_price(soup: BeautifulSoup) -> dict:
-    """Extract price from OpenGraph meta tags."""
-    tag = soup.find("meta", attrs={"property": "og:price:amount"})
-    if not tag:
-        return {}
-    cur_tag = soup.find("meta", attrs={"property": "og:price:currency"})
-    title_tag = soup.find("meta", attrs={"property": "og:title"})
-    return {
-        "label": title_tag.get("content") if title_tag else None,
-        "current_price": _to_float(tag.get("content")),
-        "original_price": None,
-        "currency": cur_tag.get("content") if cur_tag else None,
-        "out_of_stock": False,
-    }
+    """Extract price from OpenGraph meta tags.
+
+    Covers both the classic ``og:price:*`` properties and the OG *product*
+    vertical's ``product:price:*``. Shoplazza storefronts (ostehard-style
+    shops, issue #1) emit only the latter — and they emit it **server-side**,
+    so the blocked-recovery proxied-HTML rung can price them without a
+    browser; their JSON-LD, by contrast, doesn't exist even after hydration.
+    """
+    for prefix in ("og", "product"):
+        tag = soup.find("meta", attrs={"property": f"{prefix}:price:amount"})
+        if not tag:
+            continue
+        cur_tag = soup.find("meta", attrs={"property": f"{prefix}:price:currency"})
+        title_tag = soup.find("meta", attrs={"property": "og:title"})
+        return {
+            "label": title_tag.get("content") if title_tag else None,
+            "current_price": _to_float(tag.get("content")),
+            "original_price": None,
+            "currency": cur_tag.get("content") if cur_tag else None,
+            "out_of_stock": False,
+        }
+    return {}
 
 
 def _microdata_price(soup: BeautifulSoup) -> dict:
@@ -1065,35 +1085,51 @@ def extract(url: str, *, preferred_sizes: tuple[str, ...] = ()) -> dict:
         # stale every cron run. Recover through the reader proxy (un-blocked
         # egress). Only here — after a real block — so the happy path is
         # untouched.
-        if kind == "blocked" and _PROXY_FALLBACK_ENABLED:
-            # Shopify products: price/variants live in the structured `.json`
-            # (exact compare-at + per-variant availability), so prefer it.
-            if "/products/" in url:
-                if product_json is None:
-                    product_json = _shopify_json_via_proxy(_shopify_json_url(url))
+        if kind == "blocked":
+            if _PROXY_FALLBACK_ENABLED:
+                # Shopify products: price/variants live in the structured `.json`
+                # (exact compare-at + per-variant availability), so prefer it.
+                if "/products/" in url:
+                    if product_json is None:
+                        product_json = _shopify_json_via_proxy(_shopify_json_url(url))
+                        if product_json is not None:
+                            _borrow_js_availability_via_proxy(product_json, url)
                     if product_json is not None:
-                        _borrow_js_availability_via_proxy(product_json, url)
-                if product_json is not None:
-                    parsed = parse("", url, product_json=product_json,
-                                   preferred_sizes=preferred_sizes)
-                    result.update(parsed)
-                    log.info("recovered blocked Shopify product via .json: %s", url)
-                    return result
-            # Non-Shopify shops (no `.json`), and Shopify products whose `.json`
-            # also didn't come through: fetch the page HTML through the proxy and
-            # run it past the same JSON-LD / OG / microdata / WooCommerce
-            # extractors. The regex price fallback is disabled (proxied HTML is
-            # often a rendered/partial blob whose first `$N` is a banner) so we
-            # adopt a recovered price only from a structured source — otherwise
-            # we keep the last-known price (the prior "blocked" verdict).
-            proxied_html = _fetch_html_via_proxy(url)
-            if proxied_html:
-                parsed = parse(proxied_html, url, preferred_sizes=preferred_sizes,
-                               trust_regex_fallback=False)
-                if parsed.get("current_price") is not None:
-                    result.update(parsed)
-                    log.info("recovered blocked product via proxied HTML: %s", url)
-                    return result
+                        parsed = parse("", url, product_json=product_json,
+                                       preferred_sizes=preferred_sizes)
+                        result.update(parsed)
+                        log.info("recovered blocked Shopify product via .json: %s", url)
+                        return result
+                # Non-Shopify shops (no `.json`), and Shopify products whose `.json`
+                # also didn't come through: fetch the page HTML through the proxy and
+                # run it past the same JSON-LD / OG / microdata / WooCommerce
+                # extractors. The regex price fallback is disabled (proxied HTML is
+                # often a rendered/partial blob whose first `$N` is a banner) so we
+                # adopt a recovered price only from a structured source — otherwise
+                # we keep the last-known price (the prior "blocked" verdict).
+                proxied_html = _fetch_html_via_proxy(url)
+                if proxied_html:
+                    parsed = parse(proxied_html, url, preferred_sizes=preferred_sizes,
+                                   trust_regex_fallback=False)
+                    if parsed.get("current_price") is not None:
+                        result.update(parsed)
+                        log.info("recovered blocked product via proxied HTML: %s", url)
+                        return result
+            # JS-SPA holdout (issue #1's last residual): the proxy's snapshot is
+            # pre-hydration, so a storefront that injects its Product JSON-LD
+            # client-side never surfaces a price above. Render the page in a
+            # real headless browser (budgeted + failure-isolated) and run the
+            # hydrated HTML past the same structured-only extractors — the
+            # regex fallback stays off for exactly the proxied-HTML reason.
+            if _BROWSER_FALLBACK_ENABLED:
+                rendered = browser_fetch.fetch_rendered_html(url)
+                if rendered:
+                    parsed = parse(rendered, url, preferred_sizes=preferred_sizes,
+                                   trust_regex_fallback=False)
+                    if parsed.get("current_price") is not None:
+                        result.update(parsed)
+                        log.info("recovered blocked product via browser render: %s", url)
+                        return result
         result["error"] = f"HTTP {resp.status_code}"
         result["error_kind"] = kind
         return result

@@ -29,6 +29,26 @@ jobs:
       - name: Install dependencies
         run: pip install -e .
 
+      # Browser-render fallback for Cloudflare-blocked JS-SPA storefronts
+      # (issue #1, src/browser_fetch.py): the last recovery rung renders a
+      # blocked product page in headless Chromium. The playwright *package*
+      # comes with `pip install -e .`; the ~150MB browser binary is cached
+      # keyed on the resolved playwright version so most runs restore in
+      # seconds. If the render rung ever logs missing-shared-library errors,
+      # switch the install line to `playwright install --with-deps chromium`.
+      - name: Get Playwright version
+        id: playwright-version
+        run: echo "version=$(pip show playwright | awk '/^Version:/{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install Playwright Chromium
+        run: playwright install chromium
+
       - name: Run sale check
         env:
           WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}

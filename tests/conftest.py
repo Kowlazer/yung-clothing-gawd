@@ -18,3 +18,18 @@ def _fast_rate_limiters():
     main._SHOPIFY_LIMITER._interval = 0.0
     claude_fuzzy._HOMEPAGE_LIMITER._interval = 0.0
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_browser_fallback(monkeypatch):
+    """Keep the browser-render fallback out of every test by default.
+
+    ``extract()``'s blocked-recovery ladder now ends in a real headless
+    Chromium launch (``src/browser_fetch.py``). Any test that forces a
+    blocked response without stubbing that rung would otherwise launch an
+    actual browser against a fake URL — slow, flaky, and wrong. Tests that
+    exercise the rung re-enable it and monkeypatch
+    ``browser_fetch.fetch_rendered_html`` explicitly.
+    """
+    from src import extract
+    monkeypatch.setattr(extract, "_BROWSER_FALLBACK_ENABLED", False)

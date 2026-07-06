@@ -1500,6 +1500,44 @@ class TestParseRegexFallbackToggle:
                      trust_regex_fallback=False)["current_price"] is None
 
 
+# OG *product* vertical only — no JSON-LD, no og:price:*. Shoplazza
+# storefronts (ostehard/opthemes/raneogul, issue #1) emit exactly this shape
+# server-side; verified live 2026-07-05 against a real rendered + proxied page.
+_OG_PRODUCT_PREFIX_HTML = """<html><head>
+<meta property="og:title" content="Dandadan Washed Tee">
+<meta property="product:price:amount" content="32">
+<meta property="product:price:currency" content="USD">
+</head><body><h1>Dandadan Washed Tee</h1></body></html>"""
+
+_OG_BOTH_PREFIXES_HTML = """<html><head>
+<meta property="og:price:amount" content="28">
+<meta property="og:price:currency" content="EUR">
+<meta property="product:price:amount" content="32">
+<meta property="product:price:currency" content="USD">
+</head><body></body></html>"""
+
+
+class TestOgProductPrefixPrice:
+    URL = "https://shop.com/products/dandadan-washed-tee"
+
+    def test_product_prefix_price_extracted(self):
+        d = parse(_OG_PRODUCT_PREFIX_HTML, self.URL)
+        assert d["current_price"] == 32.0
+        assert d["currency"] == "USD"
+        assert d["label"] == "Dandadan Washed Tee"
+
+    def test_counts_as_structured_for_blocked_recovery(self):
+        # The blocked proxied-HTML/browser rungs parse structured-only; the
+        # product: meta must survive with the regex fallback off.
+        d = parse(_OG_PRODUCT_PREFIX_HTML, self.URL, trust_regex_fallback=False)
+        assert d["current_price"] == 32.0
+
+    def test_classic_og_prefix_wins_when_both_present(self):
+        d = parse(_OG_BOTH_PREFIXES_HTML, self.URL)
+        assert d["current_price"] == 28.0
+        assert d["currency"] == "EUR"
+
+
 class TestExtractBlockedHtmlRecovery:
     """Issue #1 residual: a blocked *non-Shopify* product recovers its price
     from page HTML fetched through the reader proxy, structured-only."""
@@ -1559,3 +1597,93 @@ class TestExtractBlockedHtmlRecovery:
         d = extract.extract(self.URL)
         assert d["error_kind"] == "blocked"
         assert called == []
+
+
+class TestExtractBlockedBrowserRecovery:
+    """Issue #1's last residual: a blocked JS-SPA storefront injects its
+    Product JSON-LD client-side, so the proxy's pre-hydration snapshot has no
+    price — the final rung renders the page in headless Chromium and parses
+    the hydrated HTML structured-only. The conftest autouse fixture disables
+    the rung globally; these tests re-enable it with the render stubbed."""
+
+    URL = "https://shop.com/shop/ronin-cargo-pant"  # non-Shopify path
+
+    def _force_block(self, monkeypatch, *, rendered):
+        monkeypatch.setattr(extract, "get_with_retry", lambda client, u: _BlockedResp())
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: None)
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy", lambda u: None)
+        monkeypatch.setattr(extract, "_BROWSER_FALLBACK_ENABLED", True)
+        rendered_calls = []
+
+        def fake_render(u):
+            rendered_calls.append(u)
+            return rendered
+
+        monkeypatch.setattr(extract.browser_fetch, "fetch_rendered_html", fake_render)
+        return rendered_calls
+
+    def test_recovers_structured_price_from_rendered_html(self, monkeypatch):
+        calls = self._force_block(monkeypatch, rendered=_JSONLD_PRODUCT_HTML)
+        d = extract.extract(self.URL)
+        assert calls == [self.URL]
+        assert d["current_price"] == 48.0
+        assert d["currency"] == "USD"
+        assert d["error"] is None and d["error_kind"] is None
+
+    def test_regex_only_render_stays_blocked(self, monkeypatch):
+        # The hydrated page's only price is a shipping banner the (disabled)
+        # regex would grab — keep the last-known price instead.
+        self._force_block(monkeypatch, rendered=_REGEX_ONLY_HTML)
+        d = extract.extract(self.URL)
+        assert d["current_price"] is None
+        assert d["error_kind"] == "blocked"
+
+    def test_render_miss_stays_blocked(self, monkeypatch):
+        self._force_block(monkeypatch, rendered=None)
+        d = extract.extract(self.URL)
+        assert d["current_price"] is None
+        assert d["error_kind"] == "blocked"
+
+    def test_runs_after_proxy_misses_on_shopify_url(self, monkeypatch):
+        # A Shopify `/products/` URL whose `.json` AND proxied-HTML recoveries
+        # both miss still reaches the browser rung.
+        calls = self._force_block(monkeypatch, rendered=_JSONLD_PRODUCT_HTML)
+        d = extract.extract("https://shop.com/products/ronin-cargo-pant")
+        assert calls == ["https://shop.com/products/ronin-cargo-pant"]
+        assert d["current_price"] == 48.0
+        assert d["error_kind"] is None
+
+    def test_runs_even_with_proxy_disabled(self, monkeypatch):
+        # Independent toggles: killing the reader proxy doesn't kill the
+        # browser rung.
+        calls = self._force_block(monkeypatch, rendered=_JSONLD_PRODUCT_HTML)
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", False)
+        d = extract.extract(self.URL)
+        assert calls == [self.URL]
+        assert d["current_price"] == 48.0
+
+    def test_disabled_skips_browser(self, monkeypatch):
+        calls = self._force_block(monkeypatch, rendered=_JSONLD_PRODUCT_HTML)
+        monkeypatch.setattr(extract, "_BROWSER_FALLBACK_ENABLED", False)
+        d = extract.extract(self.URL)
+        assert d["error_kind"] == "blocked"
+        assert calls == []
+
+    def test_not_attempted_on_non_blocked_error(self, monkeypatch):
+        # A 404 is "not_found", not "blocked" — no recovery ladder at all.
+        class _NotFound:
+            status_code = 404
+            text = ""
+
+            def json(self):
+                raise ValueError
+
+        monkeypatch.setattr(extract, "get_with_retry", lambda client, u: _NotFound())
+        monkeypatch.setattr(extract, "_BROWSER_FALLBACK_ENABLED", True)
+        calls = []
+        monkeypatch.setattr(extract.browser_fetch, "fetch_rendered_html",
+                            lambda u: calls.append(u))
+        d = extract.extract(self.URL)
+        assert d["error_kind"] == "not_found"
+        assert calls == []
