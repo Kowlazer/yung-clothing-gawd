@@ -97,11 +97,10 @@ jobs:
           # filters excluded shops out of those sections (main._wardrobe_items).
           # The weekly order-scan workflow is where ingestion/hard-delete happen.
           EXCLUDED_SHOPS: ${{ secrets.EXCLUDED_SHOPS }}
-          # Cost lever #5 (issue #16): shadow A/B run. The daily fuzzy call is
-          # ALSO sent to this model and the verdict diff logged to
-          # shadow_runs.json — the digest is never affected. Costs ~$0.06/run
-          # extra at Haiku input prices. After ~a week, review with
-          # `python -m src.shadow_report`; then either swap DEFAULT_MODEL in
-          # src/claude_fuzzy.py or just DELETE this line to end the experiment.
-          SHADOW_MODEL: claude-haiku-4-5-20251001
+          # Cost lever #5 (issue #16) CONCLUDED 2026-07-09: the Haiku shadow
+          # A/B (a SHADOW_MODEL env line here) showed 66% agreement on homepage
+          # sale verdicts with ~1 missed real sale per run, so DEFAULT_MODEL
+          # stays on Sonnet. Re-add `SHADOW_MODEL: <model-id>` to rerun the
+          # experiment against a future candidate; review with
+          # `python -m src.shadow_report`.
         run: python -m src.main

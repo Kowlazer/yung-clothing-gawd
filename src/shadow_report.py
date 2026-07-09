@@ -191,6 +191,12 @@ def format_report(store: dict) -> str:
 
 
 def main() -> int:
+    import sys
+
+    # The report text uses →/— which a cp1252 Windows console can't encode.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     try:
         from dotenv import load_dotenv
         load_dotenv(override=True)
