@@ -161,6 +161,153 @@ def test_image_url_finds_cached_file(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# fetch_images (--fetch-images, issue #19)
+# --------------------------------------------------------------------------
+
+class _FakeResp:
+    def __init__(self, status=200, content=b"IMGBYTES", ctype="image/jpeg"):
+        self.status_code = status
+        self.content = content
+        self.headers = {"content-type": ctype} if ctype is not None else {}
+
+
+class _FakeClient:
+    """Maps url -> _FakeResp (or an Exception to raise). Records calls."""
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls: list[str] = []
+
+    def get(self, url):
+        self.calls.append(url)
+        r = self.responses[url]
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    def close(self):
+        pass
+
+
+def _no_sleep(_seconds):
+    pass
+
+
+class TestFetchImages:
+    def test_downloads_named_by_content_type(self, tmp_path):
+        items = [{"id": "aaa", "image_url": "https://cdn.x/a"},
+                 {"id": "bbb", "image_url": "https://cdn.x/b"}]
+        client = _FakeClient({
+            "https://cdn.x/a": _FakeResp(ctype="image/jpeg"),
+            "https://cdn.x/b": _FakeResp(ctype="image/png", content=b"PNG"),
+        })
+        stats = wb.fetch_images(items, tmp_path, client=client, sleep=_no_sleep)
+        assert stats == {"targets": 2, "downloaded": 2, "cached": 0, "failed": 0}
+        assert (tmp_path / "aaa.jpg").read_bytes() == b"IMGBYTES"
+        assert (tmp_path / "bbb.png").read_bytes() == b"PNG"
+
+    def test_skips_cached_unless_refresh(self, tmp_path):
+        (tmp_path / "aaa.jpg").write_bytes(b"OLD")
+        items = [{"id": "aaa", "image_url": "https://cdn.x/a"}]
+        client = _FakeClient({"https://cdn.x/a": _FakeResp(content=b"NEW")})
+        stats = wb.fetch_images(items, tmp_path, client=client, sleep=_no_sleep)
+        assert stats["cached"] == 1
+        assert client.calls == []
+        assert (tmp_path / "aaa.jpg").read_bytes() == b"OLD"
+
+        stats = wb.fetch_images(
+            items, tmp_path, refresh=True, client=client, sleep=_no_sleep)
+        assert stats["downloaded"] == 1
+        assert (tmp_path / "aaa.jpg").read_bytes() == b"NEW"
+
+    def test_refresh_drops_stale_other_extension(self, tmp_path):
+        # A cached .jpg must not shadow a re-downloaded .png in _image_url's
+        # probe order — one file per id.
+        (tmp_path / "aaa.jpg").write_bytes(b"OLD")
+        items = [{"id": "aaa", "image_url": "https://cdn.x/a"}]
+        client = _FakeClient(
+            {"https://cdn.x/a": _FakeResp(ctype="image/png", content=b"PNG")})
+        wb.fetch_images(items, tmp_path, refresh=True, client=client, sleep=_no_sleep)
+        assert not (tmp_path / "aaa.jpg").exists()
+        assert (tmp_path / "aaa.png").read_bytes() == b"PNG"
+
+    def test_non_image_content_type_never_written(self, tmp_path):
+        # A CDN error page served as 200 text/html must not be cached as a .jpg.
+        items = [{"id": "aaa", "image_url": "https://cdn.x/a.jpg"}]
+        client = _FakeClient(
+            {"https://cdn.x/a.jpg": _FakeResp(ctype="text/html", content=b"<html>")})
+        stats = wb.fetch_images(items, tmp_path, client=client, sleep=_no_sleep)
+        assert stats["failed"] == 1
+        assert list(tmp_path.iterdir()) == []
+
+    def test_missing_content_type_falls_back_to_url_extension(self, tmp_path):
+        items = [{"id": "aaa", "image_url": "https://cdn.x/photo.webp?v=1"}]
+        client = _FakeClient(
+            {"https://cdn.x/photo.webp?v=1": _FakeResp(ctype=None, content=b"WEBP")})
+        stats = wb.fetch_images(items, tmp_path, client=client, sleep=_no_sleep)
+        assert stats["downloaded"] == 1
+        assert (tmp_path / "aaa.webp").read_bytes() == b"WEBP"
+
+    def test_http_error_and_exception_are_isolated(self, tmp_path):
+        # One 404 and one network error must not stop the batch.
+        items = [{"id": "aaa", "image_url": "https://cdn.x/a"},
+                 {"id": "bbb", "image_url": "https://cdn.x/b"},
+                 {"id": "ccc", "image_url": "https://cdn.x/c"}]
+        client = _FakeClient({
+            "https://cdn.x/a": _FakeResp(status=404),
+            "https://cdn.x/b": RuntimeError("boom"),
+            "https://cdn.x/c": _FakeResp(content=b"OK"),
+        })
+        stats = wb.fetch_images(items, tmp_path, client=client, sleep=_no_sleep)
+        assert stats == {"targets": 3, "downloaded": 1, "cached": 0, "failed": 2}
+        assert (tmp_path / "ccc.jpg").read_bytes() == b"OK"
+
+    def test_items_without_image_url_ignored(self, tmp_path):
+        target = tmp_path / "imgcache"
+        items = [{"id": "aaa"}, {"id": "bbb", "image_url": "  "},
+                 {"image_url": "https://cdn.x/orphan.jpg"}]  # no id
+        stats = wb.fetch_images(items, target, client=_FakeClient({}), sleep=_no_sleep)
+        assert stats == {"targets": 0, "downloaded": 0, "cached": 0, "failed": 0}
+        # No targets → the cache dir isn't even created.
+        assert not target.exists()
+
+    def test_amazon_thumbnail_upgraded_to_full_size(self, tmp_path):
+        # The 90px email thumbnail is re-requested at _SL600_; the original is
+        # only the fallback.
+        small = "https://m.media-amazon.com/images/I/61z67o0urxL._SS90_.jpg"
+        big = "https://m.media-amazon.com/images/I/61z67o0urxL._SL600_.jpg"
+        items = [{"id": "aaa", "image_url": small}]
+        client = _FakeClient({big: _FakeResp(content=b"BIG")})
+        stats = wb.fetch_images(items, tmp_path, client=client, sleep=_no_sleep)
+        assert stats["downloaded"] == 1
+        assert client.calls == [big]
+        assert (tmp_path / "aaa.jpg").read_bytes() == b"BIG"
+
+    def test_upgrade_miss_falls_back_to_stored_url(self, tmp_path):
+        small = "https://m.media-amazon.com/images/I/61z67o0urxL._SS90_.jpg"
+        big = "https://m.media-amazon.com/images/I/61z67o0urxL._SL600_.jpg"
+        items = [{"id": "aaa", "image_url": small}]
+        client = _FakeClient({big: _FakeResp(status=404),
+                              small: _FakeResp(content=b"SMALL")})
+        stats = wb.fetch_images(items, tmp_path, client=client, sleep=_no_sleep)
+        assert stats["downloaded"] == 1
+        assert client.calls == [big, small]
+        assert (tmp_path / "aaa.jpg").read_bytes() == b"SMALL"
+
+
+def test_upgraded_image_url_only_rewrites_amazon():
+    small = "https://m.media-amazon.com/images/I/61z67o0urxL._SS90_.jpg"
+    assert wb._upgraded_image_url(small) == (
+        "https://m.media-amazon.com/images/I/61z67o0urxL._SL600_.jpg")
+    # No size token → nothing to upgrade.
+    assert wb._upgraded_image_url(
+        "https://m.media-amazon.com/images/I/61z67o0urxL.jpg") is None
+    # Non-Amazon hosts are never rewritten.
+    assert wb._upgraded_image_url(
+        "https://cdn.shopify.com/a/tee._SS90_.jpg") is None
+
+
+# --------------------------------------------------------------------------
 # product_link
 # --------------------------------------------------------------------------
 

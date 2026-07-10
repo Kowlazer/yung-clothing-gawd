@@ -19,6 +19,7 @@ Usage::
     python -m src.order_scan --review-fits    # ONLY fit-review pass (no scan, no watchlist)
     python -m src.order_scan --classify       # stamp garment category on items (issue #18)
     python -m src.order_scan --reharvest-urls # backfill product_url on old items (issue #23)
+    python -m src.order_scan --reharvest-images # backfill image_url on old items (issue #19)
     python -m src.order_scan --since 2023-01-01
     python -m src.order_scan --shop "Norse Projects"
     python -m src.order_scan --reprocess "Fabletics"  # recover a burned shop (see below)
@@ -119,6 +120,7 @@ import logging
 import os
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlunparse
 
@@ -656,8 +658,10 @@ def _fetch_emails(
             # Per-item product links survive nowhere else — `_html_to_text`
             # strips hrefs — so harvest them off the raw HTML here, before the
             # message is discarded. Filtered to the shop domain + matched to
-            # items downstream (see _match_product_url).
+            # items downstream (see _match_product_url). Product images
+            # likewise (issue #19; matched in _match_image).
             parsed_em["product_links"] = _harvest_anchor_urls(msg)
+            parsed_em["product_images"] = _harvest_image_urls(msg)
             out.append(parsed_em)
         return out
     finally:
@@ -1046,6 +1050,194 @@ def _match_product_url(item_name: str, candidates: list[str]) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Per-item product images (harvested from the order email's HTML <img> tags)
+# ---------------------------------------------------------------------------
+#
+# Iteration 2 of the wardrobe browser (issue #19): show the real product photo
+# instead of a per-category icon. The order email is the only reliable source —
+# product *pages* are usually dead or tracker-opaque by the time we look
+# (issue #23 measured ~6% URL recovery) but every order confirmation carries a
+# product image. Images are harvested here, attributed to items with the same
+# conservative matcher the product-URL path uses (filename slug + alt text,
+# tie → no match), and stamped as ``image_url``; the wardrobe browser's
+# ``--fetch-images`` step downloads + caches the bytes locally, because
+# email-CDN URLs rot (image.email.*, iterable, sendinblue) and even Shopify's
+# CDN dies with the merchant. Coverage is partial by design — the issue-19
+# probe measured ~24-30% catalogue-wide: Shopify-family + Amazon emails carry
+# the product handle in the filename or the name in alt and match cleanly;
+# big-box template emails (Old Navy, Hot Topic, H&M) name every asset
+# generically, so only the single-item-order shortcut can attribute those.
+
+# Cap on harvested images per email — beyond this it's cross-sell grids and
+# footer chrome.
+_MAX_HARVESTED_IMAGES = 40
+# Any parsed width/height attribute at or below this is an open-tracking
+# pixel / divider, not a product photo.
+_PIXEL_MAX_DIM = 4
+# Spacer/pixel-style filenames (s.gif, spacer.gif, 1x1.png, ...).
+_PIXEL_NAME_RE = re.compile(
+    r"(?:^|/)(?:s|sp|spacer|pixel|px|open|blank|clear|transparent|trans|1x1|dot)"
+    r"\.(?:gif|png|jpe?g)$",
+    re.IGNORECASE,
+)
+# Email chrome — logos, social icons, banners, payment badges, CTA buttons,
+# rating stars — recognised by keywords in the URL path or alt text.
+# Deliberately contains no garment nouns. "button"/"star" are accepted
+# collateral: a button-down shirt's photo gets dropped (recall loss, item keeps
+# its icon) rather than risk a "View order" button or rating-star strip being
+# stamped as some item's photo (precision loss, wrong image shown).
+_IMAGE_CHROME_RE = re.compile(
+    r"\b(?:logo|logos|favicon|icons?|facebook|instagram|twitter|tiktok|youtube|"
+    r"pinterest|snapchat|whatsapp|linkedin|discord|social|socials|banners?|"
+    r"header|footer|masthead|unsubscribe|spacer|divider|arrows?|chevron|"
+    r"buttons?|btn|badge|payments?|visa|mastercard|amex|discover|paypal|"
+    r"klarna|afterpay|affirm|apple ?pay|google ?pay|app ?store|qr|barcode|"
+    r"signature|avatar|stars?|rating)\b"
+)
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+# Hosts whose images are plausible products even without a file extension in
+# the path (dynamic-resize CDNs). Everything else must end in an image ext.
+_IMAGE_CDN_HOSTS = (
+    "cdn.shopify.com", "shopifycdn.net", "myshopline.com",
+    "media-amazon.com", "ssl-images-amazon.com",
+)
+
+
+def _is_image_cdn(host: str) -> bool:
+    host = (host or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _IMAGE_CDN_HOSTS)
+
+
+def _parse_dim(value) -> int | None:
+    """Leading integer of a width/height attribute (``"1"``, ``"600px"``)."""
+    m = re.match(r"\s*(\d+)", str(value or ""))
+    return int(m.group(1)) if m else None
+
+
+def _is_plausible_product_image(url: str, alt: str, width, height) -> bool:
+    """Filter one ``<img>`` down to "could be a product photo".
+
+    Drops tracking pixels (tiny declared dims, pixel-style filenames), email
+    chrome (``_IMAGE_CHROME_RE`` over the slug-normalised path + alt), and
+    URLs that neither end in an image extension nor sit on a known image CDN.
+    """
+    for dim in (width, height):
+        parsed_dim = _parse_dim(dim)
+        if parsed_dim is not None and parsed_dim <= _PIXEL_MAX_DIM:
+            return False
+    parsed = urlparse(url)
+    path = parsed.path or ""
+    if _PIXEL_NAME_RE.search(path):
+        return False
+    chrome_text = re.sub(r"[-_+.]", " ", unquote(path)).lower() + " " + (alt or "").lower()
+    if _IMAGE_CHROME_RE.search(chrome_text):
+        return False
+    return path.lower().endswith(_IMAGE_EXTS) or _is_image_cdn(parsed.netloc)
+
+
+def _harvest_image_urls(msg: "email.message.Message") -> list[dict]:
+    """Plausible product images from an order email's HTML body.
+
+    Returns ``[{"url", "alt"}, ...]`` in document order, deduped by host+path
+    (the same file at two crop widths counts once), capped at
+    ``_MAX_HARVESTED_IMAGES``. Absolute http(s) ``src`` only — the issue-19
+    probe found zero inline ``data:`` images across the live inbox. Matched to
+    extracted items in ``_match_image``.
+    """
+    from bs4 import BeautifulSoup
+
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for part in msg.walk():
+        if part.is_multipart() or part.get_content_type() != "text/html":
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            html = payload.decode(charset, errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            html = payload.decode("utf-8", errors="replace")
+        for img in BeautifulSoup(html, "lxml").find_all("img", src=True):
+            src = (img["src"] or "").strip()
+            if not src.lower().startswith(("http://", "https://")):
+                continue
+            alt = (img.get("alt") or "").strip()
+            if not _is_plausible_product_image(
+                src, alt, img.get("width"), img.get("height"),
+            ):
+                continue
+            parsed = urlparse(src)
+            key = (parsed.netloc.lower(), parsed.path)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"url": src, "alt": alt})
+            if len(out) >= _MAX_HARVESTED_IMAGES:
+                return out
+    return out
+
+
+def _image_text(cand: dict) -> str:
+    """Matchable text for a harvested image: filename slug + alt text.
+
+    Shopify-family filenames carry the product handle
+    (``raijin-oversize-tee_540x.jpg``); Amazon filenames are opaque but the
+    alt carries the product name. Both funnel through the same tokeniser the
+    URL-slug matcher uses.
+    """
+    path = urlparse(cand.get("url") or "").path
+    stem = path.rsplit("/", 1)[-1]
+    if "." in stem:
+        stem = stem.rsplit(".", 1)[0]
+    slug = re.sub(r"[-_+.]", " ", unquote(stem))
+    return f"{slug} {cand.get('alt') or ''}"
+
+
+def _match_image(
+    item_name: str, candidates: list[dict], *, sole_item: bool = False,
+) -> str | None:
+    """Best product-image URL for an item, by token overlap with its name.
+
+    Mirrors ``_match_product_url``: item-name tokens vs each image's
+    filename-slug + alt tokens (shared ``_STOPWORDS`` strip), garment-category
+    gate, unique-top-score wins; a tie yields no match so a multi-item order
+    never mis-assigns a sibling's photo.
+
+    ``sole_item`` adds the single-item-order shortcut from the issue-19 probe:
+    when the order contains exactly ONE item and the email exactly ONE
+    plausible product image, that image is the item's even with no name
+    overlap — this is what recovers big-box template emails whose asset names
+    are generic and whose alt is brand-only.
+    """
+    name_tokens = _tokens(item_name)
+    if name_tokens and candidates:
+        item_cats = _garment_categories(item_name)
+        scored: list[tuple[int, str]] = []
+        for cand in candidates:
+            text = _image_text(cand)
+            overlap = len(name_tokens & _tokens(text))
+            if overlap < _PRODUCT_URL_MIN_OVERLAP:
+                continue
+            if item_cats:
+                cand_cats = _garment_categories(text)
+                if cand_cats and not (item_cats & cand_cats) and overlap < 2:
+                    continue
+            scored.append((overlap, cand["url"]))
+        if scored:
+            best = max(score for score, _ in scored)
+            top = [url for score, url in scored if score == best]
+            if len(top) == 1:
+                return top[0]
+            # Ambiguous — fall through (the shortcut below can't fire with
+            # multiple candidates, so this ends up None; never guess).
+    if sole_item and len(candidates) == 1:
+        return candidates[0]["url"]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Liveness validation (for the re-harvest backfill — see _run_reharvest_urls)
 # ---------------------------------------------------------------------------
 #
@@ -1336,6 +1528,7 @@ def _materialise_items(
     extracted_orders: list[dict],
     order_meta_by_id: dict[str, dict],
     links_by_id: dict[str, list[str]] | None = None,
+    images_by_id: dict[str, list[dict]] | None = None,
 ) -> list[dict]:
     """Flatten Claude's items array into wardrobe item dicts.
 
@@ -1349,6 +1542,11 @@ def _materialise_items(
     (``_match_product_url``) and stamped as ``product_url`` so the wardrobe
     browser can link straight to the product page. Absent/no-match → ``None``.
 
+    ``images_by_id`` (optional) likewise maps each email id to the product
+    images harvested from its HTML body (``_harvest_image_urls``); each item is
+    matched to its photo (``_match_image``, issue #19) and stamped as
+    ``image_url`` for the browser's ``--fetch-images`` cache step.
+
     ``order_meta_by_id``: ``{email_id: {shop, shop_domain, purchased_at,
     order_total: {amount, currency} | None}}``.
     """
@@ -1357,7 +1555,12 @@ def _materialise_items(
         email_id = o.get("email_id", "")
         meta = order_meta_by_id.get(email_id, {})
         email_links = (links_by_id or {}).get(email_id) or []
-        for idx, raw_item in enumerate(o.get("items") or []):
+        email_images = (images_by_id or {}).get(email_id) or []
+        raw_items = o.get("items") or []
+        # Single-item order → _match_image may take the email's lone product
+        # image with no name overlap (the big-box template-email recovery).
+        sole = sum(1 for r in raw_items if (r.get("name") or "").strip()) == 1
+        for idx, raw_item in enumerate(raw_items):
             name = (raw_item.get("name") or "").strip()
             if not name:
                 continue
@@ -1378,6 +1581,10 @@ def _materialise_items(
                 # matched to this item by slug (issue #23); None when no
                 # unambiguous match. The browser falls back to a search link.
                 "product_url": _match_product_url(name, email_links),
+                # Product photo harvested from the email HTML and matched by
+                # filename-slug + alt (issue #19); None when no unambiguous
+                # match. The browser falls back to its category icon.
+                "image_url": _match_image(name, email_images, sole_item=sole),
                 "order_email_id": email_id,
                 "shipping_email_id": None,
                 "shipped_at": None,
@@ -1981,6 +2188,9 @@ def _run_scan(
                     "product_links": _links_for_domain(
                         em.get("product_links") or [], domain,
                     ),
+                    # No domain filter — product photos live on image CDNs
+                    # (cdn.shopify.com, media-amazon), not the shop's domain.
+                    "product_images": em.get("product_images") or [],
                 })
             else:  # shipping
                 ship_records.append({
@@ -2055,8 +2265,11 @@ def _run_scan(
         links_by_id = {
             r["email_id"]: r.get("product_links") or [] for r in order_records
         }
+        images_by_id = {
+            r["email_id"]: r.get("product_images") or [] for r in order_records
+        }
         items = _materialise_items(
-            extracted.get("orders", []), meta_by_id, links_by_id,
+            extracted.get("orders", []), meta_by_id, links_by_id, images_by_id,
         )
 
         # Stash order_number on the first item per order so shipment
@@ -2462,20 +2675,22 @@ def _run_classify(
 
 def _reharvest_targets(
     items: list[dict], *, refresh: bool, limit: int | None, since: str | None,
+    field: str = "product_url",
 ) -> list[dict]:
-    """Clothing items eligible for a product_url re-harvest, newest first.
+    """Clothing items eligible for a re-harvest of ``field``, newest first.
 
     Skips non-clothing (hidden in the browser anyway) and items with no
-    ``order_email_id`` (can't re-fetch). Already-stamped items are skipped unless
-    ``refresh``. ``since`` (``YYYY-MM-DD``) bounds by ``purchased_at`` and
-    ``limit`` caps the count after the newest-first sort."""
+    ``order_email_id`` (can't re-fetch). Items already stamped with ``field``
+    (``product_url`` for --reharvest-urls, ``image_url`` for --reharvest-images)
+    are skipped unless ``refresh``. ``since`` (``YYYY-MM-DD``) bounds by
+    ``purchased_at`` and ``limit`` caps the count after the newest-first sort."""
     out: list[dict] = []
     for it in items:
         if it.get("is_clothing") is False:
             continue
         if not it.get("order_email_id"):
             continue
-        if not refresh and (it.get("product_url") or "").strip():
+        if not refresh and (it.get(field) or "").strip():
             continue
         if since and (it.get("purchased_at") or "") < since:
             continue
@@ -2484,18 +2699,21 @@ def _reharvest_targets(
     return out[:limit] if limit is not None else out
 
 
-def _fetch_product_links_by_msgids(
-    cfg: Config, msgids: list[str], *, imap_client: imaplib.IMAP4 | None = None,
-) -> dict[str, list[str]]:
-    """Re-fetch each order email by X-GM-MSGID and harvest its product anchors.
+def _fetch_harvest_by_msgids(
+    cfg: Config, msgids: list[str], harvester,
+    *, imap_client: imaplib.IMAP4 | None = None,
+) -> dict[str, list]:
+    """Re-fetch each order email by X-GM-MSGID and run ``harvester`` on it.
 
-    Returns ``{msgid: [product_url, ...]}`` (raw, un-domain-filtered — the caller
-    filters per item's shop). One ``X-GM-MSGID`` SEARCH + ``BODY.PEEK`` FETCH per
-    id; failure-isolated so one unreadable/expired message can't kill the batch.
-    The msgid is the same decimal ``X-GM-MSGID`` stored as ``order_email_id``."""
+    Shared IMAP plumbing for the two re-harvest backfills (product anchors via
+    ``_harvest_anchor_urls``, product images via ``_harvest_image_urls``).
+    Returns ``{msgid: harvester(msg)}``. One ``X-GM-MSGID`` SEARCH +
+    ``BODY.PEEK`` FETCH per id; failure-isolated so one unreadable/expired
+    message can't kill the batch. The msgid is the same decimal ``X-GM-MSGID``
+    stored as ``order_email_id``."""
     own = imap_client is None
     client = imap_client or _connect(cfg.gmail_username, cfg.gmail_app_password)
-    out: dict[str, list[str]] = {}
+    out: dict[str, list] = {}
     try:
         # Select All Mail, not INBOX: old order emails (2023–2024 purchases) are
         # usually archived, so an INBOX-scoped X-GM-MSGID search misses them and
@@ -2531,7 +2749,7 @@ def _fetch_product_links_by_msgids(
             except Exception as exc:  # noqa: BLE001 — defensive
                 log.info("reharvest: parse msgid %s failed: %s", msgid, exc)
                 continue
-            out[msgid] = _harvest_anchor_urls(msg)
+            out[msgid] = harvester(msg)
         return out
     finally:
         if own:
@@ -2539,6 +2757,24 @@ def _fetch_product_links_by_msgids(
                 client.logout()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _fetch_product_links_by_msgids(
+    cfg: Config, msgids: list[str], *, imap_client: imaplib.IMAP4 | None = None,
+) -> dict[str, list[str]]:
+    """``{msgid: [product_url, ...]}`` (raw, un-domain-filtered — the caller
+    filters per item's shop). See ``_fetch_harvest_by_msgids``."""
+    return _fetch_harvest_by_msgids(
+        cfg, msgids, _harvest_anchor_urls, imap_client=imap_client)
+
+
+def _fetch_product_images_by_msgids(
+    cfg: Config, msgids: list[str], *, imap_client: imaplib.IMAP4 | None = None,
+) -> dict[str, list[dict]]:
+    """``{msgid: [{"url", "alt"}, ...]}`` plausible product images per order
+    email. See ``_fetch_harvest_by_msgids``."""
+    return _fetch_harvest_by_msgids(
+        cfg, msgids, _harvest_image_urls, imap_client=imap_client)
 
 
 def _run_reharvest_urls(
@@ -2605,6 +2841,61 @@ def _run_reharvest_urls(
             stats["dead"] += 1
 
     log.info("reharvest: done — %s", stats)
+    return stats
+
+
+def _run_reharvest_images(
+    cfg: Config,
+    wardrobe: dict,
+    *,
+    refresh: bool = False,
+    limit: int | None = None,
+    since: str | None = None,
+    imap_client: imaplib.IMAP4 | None = None,
+) -> dict:
+    """Backfill ``image_url`` on existing items by re-fetching their order
+    emails and matching each item to its product photo (issue #19).
+
+    Mutates ``wardrobe["items"]`` in place. Unlike ``--reharvest-urls`` there
+    is **no liveness validation** — the consumer is the browser's
+    ``--fetch-images`` cache step, which is itself the validator: a rotted URL
+    just fails to download and the item keeps its category-icon fallback.
+    Coverage is partial by design (~24-30% catalogue-wide per the issue-19
+    probe; materially higher for Shopify-family shops). Returns counts:
+    targeted / emails / stamped / no_match."""
+    items = wardrobe.get("items") or []
+    targets = _reharvest_targets(
+        items, refresh=refresh, limit=limit, since=since, field="image_url")
+    stats = {"targeted": len(targets), "emails": 0, "stamped": 0, "no_match": 0}
+    if not targets:
+        return stats
+
+    msgids = list(dict.fromkeys(it["order_email_id"] for it in targets))
+    log.info("reharvest-images: re-fetching %d order email(s) for %d item(s)",
+             len(msgids), len(targets))
+    images_by_msgid = _fetch_product_images_by_msgids(
+        cfg, msgids, imap_client=imap_client)
+    stats["emails"] = sum(1 for m in msgids if images_by_msgid.get(m))
+
+    # The sole-item shortcut counts EVERY wardrobe item on the order email,
+    # not just this run's targets — a two-item order where one item is already
+    # stamped must not let the other claim "the" lone image as its own.
+    per_email = Counter(
+        it.get("order_email_id") for it in items if it.get("order_email_id"))
+    for it in targets:
+        eid = it["order_email_id"]
+        url = _match_image(
+            it.get("item_name") or "",
+            images_by_msgid.get(eid) or [],
+            sole_item=per_email[eid] == 1,
+        )
+        if url:
+            it["image_url"] = url
+            stats["stamped"] += 1
+        else:
+            stats["no_match"] += 1
+
+    log.info("reharvest-images: done — %s", stats)
     return stats
 
 
@@ -2682,6 +2973,7 @@ def _fetch_targeted(
                     continue
                 parsed_em = _parse_message(gm_msgid, msg)
                 parsed_em["product_links"] = _harvest_anchor_urls(msg)
+                parsed_em["product_images"] = _harvest_image_urls(msg)
                 out.append(parsed_em)
         return out
     finally:
@@ -2814,6 +3106,7 @@ def _run_message_scan(
             "shop_domain": domain,
             "product_links": _links_for_domain(
                 em.get("product_links") or [], domain),
+            "product_images": em.get("product_images") or [],
         })
 
     if not order_records:
@@ -2836,7 +3129,9 @@ def _run_message_scan(
         for r in order_records
     }
     links_by_id = {r["email_id"]: r.get("product_links") or [] for r in order_records}
-    items = _materialise_items(extracted.get("orders", []), meta_by_id, links_by_id)
+    images_by_id = {r["email_id"]: r.get("product_images") or [] for r in order_records}
+    items = _materialise_items(
+        extracted.get("orders", []), meta_by_id, links_by_id, images_by_id)
     log.info("order_scan: targeted scrape — materialised %d item(s)", len(items))
     return items, processed_ids
 
@@ -2953,6 +3248,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-validate", action="store_true",
         help="With --reharvest-urls: stamp every matched URL without the live "
              "HTTP check (faster, hits no shops — but may stamp a dead link).",
+    )
+    p.add_argument(
+        "--reharvest-images", action="store_true",
+        help="Skip scanning; backfill `image_url` on existing items by "
+             "re-fetching their order emails and matching each item to its "
+             "product photo by filename-slug + alt text (issue #19). Items "
+             "already stamped are skipped unless --refresh; --limit caps how "
+             "many (newest first), --since bounds by purchase date. Partial "
+             "coverage by design (~24-30%); download + cache the bytes with "
+             "`wardrobe_browser --fetch-images`. Needs GMAIL_USERNAME / "
+             "GMAIL_APP_PASSWORD.",
     )
     p.add_argument(
         "--reclassify-category", default=None, metavar="KEY",
@@ -3087,6 +3393,45 @@ def run(argv: list[str] | None = None, cfg: Config | None = None) -> int:
                 wardrobe=wardrobe,
             )
         log.info("order_scan: reharvest summary — %s", stats)
+        return 0
+
+    # Product-image re-harvest mirrors the URL one — re-fetches existing items'
+    # order emails (no forward scan, no Claude, no interactive passes) to
+    # backfill image_url (issue #19). Short-circuit before any scanning happens.
+    if args.reharvest_images:
+        since = None
+        if args.since:
+            try:
+                datetime.fromisoformat(args.since)  # validate shape only
+            except ValueError:
+                log.error("invalid --since value (need YYYY-MM-DD): %r", args.since)
+                return 2
+            since = args.since
+        stats = _run_reharvest_images(
+            cfg, wardrobe, refresh=args.refresh, limit=args.limit, since=since,
+        )
+        if dry_run:
+            log.info("order_scan: DRY_RUN — skipping write_state")
+            previews = [
+                {"item_name": it.get("item_name"), "shop": it.get("shop"),
+                 "image_url": it.get("image_url")}
+                for it in wardrobe["items"] if (it.get("image_url") or "").strip()
+            ][:20]
+            log.info(
+                "order_scan: image_url preview (first %d stamped):\n%s",
+                len(previews), json.dumps(previews, indent=2, default=str)[:4000],
+            )
+        else:
+            log.info("order_scan: writing wardrobe to gist")
+            write_state(
+                cfg.gist_id,
+                cfg.github_token,
+                prices=state.get("prices") or {},
+                aliases=state.get("aliases") or {},
+                codes=state.get("codes") or [],
+                wardrobe=wardrobe,
+            )
+        log.info("order_scan: reharvest-images summary — %s", stats)
         return 0
 
     # Targeted scrape is its own mode — ingest a hand-picked set of (usually

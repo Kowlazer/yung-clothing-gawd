@@ -14,6 +14,9 @@ fit_digest.md
 /watchlist.txt
 signup_screenshots/
 restock_screenshots/
+# Local product-image cache (wardrobe_browser --fetch-images, issue #19) —
+# real purchase data, never committed; re-poppable on any machine.
+/images/
 # Ad-hoc inspection / sampling scripts + their outputs in the repo root —
 # written per-investigation to read Gist state, sample emails by X-GM-MSGID,
 # diff matcher output, or hold one-shot paste artifacts (e.g. the watchlist

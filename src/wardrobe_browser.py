@@ -30,9 +30,13 @@ carry no garment word, e.g. "Kitsune", "Raijin"). The name fallback is
 imperfect by nature, which is exactly why the stored category exists — once an
 item is classified, its category and ``is_clothing`` flag are read directly.
 
-Future iteration: product images fetched from each item's shop page, cached in a
-local ``--image-dir`` and served at ``/images/<id>``; until then every item
-falls back to a per-category icon rendered client-side.
+Product images (issue #19): ``order_scan`` stamps ``image_url`` on items from
+their order-confirmation emails (scan-time + the ``--reharvest-images``
+backfill); ``--fetch-images`` downloads those into a local ``--image-dir``
+cache (default ``./images``, gitignored) served at ``/images/<id>.<ext>``.
+Coverage is partial by design (~24-30% of the catalogue attributes cleanly —
+see the issue-19 probe); items without a cached photo fall back to a
+per-category icon rendered client-side.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -49,7 +54,7 @@ from collections import Counter
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from src import fit_links, review_requests, state
 from src.wardrobe_categories import (
@@ -219,20 +224,155 @@ def _accumulate(bucket: dict[str, dict[str, float]], key: str, currency: str, am
     sub[currency] = sub.get(currency, 0.0) + amount
 
 
+_IMAGE_FILE_EXTS = ("jpg", "jpeg", "png", "webp", "gif")
+
+
 def _image_url(item_id: str, image_dir: Path | None) -> str | None:
     """Local cached product image URL for an item, if one exists on disk.
 
-    Iteration-2 hook: a future fetch step writes ``<image_dir>/<id>.<ext>``;
-    this surfaces it as ``/images/<file>`` so the frontend can show the real
+    The ``--fetch-images`` step writes ``<image_dir>/<id>.<ext>``; this
+    surfaces it as ``/images/<file>`` so the frontend can show the real
     product photo instead of a category icon. Empty/absent dir -> always None.
     """
     if not image_dir:
         return None
-    for ext in ("jpg", "jpeg", "png", "webp", "gif"):
+    for ext in _IMAGE_FILE_EXTS:
         f = image_dir / f"{item_id}.{ext}"
         if f.is_file():
             return f"/images/{f.name}"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Product-image fetch step (--fetch-images, issue #19)
+# ---------------------------------------------------------------------------
+# ``order_scan`` (scan-time + --reharvest-images) stamps ``image_url`` on items
+# from their order emails. The URL string rides wardrobe.json (Gist, portable);
+# the BYTES are cached here, locally — email-CDN URLs rot (image.email.*,
+# iterable, sendinblue), and even cdn.shopify.com dies with the merchant.
+# Bytes never go in the Gist (base64 bloat + the >1 MB truncation trap).
+
+# Content types we'll cache, mapped to the extension _image_url probes.
+_IMAGE_CONTENT_TYPES = {
+    "image/jpeg": "jpg", "image/jpg": "jpg", "image/pjpeg": "jpg",
+    "image/png": "png", "image/webp": "webp", "image/gif": "gif",
+}
+# Realistic browser UA — some image CDNs refuse the default python-httpx one.
+_IMAGE_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8",
+}
+
+
+def _ext_from_image_url(url: str) -> str | None:
+    path = urlparse(url or "").path.lower()
+    for ext in _IMAGE_FILE_EXTS:
+        if path.endswith("." + ext):
+            return "jpg" if ext == "jpeg" else ext
+    return None
+
+
+# Amazon order emails embed 90px thumbnails (``..._SS90_.jpg``). The size token
+# is a render instruction on the same image id, so rewriting it requests the
+# identical photo at a usable size. Live-checked 2026-07-10.
+_AMAZON_SIZE_TOKEN_RE = re.compile(r"\._[A-Z]{2}\d+_\.")
+
+
+def _upgraded_image_url(url: str) -> str | None:
+    """A better-resolution variant of ``url`` worth trying first, or None.
+
+    Only Amazon's size-token rewrite for now. The caller falls back to the
+    original URL if the upgraded one doesn't fetch."""
+    host = urlparse(url or "").netloc.lower()
+    if host.endswith("media-amazon.com") or host.endswith("images-amazon.com"):
+        upgraded = _AMAZON_SIZE_TOKEN_RE.sub("._SL600_.", url)
+        if upgraded != url:
+            return upgraded
+    return None
+
+
+def fetch_images(
+    items: list[dict],
+    image_dir: Path,
+    *,
+    refresh: bool = False,
+    client=None,
+    sleep=time.sleep,
+) -> dict:
+    """Download each item's ``image_url`` into ``image_dir/<id>.<ext>``.
+
+    Incremental: an id that already has a cached file is skipped unless
+    ``refresh``. Failure-isolated per item — a rotted URL / CDN error just
+    leaves that item on its category-icon fallback and is re-tried next run
+    (the cache file is the state). A 200 whose content-type isn't an image
+    (CDN error page) is never written. Between real downloads a short jitter
+    keeps the CDN hits polite. Returns counts: targets / downloaded / cached /
+    failed."""
+    stats = {"targets": 0, "downloaded": 0, "cached": 0, "failed": 0}
+    targets = [
+        it for it in items or []
+        if (it.get("image_url") or "").strip() and (it.get("id") or "").strip()
+    ]
+    if not targets:
+        return stats
+    image_dir.mkdir(parents=True, exist_ok=True)
+
+    import httpx
+
+    own = client is None
+    client = client or httpx.Client(
+        follow_redirects=True, timeout=30.0, headers=_IMAGE_FETCH_HEADERS)
+    try:
+        for it in targets:
+            stats["targets"] += 1
+            item_id = it["id"].strip()
+            if not refresh and _image_url(item_id, image_dir):
+                stats["cached"] += 1
+                continue
+            url = it["image_url"].strip()
+            # Try a better-resolution variant first (Amazon emails embed 90px
+            # thumbnails); the stored URL stays the fallback + the record.
+            upgraded = _upgraded_image_url(url)
+            written = False
+            for attempt in filter(None, (upgraded, url)):
+                try:
+                    resp = client.get(attempt)
+                    ctype = (resp.headers.get("content-type") or "") \
+                        .split(";")[0].strip().lower()
+                    ext = _IMAGE_CONTENT_TYPES.get(ctype) \
+                        or _ext_from_image_url(attempt)
+                    ok = (
+                        resp.status_code == 200 and resp.content and ext
+                        and (not ctype or ctype.startswith("image/"))
+                    )
+                    if not ok:
+                        log.info("fetch-images: %s -> %s (%s) — skipped",
+                                 item_id, resp.status_code,
+                                 ctype or "no content-type")
+                        continue
+                    # One file per id: drop other-extension leftovers so a
+                    # --refresh that changes format can't leave a stale .jpg
+                    # shadowing the new .png in _image_url's probe order.
+                    for old in _IMAGE_FILE_EXTS:
+                        stale = image_dir / f"{item_id}.{old}"
+                        if old != ext and stale.is_file():
+                            stale.unlink()
+                    (image_dir / f"{item_id}.{ext}").write_bytes(resp.content)
+                    stats["downloaded"] += 1
+                    written = True
+                    break
+                except Exception as exc:  # noqa: BLE001 — per-item isolation
+                    log.info("fetch-images: %s failed: %s", item_id, exc)
+            if not written:
+                stats["failed"] += 1
+            sleep(random.uniform(0.2, 0.6))
+    finally:
+        if own:
+            client.close()
+    return stats
 
 
 _HREF_RE = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
@@ -934,8 +1074,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
     parser.add_argument("--no-browser", action="store_true", help="don't auto-open the browser")
     parser.add_argument(
-        "--image-dir", type=Path, default=None,
-        help="folder of cached product images named <item_id>.<ext> (iteration 2)",
+        "--image-dir", type=Path, default=Path("images"),
+        help="folder of cached product images named <item_id>.<ext> "
+             "(default: ./images, gitignored)",
+    )
+    parser.add_argument(
+        "--fetch-images", action="store_true",
+        help="before serving, download + cache the product photo of every item "
+             "carrying an image_url (stamped by order_scan / --reharvest-images, "
+             "issue #19) into --image-dir; ids already cached are skipped",
+    )
+    parser.add_argument(
+        "--refresh-images", action="store_true",
+        help="with --fetch-images: re-download images that are already cached",
     )
     args = parser.parse_args(argv)
 
@@ -944,6 +1095,20 @@ def main(argv: list[str] | None = None) -> None:
         load_dotenv()
     except ImportError:
         pass
+
+    if args.fetch_images:
+        gist_id, token = _credentials(None)
+        log.info("wardrobe_browser: fetching wardrobe for image cache ...")
+        wardrobe = fetch_wardrobe(gist_id, token)
+        stats = fetch_images(
+            wardrobe.get("items") or [], args.image_dir,
+            refresh=args.refresh_images,
+        )
+        print(
+            f"Product images: {stats['downloaded']} downloaded, "
+            f"{stats['cached']} already cached, {stats['failed']} failed "
+            f"({stats['targets']} item(s) carry an image_url)."
+        )
 
     run(
         port=args.port,

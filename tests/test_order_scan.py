@@ -1161,6 +1161,61 @@ class TestMaterialiseItems:
         assert items[0]["product_url"] == "https://xsekai.com/products/sukuna-oversize-tee"
         assert items[1]["product_url"] == "https://xsekai.com/products/gojo-hoodie"
 
+    def test_no_images_yields_null_image_url(self):
+        extracted = [{"email_id": "gm1", "items": [{"name": "Aros Chino"}]}]
+        meta = {"gm1": {"shop": "Shop", "shop_domain": "shop.com",
+                        "purchased_at": "2026-04-15"}}
+        items = _materialise_items(extracted, meta)
+        assert items[0]["image_url"] is None
+
+    def test_matches_image_url_by_filename_slug(self):
+        extracted = [{
+            "email_id": "gm1",
+            "items": [
+                {"name": "Sukuna Oversize Tee"},
+                {"name": "Gojo Hoodie"},
+            ],
+        }]
+        meta = {"gm1": {"shop": "XSekai", "shop_domain": "xsekai.com",
+                        "purchased_at": "2026-04-15"}}
+        images = {"gm1": [
+            {"url": "https://cdn.shopify.com/s/files/1/sukuna-oversize-tee_540x.jpg",
+             "alt": ""},
+            {"url": "https://cdn.shopify.com/s/files/1/gojo-hoodie_540x.jpg",
+             "alt": ""},
+        ]}
+        items = _materialise_items(extracted, meta, None, images)
+        assert items[0]["image_url"] == (
+            "https://cdn.shopify.com/s/files/1/sukuna-oversize-tee_540x.jpg")
+        assert items[1]["image_url"] == (
+            "https://cdn.shopify.com/s/files/1/gojo-hoodie_540x.jpg")
+
+    def test_sole_item_order_takes_lone_generic_image(self):
+        # Big-box template email: one item on the order, one product image with
+        # a generic asset name + brand-only alt → the shortcut attributes it.
+        extracted = [{"email_id": "gm1", "items": [{"name": "Graphic Crew"}]}]
+        meta = {"gm1": {"shop": "Old Navy", "shop_domain": "oldnavy.com",
+                        "purchased_at": "2026-04-15"}}
+        images = {"gm1": [
+            {"url": "https://mi.oldnavy.com/p/rp/asset_17.png", "alt": "Her Universe"},
+        ]}
+        items = _materialise_items(extracted, meta, None, images)
+        assert items[0]["image_url"] == "https://mi.oldnavy.com/p/rp/asset_17.png"
+
+    def test_multi_item_order_never_guesses_generic_image(self):
+        extracted = [{
+            "email_id": "gm1",
+            "items": [{"name": "Graphic Crew"}, {"name": "Flare Jeans"}],
+        }]
+        meta = {"gm1": {"shop": "Old Navy", "shop_domain": "oldnavy.com",
+                        "purchased_at": "2026-04-15"}}
+        images = {"gm1": [
+            {"url": "https://mi.oldnavy.com/p/rp/asset_17.png", "alt": "Her Universe"},
+        ]}
+        items = _materialise_items(extracted, meta, None, images)
+        assert items[0]["image_url"] is None
+        assert items[1]["image_url"] is None
+
 
 # ---------------------------------------------------------------------------
 # Per-item product URLs (harvest / domain-filter / match)
@@ -1282,6 +1337,158 @@ class TestHarvestAnchorUrls:
 
 
 # ---------------------------------------------------------------------------
+# Per-item product images (harvest / match — issue #19)
+# ---------------------------------------------------------------------------
+
+class TestHarvestImageUrls:
+    @staticmethod
+    def _msg(html):
+        import email as _email
+        raw = (
+            "From: shop <no-reply@shop.com>\r\n"
+            "Subject: Your order\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n\r\n"
+        ) + html
+        return _email.message_from_string(raw)
+
+    def test_keeps_product_image_with_alt(self):
+        from src.order_scan import _harvest_image_urls
+        html = ('<img src="https://cdn.shopify.com/s/files/1/raijin-tee_540x.jpg?v=1"'
+                ' alt="Raijin Tee" width="540">')
+        out = _harvest_image_urls(self._msg(html))
+        assert out == [{
+            "url": "https://cdn.shopify.com/s/files/1/raijin-tee_540x.jpg?v=1",
+            "alt": "Raijin Tee",
+        }]
+
+    def test_drops_tracking_pixels(self):
+        from src.order_scan import _harvest_image_urls
+        html = (
+            # 1x1 open tracker — tiny declared dims.
+            '<img src="https://track.esp.com/o/open.jpg" width="1" height="1">'
+            # Pixel-style filename even without dims.
+            '<img src="https://track.esp.com/o/s.gif">'
+            '<img src="https://shop.com/assets/spacer.png">'
+        )
+        assert _harvest_image_urls(self._msg(html)) == []
+
+    def test_drops_email_chrome(self):
+        from src.order_scan import _harvest_image_urls
+        html = (
+            '<img src="https://shop.com/emails/logo.png" alt="Shop">'
+            '<img src="https://shop.com/social/facebook.png" alt="Facebook">'
+            '<img src="https://shop.com/emails/summer-banner.jpg" alt="">'
+            '<img src="https://shop.com/pay/visa.png" alt="Visa">'
+            # Chrome recognised from the ALT even with a clean filename.
+            '<img src="https://shop.com/emails/a1b2.jpg" alt="Unsubscribe here">'
+        )
+        assert _harvest_image_urls(self._msg(html)) == []
+
+    def test_requires_extension_or_known_cdn(self):
+        from src.order_scan import _harvest_image_urls
+        html = (
+            # No extension, unknown host → dropped.
+            '<img src="https://shop.com/render/12345" alt="Nice Tee">'
+            # No extension but a known image CDN → kept.
+            '<img src="https://cdn.shopify.com/s/files/1/tee-photo" alt="Tee Photo">'
+            # Relative / cid sources are skipped outright.
+            '<img src="cid:inline-photo" alt="Inline">'
+            '<img src="/assets/photo.jpg" alt="Relative">'
+        )
+        out = _harvest_image_urls(self._msg(html))
+        assert out == [{"url": "https://cdn.shopify.com/s/files/1/tee-photo",
+                        "alt": "Tee Photo"}]
+
+    def test_dedupes_by_host_and_path(self):
+        from src.order_scan import _harvest_image_urls
+        # Same file at two crop widths (query differs) counts once.
+        html = (
+            '<img src="https://cdn.shopify.com/a/tee.jpg?width=200" alt="">'
+            '<img src="https://cdn.shopify.com/a/tee.jpg?width=600" alt="">'
+        )
+        out = _harvest_image_urls(self._msg(html))
+        assert out == [{"url": "https://cdn.shopify.com/a/tee.jpg?width=200",
+                        "alt": ""}]
+
+    def test_empty_when_no_html(self):
+        from src.order_scan import _harvest_image_urls
+        import email as _email
+        msg = _email.message_from_string(
+            "Subject: x\r\nContent-Type: text/plain\r\n\r\nno images here"
+        )
+        assert _harvest_image_urls(msg) == []
+
+
+class TestMatchImage:
+    def test_picks_best_filename_slug_overlap(self):
+        from src.order_scan import _match_image
+        cands = [
+            {"url": "https://cdn.shopify.com/a/raijin-tee_540x.jpg", "alt": ""},
+            {"url": "https://cdn.shopify.com/a/fujin-tee_540x.jpg", "alt": ""},
+        ]
+        assert _match_image("Raijin Tee", cands) == cands[0]["url"]
+
+    def test_matches_on_alt_when_filename_opaque(self):
+        from src.order_scan import _match_image
+        # Amazon-style: opaque filename, product name in alt.
+        cands = [
+            {"url": "https://m.media-amazon.com/images/I/71abc.jpg",
+             "alt": "Amazon Essentials Lightweight Pullover"},
+            {"url": "https://m.media-amazon.com/images/I/81xyz.jpg",
+             "alt": "Champion Fleece Joggers"},
+        ]
+        assert _match_image("Essentials Lightweight Pullover", cands) == cands[0]["url"]
+
+    def test_ambiguous_tie_returns_none(self):
+        from src.order_scan import _match_image
+        cands = [
+            {"url": "https://cdn.shopify.com/a/raijin-black-tee.jpg", "alt": ""},
+            {"url": "https://cdn.shopify.com/a/raijin-white-tee.jpg", "alt": ""},
+        ]
+        assert _match_image("Raijin Tee", cands) is None
+
+    def test_garment_category_gate(self):
+        from src.order_scan import _match_image
+        # A "beanie" item must not match a "-hoodie" image on one shared token.
+        cands = [{"url": "https://cdn.shopify.com/a/bee-hoodie.jpg", "alt": ""}]
+        assert _match_image("Bee Beanie", cands) is None
+
+    def test_strong_overlap_crosses_category_gate(self):
+        from src.order_scan import _match_image
+        cands = [{"url": "https://cdn.shopify.com/a/hinata-kageyama-limits-hoodie.jpg",
+                  "alt": ""}]
+        assert _match_image("Hinata Kageyama Limits Tee", cands) == cands[0]["url"]
+
+    def test_sole_item_shortcut_takes_lone_image(self):
+        from src.order_scan import _match_image
+        # No name overlap at all (big-box generic asset + brand-only alt) —
+        # but a single-item order with a single plausible image is that item's.
+        cands = [{"url": "https://mi.oldnavy.com/p/rp/asset_17.png",
+                  "alt": "Her Universe"}]
+        assert _match_image("Graphic Crew", cands) is None
+        assert _match_image("Graphic Crew", cands, sole_item=True) == cands[0]["url"]
+
+    def test_sole_item_shortcut_needs_exactly_one_candidate(self):
+        from src.order_scan import _match_image
+        cands = [
+            {"url": "https://mi.oldnavy.com/p/rp/asset_17.png", "alt": "Her Universe"},
+            {"url": "https://mi.oldnavy.com/p/rp/asset_18.png", "alt": "Her Universe"},
+        ]
+        assert _match_image("Graphic Crew", cands, sole_item=True) is None
+
+    def test_name_match_beats_shortcut(self):
+        from src.order_scan import _match_image
+        cands = [{"url": "https://cdn.shopify.com/a/raijin-tee.jpg", "alt": ""}]
+        assert _match_image("Raijin Tee", cands, sole_item=True) == cands[0]["url"]
+
+    def test_empty_inputs(self):
+        from src.order_scan import _match_image
+        assert _match_image("", []) is None
+        assert _match_image("Raijin", []) is None
+        assert _match_image("", [], sole_item=True) is None
+
+
+# ---------------------------------------------------------------------------
 # Product-URL re-harvest backfill (--reharvest-urls)
 # ---------------------------------------------------------------------------
 
@@ -1316,6 +1523,18 @@ class TestReharvestTargets:
                  self._it(id="mid", purchased_at="2025-06-01")]
         out = order_scan._reharvest_targets(items, refresh=False, limit=2, since="2025-01-01")
         assert [i["id"] for i in out] == ["new", "mid"]
+
+    def test_field_selects_which_stamp_gates(self):
+        # An item with a product_url but no image_url is still an IMAGE target;
+        # one with an image_url is skipped for images but not for URLs.
+        items = [self._it(id="a", product_url="https://s.com/products/x"),
+                 self._it(id="b", image_url="https://cdn.shopify.com/a/x.jpg")]
+        images = order_scan._reharvest_targets(
+            items, refresh=False, limit=None, since=None, field="image_url")
+        assert [i["id"] for i in images] == ["a"]
+        urls = order_scan._reharvest_targets(
+            items, refresh=False, limit=None, since=None)
+        assert [i["id"] for i in urls] == ["b"]
 
 
 class TestUnwrapTrackingUrl:
@@ -1453,6 +1672,93 @@ class TestRunReharvest:
         monkeypatch.setattr(order_scan, "_fetch_product_links_by_msgids", _fetch)
         w = {"items": [{"id": "1", "is_clothing": False, "order_email_id": "1"}]}
         stats = order_scan._run_reharvest_urls(None, w)
+        assert stats["targeted"] == 0
+        assert called["n"] == 0  # never hit Gmail when nothing's pending
+
+
+# ---------------------------------------------------------------------------
+# Product-image re-harvest backfill (--reharvest-images, issue #19)
+# ---------------------------------------------------------------------------
+
+class TestRunReharvestImages:
+    @staticmethod
+    def _wardrobe():
+        return {"items": [
+            {"id": "1", "item_name": "Raijin Tee", "shop_domain": "bosuman.com",
+             "order_email_id": "100", "purchased_at": "2026-01-01"},
+            {"id": "2", "item_name": "Fujin Hoodie", "shop_domain": "bosuman.com",
+             "order_email_id": "100", "purchased_at": "2026-01-02"},
+            {"id": "3", "item_name": "Graphic Crew", "shop_domain": "oldnavy.com",
+             "order_email_id": "200", "purchased_at": "2026-01-03"},
+        ]}
+
+    @staticmethod
+    def _patch_fetch(monkeypatch, images):
+        monkeypatch.setattr(order_scan, "_fetch_product_images_by_msgids",
+                            lambda cfg, msgids, **kw: images)
+
+    def test_stamps_slug_matches_and_sole_item_shortcut(self, monkeypatch):
+        w = self._wardrobe()
+        self._patch_fetch(monkeypatch, {
+            # Shopify-style: handle in the filename → both siblings attribute.
+            "100": [
+                {"url": "https://cdn.shopify.com/a/raijin-tee_540x.jpg", "alt": ""},
+                {"url": "https://cdn.shopify.com/a/fujin-hoodie_540x.jpg", "alt": ""},
+            ],
+            # Big-box template: generic asset name, brand-only alt — only the
+            # single-item-order shortcut can attribute it.
+            "200": [
+                {"url": "https://mi.oldnavy.com/p/rp/asset_17.png",
+                 "alt": "Her Universe"},
+            ],
+        })
+        stats = order_scan._run_reharvest_images(None, w)
+        assert stats == {"targeted": 3, "emails": 2, "stamped": 3, "no_match": 0}
+        by_id = {it["id"]: it for it in w["items"]}
+        assert by_id["1"]["image_url"] == "https://cdn.shopify.com/a/raijin-tee_540x.jpg"
+        assert by_id["2"]["image_url"] == "https://cdn.shopify.com/a/fujin-hoodie_540x.jpg"
+        assert by_id["3"]["image_url"] == "https://mi.oldnavy.com/p/rp/asset_17.png"
+
+    def test_stamped_sibling_still_blocks_the_shortcut(self, monkeypatch):
+        # Item 1 already has an image_url, so only item 2 is a target — but the
+        # ORDER still had two items, so the lone generic image must not be
+        # claimed by item 2 (it could be item 1's photo).
+        w = {"items": [
+            {"id": "1", "item_name": "Raijin Tee", "order_email_id": "100",
+             "purchased_at": "2026-01-01",
+             "image_url": "https://cdn.shopify.com/a/raijin-tee.jpg"},
+            {"id": "2", "item_name": "Fujin Hoodie", "order_email_id": "100",
+             "purchased_at": "2026-01-02"},
+        ]}
+        self._patch_fetch(monkeypatch, {
+            "100": [{"url": "https://cdn.shopify.com/a/asset_9.jpg", "alt": ""}],
+        })
+        stats = order_scan._run_reharvest_images(None, w)
+        assert stats == {"targeted": 1, "emails": 1, "stamped": 0, "no_match": 1}
+        assert "image_url" not in w["items"][1]
+
+    def test_no_match_left_unstamped_and_retried(self, monkeypatch):
+        w = self._wardrobe()
+        self._patch_fetch(monkeypatch, {"100": [], "200": []})
+        stats = order_scan._run_reharvest_images(None, w)
+        assert stats["stamped"] == 0
+        assert stats["no_match"] == 3
+        # Unstamped items remain targets for the next run.
+        rerun = order_scan._reharvest_targets(
+            w["items"], refresh=False, limit=None, since=None, field="image_url")
+        assert len(rerun) == 3
+
+    def test_empty_targets_short_circuits(self, monkeypatch):
+        called = {"n": 0}
+        def _fetch(*a, **k):
+            called["n"] += 1
+            return {}
+        monkeypatch.setattr(order_scan, "_fetch_product_images_by_msgids", _fetch)
+        w = {"items": [
+            {"id": "1", "order_email_id": "100", "purchased_at": "2026-01-01",
+             "image_url": "https://cdn.shopify.com/a/x.jpg"},
+        ]}
+        stats = order_scan._run_reharvest_images(None, w)
         assert stats["targeted"] == 0
         assert called["n"] == 0  # never hit Gmail when nothing's pending
 
