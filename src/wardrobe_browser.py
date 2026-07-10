@@ -1010,12 +1010,43 @@ def _make_handler(catalogue: _Catalogue):
     return Handler
 
 
+def _fetch_images_in_background(
+    catalogue: "_Catalogue", gist_id: str, token: str, image_dir: Path,
+    *, refresh: bool = False,
+) -> threading.Thread:
+    """Run the image fetch on a daemon thread so serving starts immediately.
+
+    The retry of permanently-rotted URLs (~fast 404s / dead DNS) costs ~15s a
+    pass — hidden here instead of delaying the UI. When anything new lands,
+    the served payload is rebuilt so the next page load / Refresh shows it."""
+    def _work():
+        try:
+            wardrobe = fetch_wardrobe(gist_id, token)
+            stats = fetch_images(
+                wardrobe.get("items") or [], image_dir, refresh=refresh)
+            print(
+                f"Product images: {stats['downloaded']} downloaded, "
+                f"{stats['cached']} already cached, {stats['failed']} failed "
+                f"({stats['targets']} item(s) carry an image_url)."
+            )
+            if stats["downloaded"]:
+                catalogue.refresh()
+        except Exception as exc:  # noqa: BLE001 — never take the server down
+            log.warning("wardrobe_browser: image fetch failed: %s", exc)
+
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
+    return t
+
+
 def run(
     *,
     port: int = 8787,
     host: str = "127.0.0.1",
     open_browser: bool = True,
     image_dir: Path | None = None,
+    fetch_images_first: bool = False,
+    refresh_images: bool = False,
     env: dict | None = None,
 ) -> None:
     gist_id, token = _credentials(env)
@@ -1051,6 +1082,11 @@ def run(
            else "disabled (set GMAIL_USERNAME + GMAIL_APP_PASSWORD in .env to enable)")
     )
 
+    if fetch_images_first and image_dir:
+        print("Fetching product images in the background ...")
+        _fetch_images_in_background(
+            catalogue, gist_id, token, image_dir, refresh=refresh_images)
+
     server = ThreadingHTTPServer((host, port), _make_handler(catalogue))
     url = f"http://{host}:{port}/"
     print(f"Wardrobe browser running at {url}  (Ctrl-C to stop)")
@@ -1080,9 +1116,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--fetch-images", action="store_true",
-        help="before serving, download + cache the product photo of every item "
-             "carrying an image_url (stamped by order_scan / --reharvest-images, "
-             "issue #19) into --image-dir; ids already cached are skipped",
+        help="download + cache the product photo of every item carrying an "
+             "image_url (stamped by order_scan / --reharvest-images, issue #19) "
+             "into --image-dir, in the background while the app serves; ids "
+             "already cached are skipped",
     )
     parser.add_argument(
         "--refresh-images", action="store_true",
@@ -1096,25 +1133,13 @@ def main(argv: list[str] | None = None) -> None:
     except ImportError:
         pass
 
-    if args.fetch_images:
-        gist_id, token = _credentials(None)
-        log.info("wardrobe_browser: fetching wardrobe for image cache ...")
-        wardrobe = fetch_wardrobe(gist_id, token)
-        stats = fetch_images(
-            wardrobe.get("items") or [], args.image_dir,
-            refresh=args.refresh_images,
-        )
-        print(
-            f"Product images: {stats['downloaded']} downloaded, "
-            f"{stats['cached']} already cached, {stats['failed']} failed "
-            f"({stats['targets']} item(s) carry an image_url)."
-        )
-
     run(
         port=args.port,
         host=args.host,
         open_browser=not args.no_browser,
         image_dir=args.image_dir,
+        fetch_images_first=args.fetch_images,
+        refresh_images=args.refresh_images,
     )
 
 
