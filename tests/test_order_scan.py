@@ -1359,6 +1359,7 @@ class TestHarvestImageUrls:
         assert out == [{
             "url": "https://cdn.shopify.com/s/files/1/raijin-tee_540x.jpg?v=1",
             "alt": "Raijin Tee",
+            "context": "",
         }]
 
     def test_drops_tracking_pixels(self):
@@ -1397,7 +1398,7 @@ class TestHarvestImageUrls:
         )
         out = _harvest_image_urls(self._msg(html))
         assert out == [{"url": "https://cdn.shopify.com/s/files/1/tee-photo",
-                        "alt": "Tee Photo"}]
+                        "alt": "Tee Photo", "context": ""}]
 
     def test_dedupes_by_host_and_path(self):
         from src.order_scan import _harvest_image_urls
@@ -1408,7 +1409,7 @@ class TestHarvestImageUrls:
         )
         out = _harvest_image_urls(self._msg(html))
         assert out == [{"url": "https://cdn.shopify.com/a/tee.jpg?width=200",
-                        "alt": ""}]
+                        "alt": "", "context": ""}]
 
     def test_empty_when_no_html(self):
         from src.order_scan import _harvest_image_urls
@@ -1417,6 +1418,108 @@ class TestHarvestImageUrls:
             "Subject: x\r\nContent-Type: text/plain\r\n\r\nno images here"
         )
         assert _harvest_image_urls(msg) == []
+
+    # -- row context (issue #28) ---------------------------------------------
+
+    def test_context_is_own_row_text(self):
+        from src.order_scan import _harvest_image_urls
+        # Big-box shape: generic filenames, brand-only alt, names ONLY in the
+        # row text. Each image's context must be its own row, not the table.
+        html = (
+            "<table>"
+            '<tr><td><img src="https://img.bigbox.test/assets/a1.jpg" alt="BigBox"'
+            ' width="100"></td><td>Raijin Oversize Tee Size: L Qty 1 $19.99</td></tr>'
+            '<tr><td><img src="https://img.bigbox.test/assets/a2.jpg" alt="BigBox"'
+            ' width="100"></td><td>Fujin Zip Hoodie Size: M Qty 1 $39.99</td></tr>'
+            "</table>"
+        )
+        out = _harvest_image_urls(self._msg(html))
+        assert [c["url"][-6:] for c in out] == ["a1.jpg", "a2.jpg"]
+        assert "Raijin Oversize Tee" in out[0]["context"]
+        assert "Fujin" not in out[0]["context"]
+        assert "Fujin Zip Hoodie" in out[1]["context"]
+        assert "Raijin" not in out[1]["context"]
+
+    def test_duplicate_image_does_not_stop_context_walk(self):
+        from src.order_scan import _harvest_image_urls
+        # Desktop + mobile copies of the SAME image inside one row: the walk
+        # counts distinct URLs, so the duplicate must not stop it before the
+        # row text is reached (and the pair still dedupes to one candidate).
+        html = (
+            "<table><tr>"
+            '<td><img src="https://img.bigbox.test/a/tee.jpg" width="100">'
+            '<img src="https://img.bigbox.test/a/tee.jpg" width="50%"></td>'
+            "<td>Raijin Tee Size: L</td>"
+            "</tr></table>"
+        )
+        out = _harvest_image_urls(self._msg(html))
+        assert len(out) == 1
+        assert "Raijin Tee" in out[0]["context"]
+
+    def test_same_image_in_adjacent_rows_merges_to_one_candidate(self):
+        from src.order_scan import _harvest_image_urls
+        # One product bought twice (two sizes) shows the same photo in two
+        # adjacent rows: no second DISTINCT image ever enters, so the walk
+        # spans both rows and the pair dedupes to one candidate whose context
+        # carries both — same image either way, still matchable.
+        html = (
+            "<table>"
+            '<tr><td><img src="https://img.bigbox.test/a/joggers.jpg" width="100">'
+            "</td><td>Twill Joggers M Cream</td></tr>"
+            '<tr><td><img src="https://img.bigbox.test/a/joggers.jpg" width="100">'
+            "</td><td>Twill Joggers S Cream</td></tr>"
+            "</table>"
+        )
+        out = _harvest_image_urls(self._msg(html))
+        assert len(out) == 1
+        assert out[0]["context"] == "Twill Joggers M Cream Twill Joggers S Cream"
+
+    def test_same_image_in_separated_rows_keeps_both_contexts(self):
+        from src.order_scan import _harvest_image_urls
+        # The same photo in two rows SEPARATED by another product: each copy's
+        # walk stops at its own row, and the (host, path, context) dedupe
+        # keeps both row candidates.
+        html = (
+            "<table>"
+            '<tr><td><img src="https://img.bigbox.test/a/joggers.jpg" width="100">'
+            "</td><td>Twill Joggers M Cream</td></tr>"
+            '<tr><td><img src="https://img.bigbox.test/a/chinos.jpg" width="100">'
+            "</td><td>Straight Chinos L Tan</td></tr>"
+            '<tr><td><img src="https://img.bigbox.test/a/joggers.jpg" width="100">'
+            "</td><td>Twill Joggers S Cream</td></tr>"
+            "</table>"
+        )
+        out = _harvest_image_urls(self._msg(html))
+        assert [c["context"] for c in out] == [
+            "Twill Joggers M Cream",
+            "Straight Chinos L Tan",
+            "Twill Joggers S Cream",
+        ]
+
+    def test_tiny_decoration_neither_candidate_nor_walk_stopper(self):
+        from src.order_scan import _harvest_image_urls
+        # Hot Topic plants an 11px icon INSIDE each item row; it must not
+        # become a candidate and must not stop the row walk.
+        html = (
+            "<table><tr>"
+            '<td><img src="https://img.bigbox.test/a/tee.jpg" width="100"></td>'
+            '<td><img src="https://img.bigbox.test/m/icon-a1.png" width="11" height="11">'
+            "Raijin Tee Size: 2X</td>"
+            "</tr></table>"
+        )
+        out = _harvest_image_urls(self._msg(html))
+        assert len(out) == 1
+        assert out[0]["url"].endswith("tee.jpg")
+        assert "Raijin Tee" in out[0]["context"]
+
+    def test_context_capped(self):
+        from src.order_scan import _harvest_image_urls, _IMAGE_CONTEXT_CAP
+        html = (
+            '<div><img src="https://img.bigbox.test/a/tee.jpg" width="100">'
+            + "Raijin Tee " + "x" * 600 + "</div>"
+        )
+        out = _harvest_image_urls(self._msg(html))
+        assert len(out[0]["context"]) == _IMAGE_CONTEXT_CAP
 
 
 class TestMatchImage:
@@ -1486,6 +1589,181 @@ class TestMatchImage:
         assert _match_image("", []) is None
         assert _match_image("Raijin", []) is None
         assert _match_image("", [], sole_item=True) is None
+
+    # -- tier 2: row-context + colour (issue #28) -----------------------------
+
+    @staticmethod
+    def _bigbox(context_a, context_b):
+        # Generic filenames + brand-only alt: tier 1 has nothing to grip.
+        return [
+            {"url": "https://img.bigbox.test/assets/a1.jpg", "alt": "BigBox",
+             "context": context_a},
+            {"url": "https://img.bigbox.test/assets/a2.jpg", "alt": "BigBox",
+             "context": context_b},
+        ]
+
+    def test_tier2_matches_on_row_context(self):
+        from src.order_scan import _match_image
+        cands = self._bigbox("Raijin Oversize Tee Size: L Qty 1 $19.99",
+                             "Fujin Zip Hoodie Size: M Qty 1 $39.99")
+        assert _match_image("Raijin Oversize Tee", cands) == cands[0]["url"]
+        assert _match_image("Fujin Zip Hoodie", cands) == cands[1]["url"]
+
+    def test_tier2_colour_separates_colourway_rows(self):
+        from src.order_scan import _match_image
+        # Old Navy shape: identical item names, colour only in the row text.
+        cands = self._bigbox("Crew Tee 111 $6.00 L | Bourbon Qty 1",
+                             "Crew Tee 222 $6.00 L | Stonewash Qty 1")
+        assert _match_image("Crew Tee", cands, color="Bourbon") == cands[0]["url"]
+        assert _match_image("Crew Tee", cands, color="Stonewash") == cands[1]["url"]
+        # No colour to separate them → tie across different images → None.
+        assert _match_image("Crew Tee", cands) is None
+
+    def test_tier2_colour_rescues_tokenless_name(self):
+        from src.order_scan import _match_image, _tokens
+        # "Loose Fit Sweatpants" tokenizes to nothing (generic apparel fillers)
+        # — the colour is the only distinctive signal, and it suffices.
+        assert _tokens("Loose Fit Sweatpants") == set()
+        cands = self._bigbox("Loose Fit Sweatpants $ 24.99 S Navy blue 1012",
+                             "Loose Fit Sweatpants $ 24.99 S Dark taupe 1013")
+        assert _match_image(
+            "Loose Fit Sweatpants", cands, color="Navy blue") == cands[0]["url"]
+
+    def test_tier2_same_url_tie_resolves(self):
+        from src.order_scan import _match_image
+        # Same photo in two rows (two sizes of one product): both rows match,
+        # but it's the same image either way — unambiguous.
+        cands = [
+            {"url": "https://img.bigbox.test/a/joggers.jpg?w=200", "alt": "",
+             "context": "Twill Joggers M Cream"},
+            {"url": "https://img.bigbox.test/a/joggers.jpg?w=600", "alt": "",
+             "context": "Twill Joggers S Cream"},
+        ]
+        assert _match_image("Twill Joggers", cands, color="Cream") == cands[0]["url"]
+
+    def test_tier2_tie_across_different_images_returns_none(self):
+        from src.order_scan import _match_image
+        cands = self._bigbox("Totoro Wash Tee Item: 111",
+                             "Totoro Wash Sweatshirt Item: 222")
+        assert _match_image("Totoro Wash", cands) is None
+
+    def test_tier2_category_gate(self):
+        from src.order_scan import _match_image
+        # One shared token + conflicting garment category in the row → gated.
+        cands = [{"url": "https://img.bigbox.test/assets/a1.jpg", "alt": "",
+                  "context": "Bee Hoodie $12.99 Qty 1"}]
+        assert _match_image("Bee Beanie", cands) is None
+
+    def test_tier1_stays_authoritative_over_context(self):
+        from src.order_scan import _match_image
+        # A slug match wins even when another candidate's row context also
+        # mentions the name — tier 2 fires only when tier 1 scored nothing.
+        cands = [
+            {"url": "https://cdn.shopify.com/a/raijin-tee_540x.jpg", "alt": "",
+             "context": "unrelated footer text"},
+            {"url": "https://img.bigbox.test/assets/a1.jpg", "alt": "",
+             "context": "Raijin Tee Size: L"},
+        ]
+        assert _match_image("Raijin Tee", cands) == cands[0]["url"]
+
+    def test_sole_item_shortcut_counts_distinct_urls(self):
+        from src.order_scan import _match_image
+        # Two candidates that are the SAME image (two rows/crops) still count
+        # as "exactly one plausible image" for the shortcut.
+        cands = [
+            {"url": "https://mi.oldnavy.com/p/rp/asset_17.png", "alt": "BigBox",
+             "context": ""},
+            {"url": "https://mi.oldnavy.com/p/rp/asset_17.png?w=600", "alt": "BigBox",
+             "context": "row two"},
+        ]
+        assert _match_image("Graphic Crew", cands, sole_item=True) == cands[0]["url"]
+
+
+class TestImageConflictGuard:
+    def test_conflicted_keys_flags_shared_image_across_different_items(self):
+        from src.order_scan import _conflicted_image_keys, _image_claim_tokens
+        url = "https://mi.bigbox.test/p/rp/block.png"
+        claims = [
+            (_image_claim_tokens("Rotation Baggy Joggers", "Moire Navy"), url),
+            (_image_claim_tokens("Tapered Joggers", "Black"), url),
+        ]
+        assert _conflicted_image_keys(claims) == {("mi.bigbox.test", "/p/rp/block.png")}
+
+    def test_same_product_twice_is_not_a_conflict(self):
+        from src.order_scan import _conflicted_image_keys, _image_claim_tokens
+        url = "https://img.bigbox.test/a/joggers.jpg"
+        claims = [
+            (_image_claim_tokens("Twill Joggers", "Cream"), url),
+            (_image_claim_tokens("Twill Joggers", "Cream"), url),
+        ]
+        assert _conflicted_image_keys(claims) == set()
+
+    def test_different_images_never_conflict(self):
+        from src.order_scan import _conflicted_image_keys, _image_claim_tokens
+        claims = [
+            (_image_claim_tokens("Raijin Tee", ""), "https://i.test/a1.jpg"),
+            (_image_claim_tokens("Fujin Hoodie", ""), "https://i.test/a2.jpg"),
+        ]
+        assert _conflicted_image_keys(claims) == set()
+
+
+class TestBigBoxImageEndToEnd:
+    """Synthetic big-box template email → harvest → materialise (issue #28).
+
+    Fake shop, fake items — structure mirrors a real big-box order email
+    (generic asset filenames, brand-only alt, item name/colour only in the
+    row text) per the privacy rules.
+    """
+
+    _HTML = (
+        "<table>"
+        '<tr><td><img src="https://img.bigbox.test/assets/a1.jpg" alt="BigBox"'
+        ' width="100"></td><td>Raijin Oversize Tee L | Black Qty 1 $19.99</td></tr>'
+        '<tr><td><img src="https://img.bigbox.test/assets/a2.jpg" alt="BigBox"'
+        ' width="100"></td><td>Fujin Zip Hoodie M | Green Qty 1 $39.99</td></tr>'
+        "</table>"
+    )
+
+    def test_both_items_attribute_via_row_context(self):
+        from src.order_scan import _harvest_image_urls, _materialise_items
+        import email as _email
+        msg = _email.message_from_string(
+            "From: shop <no-reply@bigbox.test>\r\nSubject: Your order\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n\r\n" + self._HTML
+        )
+        images = _harvest_image_urls(msg)
+        items = _materialise_items(
+            [{"email_id": "100", "items": [
+                {"name": "Raijin Oversize Tee", "color": "Black"},
+                {"name": "Fujin Zip Hoodie", "color": "Green"},
+            ]}],
+            {"100": {"shop": "BigBox", "shop_domain": "bigbox.test",
+                     "purchased_at": "2026-07-01"}},
+            None,
+            {"100": images},
+        )
+        assert items[0]["image_url"] == "https://img.bigbox.test/assets/a1.jpg"
+        assert items[1]["image_url"] == "https://img.bigbox.test/assets/a2.jpg"
+
+    def test_section_level_render_nulled_for_both_items(self):
+        from src.order_scan import _materialise_items
+        # One rendered "Your Order" block whose context spans BOTH items: each
+        # would match it as unique top — the conflict guard nulls both.
+        images = [{
+            "url": "https://mi.bigbox.test/p/rp/block.png", "alt": "",
+            "context": "Your Order Raijin Oversize Tee $19.99 Fujin Zip Hoodie $39.99",
+        }]
+        items = _materialise_items(
+            [{"email_id": "100", "items": [
+                {"name": "Raijin Oversize Tee"}, {"name": "Fujin Zip Hoodie"},
+            ]}],
+            {"100": {"shop": "BigBox", "shop_domain": "bigbox.test",
+                     "purchased_at": "2026-07-01"}},
+            None,
+            {"100": images},
+        )
+        assert items[0]["image_url"] is None
+        assert items[1]["image_url"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1718,6 +1996,67 @@ class TestRunReharvestImages:
         assert by_id["1"]["image_url"] == "https://cdn.shopify.com/a/raijin-tee_540x.jpg"
         assert by_id["2"]["image_url"] == "https://cdn.shopify.com/a/fujin-hoodie_540x.jpg"
         assert by_id["3"]["image_url"] == "https://mi.oldnavy.com/p/rp/asset_17.png"
+
+    def test_tier2_context_backfills_bigbox_rows(self, monkeypatch):
+        # Big-box shape: generic filenames + brand-only alt (tier 1 blind),
+        # names + colours only in the row contexts → tier 2 stamps both
+        # siblings (issue #28).
+        w = {"items": [
+            {"id": "1", "item_name": "Raijin Oversize Tee", "color": "Black",
+             "order_email_id": "100", "purchased_at": "2026-01-01"},
+            {"id": "2", "item_name": "Fujin Zip Hoodie", "color": "Green",
+             "order_email_id": "100", "purchased_at": "2026-01-02"},
+        ]}
+        self._patch_fetch(monkeypatch, {"100": [
+            {"url": "https://img.bigbox.test/assets/a1.jpg", "alt": "BigBox",
+             "context": "Raijin Oversize Tee L | Black Qty 1 $19.99"},
+            {"url": "https://img.bigbox.test/assets/a2.jpg", "alt": "BigBox",
+             "context": "Fujin Zip Hoodie M | Green Qty 1 $39.99"},
+        ]})
+        stats = order_scan._run_reharvest_images(None, w)
+        assert stats == {"targeted": 2, "emails": 1, "stamped": 2, "no_match": 0}
+        assert w["items"][0]["image_url"].endswith("a1.jpg")
+        assert w["items"][1]["image_url"].endswith("a2.jpg")
+
+    def test_section_level_render_not_stamped(self, monkeypatch):
+        # A rendered order block matching BOTH differently-named items is
+        # section-level — the conflict guard nulls both matches.
+        w = {"items": [
+            {"id": "1", "item_name": "Rotation Baggy Sweatpants", "color": "Navy",
+             "order_email_id": "100", "purchased_at": "2026-01-01"},
+            {"id": "2", "item_name": "Tapered Jogger Sweatpants", "color": "Black",
+             "order_email_id": "100", "purchased_at": "2026-01-02"},
+        ]}
+        self._patch_fetch(monkeypatch, {"100": [
+            {"url": "https://mi.bigbox.test/p/rp/block.png", "alt": "",
+             "context": "Your Order Rotation Baggy Sweatpants Navy "
+                        "Tapered Jogger Sweatpants Black"},
+        ]})
+        stats = order_scan._run_reharvest_images(None, w)
+        assert stats == {"targeted": 2, "emails": 1, "stamped": 0, "no_match": 2}
+        assert "image_url" not in w["items"][0]
+        assert "image_url" not in w["items"][1]
+
+    def test_existing_stamp_conflicts_null_new_match(self, monkeypatch):
+        # A stamped sibling already holds the URL the new match wants, under
+        # different tokens → the new match is dropped; the stamp is untouched.
+        block = "https://mi.bigbox.test/p/rp/block.png"
+        w = {"items": [
+            {"id": "1", "item_name": "Rotation Baggy Sweatpants", "color": "Navy",
+             "order_email_id": "100", "purchased_at": "2026-01-01",
+             "image_url": block},
+            {"id": "2", "item_name": "Tapered Jogger Sweatpants", "color": "Black",
+             "order_email_id": "100", "purchased_at": "2026-01-02"},
+        ]}
+        self._patch_fetch(monkeypatch, {"100": [
+            {"url": block, "alt": "",
+             "context": "Your Order Rotation Baggy Sweatpants Navy "
+                        "Tapered Jogger Sweatpants Black"},
+        ]})
+        stats = order_scan._run_reharvest_images(None, w)
+        assert stats == {"targeted": 1, "emails": 1, "stamped": 0, "no_match": 1}
+        assert w["items"][0]["image_url"] == block
+        assert "image_url" not in w["items"][1]
 
     def test_stamped_sibling_still_blocks_the_shortcut(self, monkeypatch):
         # Item 1 already has an image_url, so only item 2 is a target — but the

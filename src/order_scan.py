@@ -1062,18 +1062,35 @@ def _match_product_url(item_name: str, candidates: list[str]) -> str | None:
 # tie → no match), and stamped as ``image_url``; the wardrobe browser's
 # ``--fetch-images`` step downloads + caches the bytes locally, because
 # email-CDN URLs rot (image.email.*, iterable, sendinblue) and even Shopify's
-# CDN dies with the merchant. Coverage is partial by design — the issue-19
-# probe measured ~24-30% catalogue-wide: Shopify-family + Amazon emails carry
-# the product handle in the filename or the name in alt and match cleanly;
-# big-box template emails (Old Navy, Hot Topic, H&M) name every asset
-# generically, so only the single-item-order shortcut can attribute those.
+# CDN dies with the merchant. Shopify-family + Amazon emails carry the product
+# handle in the filename or the name in alt and match cleanly (tier 1).
+#
+# Phase 2 (issue #28): big-box template emails (Old Navy, Hot Topic, H&M) name
+# every asset generically with brand-only alt — but the photo IS tied to the
+# item by POSITION: the item's table row contains both the <img> and the
+# item-name/colour text. Each harvested image therefore carries a ``context``
+# (the visible text of its own item row, found by growing the ancestor until a
+# second distinct product image would enter) and ``_match_image`` scores
+# name+colour tokens against it as a tier-2 fallback. The issue-28 probe
+# measured ~100% attribution where the email has per-item photos at all
+# (Hot Topic 41/43, Old Navy/H&M colourway orders fully resolved by the colour
+# tokens), zero wrong assignments; the remaining big-box misses are template
+# variants with NO per-item image in the email (Old Navy's brand-logo
+# placeholder rows, H&M's old text-only items table) — those keep the icon.
 
 # Cap on harvested images per email — beyond this it's cross-sell grids and
 # footer chrome.
 _MAX_HARVESTED_IMAGES = 40
-# Any parsed width/height attribute at or below this is an open-tracking
-# pixel / divider, not a product photo.
-_PIXEL_MAX_DIM = 4
+# Any parsed width/height attribute at or below this is email decoration —
+# tracking pixels and dividers (1px), then arrows, list bullets and inline
+# icons (Hot Topic plants an 11px icon INSIDE each item row, which would
+# otherwise stop the context walk one hop before the item name). Real product
+# photos in order emails declare 90px+ (Amazon thumbs) when they declare at
+# all.
+_DECOR_MAX_DIM = 40
+# Row-context cap — item rows are short ("name sku price colour qty"); beyond
+# this the walk grabbed a section, not a row.
+_IMAGE_CONTEXT_CAP = 300
 # Spacer/pixel-style filenames (s.gif, spacer.gif, 1x1.png, ...).
 _PIXEL_NAME_RE = re.compile(
     r"(?:^|/)(?:s|sp|spacer|pixel|px|open|blank|clear|transparent|trans|1x1|dot)"
@@ -1097,9 +1114,16 @@ _IMAGE_CHROME_RE = re.compile(
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 # Hosts whose images are plausible products even without a file extension in
 # the path (dynamic-resize CDNs). Everything else must end in an image ext.
+# Narrow, exact hosts only — widening this also widens what the single-item
+# shortcut can grab. amplience (Hot Topic: /s/hottopic/<sku>_hi) and
+# assets.hm.com (/…/articles/<article-id>) are the big-box product-image CDNs
+# the issue-28 probe observed; their ESP-render hosts (em.realtime.email,
+# image.email.*) are deliberately NOT here — those serve promo/recommendation
+# widgets, not the item's own photo.
 _IMAGE_CDN_HOSTS = (
     "cdn.shopify.com", "shopifycdn.net", "myshopline.com",
     "media-amazon.com", "ssl-images-amazon.com",
+    "cdn.media.amplience.net", "assets.hm.com",
 )
 
 
@@ -1117,13 +1141,14 @@ def _parse_dim(value) -> int | None:
 def _is_plausible_product_image(url: str, alt: str, width, height) -> bool:
     """Filter one ``<img>`` down to "could be a product photo".
 
-    Drops tracking pixels (tiny declared dims, pixel-style filenames), email
-    chrome (``_IMAGE_CHROME_RE`` over the slug-normalised path + alt), and
-    URLs that neither end in an image extension nor sit on a known image CDN.
+    Drops decorations (declared dims at or under ``_DECOR_MAX_DIM`` — tracking
+    pixels, dividers, inline icons), pixel-style filenames, email chrome
+    (``_IMAGE_CHROME_RE`` over the slug-normalised path + alt), and URLs that
+    neither end in an image extension nor sit on a known image CDN.
     """
     for dim in (width, height):
         parsed_dim = _parse_dim(dim)
-        if parsed_dim is not None and parsed_dim <= _PIXEL_MAX_DIM:
+        if parsed_dim is not None and parsed_dim <= _DECOR_MAX_DIM:
             return False
     parsed = urlparse(url)
     path = parsed.path or ""
@@ -1138,15 +1163,25 @@ def _is_plausible_product_image(url: str, alt: str, width, height) -> bool:
 def _harvest_image_urls(msg: "email.message.Message") -> list[dict]:
     """Plausible product images from an order email's HTML body.
 
-    Returns ``[{"url", "alt"}, ...]`` in document order, deduped by host+path
-    (the same file at two crop widths counts once), capped at
-    ``_MAX_HARVESTED_IMAGES``. Absolute http(s) ``src`` only — the issue-19
-    probe found zero inline ``data:`` images across the live inbox. Matched to
-    extracted items in ``_match_image``.
+    Returns ``[{"url", "alt", "context"}, ...]`` in document order, deduped by
+    host+path+context (the same file at two crop widths counts once, but one
+    photo shown in TWO item rows — colourways of one product — keeps each
+    row's candidate), capped at ``_MAX_HARVESTED_IMAGES``. Absolute http(s)
+    ``src`` only — the issue-19 probe found zero inline ``data:`` images
+    across the live inbox. Matched to extracted items in ``_match_image``.
+
+    ``context`` (issue #28) is the visible text of the image's own item row:
+    the largest ancestor still containing exactly ONE distinct plausible image
+    URL, grown until a sibling product image would enter. Counting DISTINCT
+    URLs (not nodes) matters — big-box templates repeat the same image for
+    desktop/mobile, and a duplicate must not stop the walk before the row text
+    is reached. The grow-until-a-sibling rule finds the per-item cell in any
+    table layout without knowing the template, and structurally can't leak a
+    sibling item's name into the context.
     """
     from bs4 import BeautifulSoup
 
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     out: list[dict] = []
     for part in msg.walk():
         if part.is_multipart() or part.get_content_type() != "text/html":
@@ -1159,6 +1194,7 @@ def _harvest_image_urls(msg: "email.message.Message") -> list[dict]:
             html = payload.decode(charset, errors="replace")
         except (LookupError, UnicodeDecodeError):
             html = payload.decode("utf-8", errors="replace")
+        plausible: list[tuple[object, str, str]] = []
         for img in BeautifulSoup(html, "lxml").find_all("img", src=True):
             src = (img["src"] or "").strip()
             if not src.lower().startswith(("http://", "https://")):
@@ -1168,12 +1204,30 @@ def _harvest_image_urls(msg: "email.message.Message") -> list[dict]:
                 src, alt, img.get("width"), img.get("height"),
             ):
                 continue
+            plausible.append((img, src, alt))
+        walk_key: dict[int, tuple[str, str]] = {}
+        for node, src, _alt in plausible:
             parsed = urlparse(src)
-            key = (parsed.netloc.lower(), parsed.path)
+            walk_key[id(node)] = (parsed.netloc.lower(), parsed.path)
+        for node, src, alt in plausible:
+            best = node
+            cur = node.parent
+            while cur is not None:
+                distinct = {
+                    walk_key[id(i)] for i in cur.find_all("img")
+                    if id(i) in walk_key
+                }
+                if len(distinct) > 1:
+                    break
+                best = cur
+                cur = cur.parent
+            context = " ".join(best.get_text(" ").split())[:_IMAGE_CONTEXT_CAP]
+            parsed = urlparse(src)
+            key = (parsed.netloc.lower(), parsed.path, context)
             if key in seen:
                 continue
             seen.add(key)
-            out.append({"url": src, "alt": alt})
+            out.append({"url": src, "alt": alt, "context": context})
             if len(out) >= _MAX_HARVESTED_IMAGES:
                 return out
     return out
@@ -1195,26 +1249,55 @@ def _image_text(cand: dict) -> str:
     return f"{slug} {cand.get('alt') or ''}"
 
 
+def _image_key(url: str) -> tuple[str, str]:
+    """Host+path identity of an image URL (query = crop params, ignored)."""
+    parsed = urlparse(url)
+    return (parsed.netloc.lower(), parsed.path)
+
+
+def _resolve_top_image(scored: list[tuple[int, str]]) -> str | None:
+    """Unique-top-score winner, or ``None`` on a real tie.
+
+    A tie whose candidates are all the SAME image (host+path — one photo
+    harvested from several rows or crop widths) is unambiguous and resolves to
+    the first; a tie across different images never guesses.
+    """
+    best = max(score for score, _ in scored)
+    top = [url for score, url in scored if score == best]
+    if len(top) == 1 or len({_image_key(u) for u in top}) == 1:
+        return top[0]
+    return None
+
+
 def _match_image(
     item_name: str, candidates: list[dict], *, sole_item: bool = False,
+    color: str = "",
 ) -> str | None:
     """Best product-image URL for an item, by token overlap with its name.
 
-    Mirrors ``_match_product_url``: item-name tokens vs each image's
-    filename-slug + alt tokens (shared ``_STOPWORDS`` strip), garment-category
-    gate, unique-top-score wins; a tie yields no match so a multi-item order
-    never mis-assigns a sibling's photo.
+    Tier 1 (authoritative, unchanged from issue #19): item-name tokens vs each
+    image's filename-slug + alt tokens (shared ``_STOPWORDS`` strip),
+    garment-category gate, unique-top-score wins; a tie across different
+    images yields no match so a multi-item order never mis-assigns a sibling's
+    photo.
+
+    Tier 2 (issue #28): only when tier 1 scored nothing — name+``color``
+    tokens vs each candidate's row ``context``, same gates and tie rules.
+    Colour is what separates same-name colourway rows (Old Navy's "Crew-Neck
+    T-Shirt" in eight colours, each row naming its colour) and rescues generic
+    names the tokenizer empties entirely ("Loose Fit Sweatpants" → ∅, but
+    "Navy blue" survives). Context is noisier than a slug, so tier 1 must stay
+    first: today's tier-1 matches can't change.
 
     ``sole_item`` adds the single-item-order shortcut from the issue-19 probe:
     when the order contains exactly ONE item and the email exactly ONE
-    plausible product image, that image is the item's even with no name
-    overlap — this is what recovers big-box template emails whose asset names
-    are generic and whose alt is brand-only.
+    distinct plausible product image, that image is the item's even with no
+    name overlap.
     """
+    item_cats = _garment_categories(item_name)
     name_tokens = _tokens(item_name)
+    tier1: list[tuple[int, str]] = []
     if name_tokens and candidates:
-        item_cats = _garment_categories(item_name)
-        scored: list[tuple[int, str]] = []
         for cand in candidates:
             text = _image_text(cand)
             overlap = len(name_tokens & _tokens(text))
@@ -1224,17 +1307,63 @@ def _match_image(
                 cand_cats = _garment_categories(text)
                 if cand_cats and not (item_cats & cand_cats) and overlap < 2:
                     continue
-            scored.append((overlap, cand["url"]))
-        if scored:
-            best = max(score for score, _ in scored)
-            top = [url for score, url in scored if score == best]
-            if len(top) == 1:
-                return top[0]
-            # Ambiguous — fall through (the shortcut below can't fire with
-            # multiple candidates, so this ends up None; never guess).
-    if sole_item and len(candidates) == 1:
-        return candidates[0]["url"]
+            tier1.append((overlap, cand["url"]))
+    if tier1:
+        resolved = _resolve_top_image(tier1)
+        if resolved:
+            return resolved
+        # Ambiguous across different images — never guess; the shortcut below
+        # can't fire with multiple distinct candidates, so this ends up None.
+    else:
+        ctx_tokens = _tokens(f"{item_name} {color or ''}")
+        tier2: list[tuple[int, str]] = []
+        if ctx_tokens:
+            for cand in candidates:
+                context = cand.get("context") or ""
+                if not context:
+                    continue
+                overlap = len(ctx_tokens & _tokens(context))
+                if overlap < _PRODUCT_URL_MIN_OVERLAP:
+                    continue
+                if item_cats:
+                    cand_cats = _garment_categories(context)
+                    if cand_cats and not (item_cats & cand_cats) and overlap < 2:
+                        continue
+                tier2.append((overlap, cand["url"]))
+        if tier2:
+            resolved = _resolve_top_image(tier2)
+            if resolved:
+                return resolved
+    if sole_item and candidates:
+        if len({_image_key(c["url"]) for c in candidates}) == 1:
+            return candidates[0]["url"]
     return None
+
+
+def _image_claim_tokens(item_name: str, color: str) -> frozenset:
+    """The token identity under which an item claims an image (see below)."""
+    return frozenset(_tokens(f"{item_name or ''} {color or ''}"))
+
+
+def _conflicted_image_keys(
+    claims: list[tuple[frozenset, str]],
+) -> set[tuple[str, str]]:
+    """Image keys claimed by 2+ items with DIFFERENT name+colour token sets.
+
+    Order-level guard (issue #28): one photo legitimately serves the same
+    product bought twice (identical token sets — sizes share the photo), but
+    two differently-named items resolving to one image means the image is
+    section-level — a rendered block spanning several items (Old Navy's
+    Movable Ink "Your Order" render matched every item's tokens in the probe)
+    — and stamping it would show the wrong photo on at least one item. The
+    caller nulls every match whose key is returned. ``claims``: one
+    ``(_image_claim_tokens(...), matched_url)`` pair per matched item of a
+    single order email.
+    """
+    by_key: dict[tuple[str, str], set[frozenset]] = {}
+    for toks, url in claims:
+        by_key.setdefault(_image_key(url), set()).add(toks)
+    return {key for key, sets in by_key.items() if len(sets) > 1}
 
 
 # ---------------------------------------------------------------------------
@@ -1560,6 +1689,24 @@ def _materialise_items(
         # Single-item order → _match_image may take the email's lone product
         # image with no name overlap (the big-box template-email recovery).
         sole = sum(1 for r in raw_items if (r.get("name") or "").strip()) == 1
+        # Match the whole order's images first, then null any image claimed by
+        # two differently-named items — a section-level render, never a
+        # per-item photo (issue #28; see _conflicted_image_keys).
+        image_by_idx: dict[int, str | None] = {}
+        image_claims: list[tuple[frozenset, str]] = []
+        for idx, raw_item in enumerate(raw_items):
+            name = (raw_item.get("name") or "").strip()
+            if not name:
+                continue
+            color = (raw_item.get("color") or "").strip()
+            url = _match_image(name, email_images, sole_item=sole, color=color)
+            image_by_idx[idx] = url
+            if url:
+                image_claims.append((_image_claim_tokens(name, color), url))
+        conflicted = _conflicted_image_keys(image_claims)
+        for idx, url in image_by_idx.items():
+            if url and _image_key(url) in conflicted:
+                image_by_idx[idx] = None
         for idx, raw_item in enumerate(raw_items):
             name = (raw_item.get("name") or "").strip()
             if not name:
@@ -1582,9 +1729,10 @@ def _materialise_items(
                 # unambiguous match. The browser falls back to a search link.
                 "product_url": _match_product_url(name, email_links),
                 # Product photo harvested from the email HTML and matched by
-                # filename-slug + alt (issue #19); None when no unambiguous
-                # match. The browser falls back to its category icon.
-                "image_url": _match_image(name, email_images, sole_item=sole),
+                # filename-slug + alt, falling back to row-context + colour
+                # (issues #19/#28); None when no unambiguous match. The
+                # browser falls back to its category icon.
+                "image_url": image_by_idx.get(idx),
                 "order_email_id": email_id,
                 "shipping_email_id": None,
                 "shipped_at": None,
@@ -2860,9 +3008,10 @@ def _run_reharvest_images(
     is **no liveness validation** — the consumer is the browser's
     ``--fetch-images`` cache step, which is itself the validator: a rotted URL
     just fails to download and the item keeps its category-icon fallback.
-    Coverage is partial by design (~24-30% catalogue-wide per the issue-19
-    probe; materially higher for Shopify-family shops). Returns counts:
-    targeted / emails / stamped / no_match."""
+    Coverage is partial by design (the ceiling is emails that carry a per-item
+    photo at all: Shopify-family + Amazon via tier 1, big-box template rows
+    via tier-2 context — issues #19/#28). Returns counts: targeted / emails /
+    stamped / no_match."""
     items = wardrobe.get("items") or []
     targets = _reharvest_targets(
         items, refresh=refresh, limit=limit, since=since, field="image_url")
@@ -2882,18 +3031,48 @@ def _run_reharvest_images(
     # stamped must not let the other claim "the" lone image as its own.
     per_email = Counter(
         it.get("order_email_id") for it in items if it.get("order_email_id"))
+    # Likewise the conflict guard (issue #28) sees existing stamps: a sibling
+    # already holding the URL a new match wants, under different name+colour
+    # tokens, is the same section-level-image signal. Existing stamps are
+    # never touched — only the new match is dropped.
+    stamped_claims: dict[str, list[tuple[frozenset, str]]] = {}
+    for it in items:
+        eid = it.get("order_email_id")
+        url = (it.get("image_url") or "").strip()
+        if eid and url:
+            stamped_claims.setdefault(eid, []).append((
+                _image_claim_tokens(it.get("item_name") or "", it.get("color") or ""),
+                url,
+            ))
+    targets_by_eid: dict[str, list[dict]] = {}
     for it in targets:
-        eid = it["order_email_id"]
-        url = _match_image(
-            it.get("item_name") or "",
-            images_by_msgid.get(eid) or [],
-            sole_item=per_email[eid] == 1,
-        )
-        if url:
-            it["image_url"] = url
-            stats["stamped"] += 1
-        else:
-            stats["no_match"] += 1
+        targets_by_eid.setdefault(it["order_email_id"], []).append(it)
+    for eid, batch in targets_by_eid.items():
+        cands = images_by_msgid.get(eid) or []
+        matched: list[tuple[dict, str | None]] = []
+        claims = list(stamped_claims.get(eid) or [])
+        for it in batch:
+            url = _match_image(
+                it.get("item_name") or "",
+                cands,
+                sole_item=per_email[eid] == 1,
+                color=it.get("color") or "",
+            )
+            matched.append((it, url))
+            if url:
+                claims.append((
+                    _image_claim_tokens(it.get("item_name") or "", it.get("color") or ""),
+                    url,
+                ))
+        conflicted = _conflicted_image_keys(claims)
+        for it, url in matched:
+            if url and _image_key(url) in conflicted:
+                url = None
+            if url:
+                it["image_url"] = url
+                stats["stamped"] += 1
+            else:
+                stats["no_match"] += 1
 
     log.info("reharvest-images: done — %s", stats)
     return stats
