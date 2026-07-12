@@ -3481,6 +3481,169 @@ class TestSearchImageTargets:
         assert [it["id"] for it in got] == ["c"]
 
 
+def _on_card(style_id, name, ccs):
+    """A minimal Old Navy product-listings result card. ``ccs`` is
+    [(cc_id, swatch_name), ...] — every card repeats the merged family."""
+    return {"id": style_id, "name": name, "colors": [
+        {"id": cid, "shortDescription": swatch,
+         "images": [
+             {"type": "P01", "absoluteUrl": f"https://img.test/{cid}_p01.jpg"},
+             {"type": "Z", "absoluteUrl": f"https://img.test/{cid}_z.jpg"},
+         ]}
+        for cid, swatch in ccs]}
+
+
+class TestOldNavyHelpers:
+    def test_squash_title_folds_punctuation_and_case(self):
+        assert order_scan._squash_title("So-Soft Crew-Neck Sweater") \
+            == order_scan._squash_title("SoSoft Crew-Neck Sweater")
+        assert order_scan._squash_title("Crew-Neck T-Shirt") \
+            != order_scan._squash_title("EveryWear Crew-Neck T-Shirt")
+
+    def test_norm_swatch_folds_curly_apostrophe(self):
+        assert order_scan._norm_swatch("A Stone’s Throw") \
+            == order_scan._norm_swatch("A Stone's Throw")
+
+    def test_swatch_fold_plural_and_grey(self):
+        assert order_scan._swatch_fold("Panthers") \
+            == order_scan._swatch_fold("Panther")
+        assert order_scan._swatch_fold("Dark Grey") \
+            == order_scan._swatch_fold("Dark Gray")
+
+    def test_product_url_keeps_pid_through_clean(self):
+        url = order_scan._clean_product_url(order_scan._onavy_product_url("407510042"))
+        assert url == "https://oldnavy.gap.com/browse/product.do?pid=407510042"
+
+    def test_image_url_priority(self):
+        cc = {"images": [
+            {"type": "P01", "absoluteUrl": "https://img.test/p01.jpg"},
+            {"type": "Z", "absoluteUrl": "https://img.test/z.jpg"},
+        ]}
+        assert order_scan._onavy_image_url(cc) == "https://img.test/z.jpg"
+        assert order_scan._onavy_image_url(
+            {"images": [{"type": "P01", "absoluteUrl": "https://img.test/p01.jpg"}]}
+        ) == "https://img.test/p01.jpg"
+        assert order_scan._onavy_image_url({"images": []}) is None
+
+
+class TestOldNavyStyleColourways:
+    def test_prefix_filter_drops_sibling_style_and_dedupes(self):
+        # "Panther" exists under both the Tapered (407510) and the Baggy
+        # (665118) style; every card repeats the merged family list.
+        family = [("407510022", "Panther"), ("665118022", "Panther"),
+                  ("407510042", "A Stone's Throw")]
+        products = [_on_card("407510", "Tapered Jogger Sweatpants", family),
+                    _on_card("665118", "Rotation Baggy Jogger Sweatpants", family)]
+        ccs = order_scan._onavy_style_colourways("407510", products)
+        assert sorted(ccs) == ["407510022", "407510042"]
+
+
+class TestOldNavyMatchColourway:
+    CCS = {
+        "1042": {"id": "1042", "shortDescription": "A Stone's Throw"},
+        "1022": {"id": "1022", "shortDescription": "Panther"},
+        "1012": {"id": "1012", "shortDescription": "Navy"},
+    }
+
+    def test_exact_swatch_wins(self):
+        cc = order_scan._onavy_match_colourway(self.CCS, "A Stone’s Throw")
+        assert cc is not None and cc["id"] == "1042"
+
+    def test_plural_folds(self):
+        cc = order_scan._onavy_match_colourway(self.CCS, "Panthers")
+        assert cc is not None and cc["id"] == "1022"
+
+    def test_unique_containment(self):
+        cc = order_scan._onavy_match_colourway(self.CCS, "Navy Blue")
+        assert cc is not None and cc["id"] == "1012"
+
+    def test_missing_swatch_is_none(self):
+        assert order_scan._onavy_match_colourway(self.CCS, "Wintry Waters") is None
+
+    def test_ambiguous_exact_is_none(self):
+        ccs = {"1": {"id": "1", "shortDescription": "Black"},
+               "2": {"id": "2", "shortDescription": "Black"}}
+        assert order_scan._onavy_match_colourway(ccs, "Black") is None
+
+    def test_no_colour_needs_single_colourway(self):
+        one = {"1": {"id": "1", "shortDescription": "Black"}}
+        assert order_scan._onavy_match_colourway(one, "") == one["1"]
+        assert order_scan._onavy_match_colourway(self.CCS, "") is None
+
+
+class TestOldNavyMatchStyle:
+    def test_exact_title_beats_token_tie_sibling(self):
+        # _tokens strips garment nouns, so "Tapered Jogger Sweatpants" and
+        # "Rotation Tapered Jogger Sweatpants" tie on tokens — the exact
+        # title tier must resolve it (the live probe's headline failure).
+        products = [
+            _on_card("407510", "Tapered Jogger Sweatpants",
+                     [("407510042", "A Stone's Throw")]),
+            _on_card("407522", "Rotation Tapered Jogger Sweatpants",
+                     [("407522012", "Dark Heather Gray")]),
+        ]
+        assert order_scan._onavy_match_style(
+            "Tapered Jogger Sweatpants", "A Stone's Throw", products) == "407510"
+
+    def test_exact_title_squash_normalised(self):
+        products = [_on_card("100200", "SoSoft Crew-Neck Sweater",
+                             [("100200012", "Gray")]),
+                    _on_card("100300", "SoSoft Cropped Crew-Neck Cardigan",
+                             [("100300012", "Gray")])]
+        assert order_scan._onavy_match_style(
+            "So-Soft Crew-Neck Sweater", "Gray", products) == "100200"
+
+    def test_ambiguous_exact_title_resolved_by_unique_swatch(self):
+        # Four live "Crew-Neck T-Shirt" families — only one carries the
+        # item's swatch, so the swatch disambiguates.
+        products = [
+            _on_card("855428", "Crew-Neck T-Shirt",
+                     [("855428012", "Raisin Arizona"), ("855428022", "Black")]),
+            _on_card("900100", "Crew-Neck T-Shirt",
+                     [("900100012", "White"), ("900100022", "Black")]),
+        ]
+        assert order_scan._onavy_match_style(
+            "Crew-Neck T-Shirt", "Raisin Arizona", products) == "855428"
+
+    def test_ambiguous_exact_title_shared_swatch_is_none(self):
+        products = [
+            _on_card("855428", "Crew-Neck T-Shirt", [("855428022", "Black")]),
+            _on_card("900100", "Crew-Neck T-Shirt", [("900100022", "Black")]),
+        ]
+        assert order_scan._onavy_match_style(
+            "Crew-Neck T-Shirt", "Black", products) is None
+
+    def test_token_tier_unique_top_score(self):
+        products = [
+            _on_card("111111", "Rotation Jogger Sweatpants",
+                     [("111111012", "Black")]),
+            _on_card("222222", "Dynamic Fleece 4.0 Joggers",
+                     [("222222012", "Black")]),
+        ]
+        assert order_scan._onavy_match_style(
+            "Rotation Sweatpants (Logo)", "Black", products) == "111111"
+
+    def test_token_tier_cross_style_tie_is_none(self):
+        products = [
+            _on_card("111111", "High-Waisted SoComfy Wide-Leg Sweatpants",
+                     [("111111012", "Wish Bone")]),
+            _on_card("222222", "High-Waisted SoComfy Jogger Sweatpants",
+                     [("222222012", "Wish Bone")]),
+        ]
+        assert order_scan._onavy_match_style(
+            "Extra High-Waisted SoComfy Sweatpants", "Wish Bone", products) is None
+
+    def test_same_style_repeated_cards_collapse(self):
+        card = _on_card("333333", "Garment-Dyed Rotation Tee",
+                        [("333333012", "Plum")])
+        products = [card, dict(card)]
+        assert order_scan._onavy_match_style(
+            "Garment-Dyed Rotation Tee Shirt", "Plum", products) == "333333"
+
+    def test_empty_products_is_none(self):
+        assert order_scan._onavy_match_style("Anything", "Black", []) is None
+
+
 class TestRunSearchImages:
     """End-to-end over a MockTransport: probe -> suggest -> colour -> stamp."""
 
@@ -3493,9 +3656,12 @@ class TestRunSearchImages:
             {"id": "2", "item_name": "Kireina Pants", "color": "Red",
              "shop": "Kidoriman", "shop_domain": "kidoriman.test",
              "purchased_at": "2026-01-02"},
-            {"id": "3", "item_name": "Old Navy Thing", "color": None,
-             "shop": "Oldnavy", "shop_domain": "walled.test",
+            {"id": "3", "item_name": "Walled Thing", "color": None,
+             "shop": "Bigbox", "shop_domain": "walled.test",
              "purchased_at": "2026-01-03"},
+            {"id": "4", "item_name": "Tapered Jogger Sweatpants",
+             "color": "A Stone's Throw", "shop": "Oldnavy",
+             "shop_domain": "oldnavy.com", "purchased_at": "2026-01-04"},
         ]}
 
     @staticmethod
@@ -3505,6 +3671,20 @@ class TestRunSearchImages:
             q = request.url.params.get("q", "")
             if host == "walled.test":
                 return httpx.Response(403)
+            if host == "api.gap.com" \
+                    and path == "/commerce/search/v2/product_listings":
+                kw = request.url.params.get("keyword", "")
+                products = []
+                if "Tapered Jogger" in kw:
+                    family = [("407510042", "A Stone's Throw"),
+                              ("407510022", "Panther"),
+                              ("665118022", "Panther")]
+                    products = [
+                        _on_card("407510", "Tapered Jogger Sweatpants", family),
+                        _on_card("665118", "Rotation Baggy Jogger Sweatpants",
+                                 family),
+                    ]
+                return httpx.Response(200, json={"products": products})
             if path == "/search/suggest.json":
                 if host == "bosuman.test" and "Raijin" in q:
                     return _suggest_response([{
@@ -3547,8 +3727,13 @@ class TestRunSearchImages:
         assert by_id["2"]["product_url"] == "https://kidoriman.test/products/kireina"
         # Non-Shopify (403) domain untouched:
         assert "image_url" not in by_id["3"]
-        assert stats == {"targeted": 3, "shopify_domains": 2, "stamped": 2,
-                         "product_urls": 2, "no_match": 0,
+        # Old Navy item: swatch-matched colourway image + pid PDP link:
+        assert by_id["4"]["image_url"] == "https://img.test/407510042_z.jpg"
+        assert by_id["4"]["product_url"] \
+            == "https://oldnavy.gap.com/browse/product.do?pid=407510042"
+        assert stats == {"targeted": 4, "shopify_domains": 2,
+                         "oldnavy_items": 1, "stamped": 3,
+                         "product_urls": 3, "no_match": 0,
                          "colour_unconfirmed": 0, "skipped_no_storefront": 1}
 
     def test_existing_product_url_not_overwritten(self, monkeypatch):

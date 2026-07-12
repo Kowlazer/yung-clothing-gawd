@@ -20,7 +20,7 @@ Usage::
     python -m src.order_scan --classify       # stamp garment category on items (issue #18)
     python -m src.order_scan --reharvest-urls # backfill product_url on old items (issue #23)
     python -m src.order_scan --reharvest-images # backfill image_url on old items (issue #19)
-    python -m src.order_scan --search-images  # image_url from the live storefront (issue #29)
+    python -m src.order_scan --search-images  # image_url from the live storefront (issues #29/#31)
     python -m src.order_scan --since 2023-01-01
     python -m src.order_scan --shop "Norse Projects"
     python -m src.order_scan --reprocess "Fabletics"  # recover a burned shop (see below)
@@ -121,6 +121,7 @@ import logging
 import os
 import re
 import sys
+import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from urllib.parse import (
@@ -894,8 +895,10 @@ _TRACKER_URL_PARAMS = ("url", "u", "destination", "redirect", "target", "ult")
 # The only query params worth keeping on a stored product URL. Everything else —
 # utm_*, click ids, and notably ``utm_contact`` (a base64 blob of the recipient's
 # EMAIL) — is marketing tracking that must NOT be persisted or shown. ``variant``
-# is kept because it selects the exact Shopify variant the item is.
-_KEEP_QUERY_PARAMS = frozenset({"variant"})
+# is kept because it selects the exact Shopify variant the item is; ``pid`` is
+# the Gap-family (Old Navy) PDP's colourway selector — the whole URL
+# (``/browse/product.do?pid=…``) is useless without it.
+_KEEP_QUERY_PARAMS = frozenset({"variant", "pid"})
 
 
 def _clean_product_url(url: str | None) -> str | None:
@@ -3092,9 +3095,9 @@ def _run_reharvest_images(
 # unauthenticated ``/search/suggest.json`` endpoint that returns product
 # matches WITH image and product URLs — no bot wall (verified live in the
 # issue-29 probe). Only live Shopify storefronts participate (probed once per
-# domain per run); big-box platforms (Old Navy / H&M / Amazon), dead shops,
-# and shops that delisted the item fall through untouched to the manual
-# paste-back rung.
+# domain per run); Old Navy has its own provider below (issue #31), while the
+# remaining big-box platforms (H&M / Amazon), dead shops, and shops that
+# delisted the item fall through untouched to the manual paste-back rung.
 #
 # Precision bar is the usual conservative matcher (unique top score, tie →
 # None, garment-category gate), plus one rule the probe forced: a matched
@@ -3279,6 +3282,217 @@ def _search_refined_image(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Old Navy storefront-search provider (issue #31 — image-gap phase C)
+# ---------------------------------------------------------------------------
+#
+# Old Navy isn't Shopify, so the suggest rung above can't reach its ~59
+# icon-only items. Its search page is a Next.js shell of skeleton cards —
+# the products hydrate client-side from a public JSON API on api.gap.com
+# (``/commerce/search/v2/product_listings``, the exact request captured off
+# the live site in the issue-31 probe), which answers plain httpx with a
+# browser UA from a residential IP. Each result card carries the full merged
+# colourway family: ``colors[]`` entries whose ``shortDescription`` is the
+# OFFICIAL swatch name — exactly the colour string the order emails put on
+# the user's items ("A Stone's Throw", "Moire Navy") — plus typed image URLs
+# and a cc id whose prefix is the owning style id.
+#
+# Matching is precision-first, tuned on a full live dry-run of all 59 items:
+#  * Titles are too generic for the token matcher alone (``_tokens`` strips
+#    garment nouns + cut words, so "Tapered Jogger Sweatpants" keeps only
+#    "tapered" and ties against "Rotation Tapered Jogger Sweatpants"). An
+#    exact squash-normalised TITLE tier therefore runs first; identical
+#    titles spanning several style ids (four current "Crew-Neck T-Shirt"
+#    families) are resolved only when exactly one of them carries the item's
+#    swatch. The token tier is the fallback, its tie collapsed only when all
+#    tied cards are one style.
+#  * A card's ``colors`` list spans the whole merged family ACROSS styles
+#    ("Panther" exists under both the Tapered and the Baggy style), so
+#    colourway candidates are prefix-filtered to the matched style before
+#    the swatch-name match (exact, then s-folded token equality, then
+#    unique containment — "Navy Blue" ⊃ "Navy"). No confirmable swatch ⇒ no
+#    stamp, the #29 discipline.
+# Probe yield: 20/59 — the residual is delisted colourways/products and the
+# genuinely ambiguous crew-neck families, which stay on the manual rung.
+
+_ONAVY_DOMAINS = frozenset({"oldnavy.com", "oldnavy.gap.com"})
+_ONAVY_API = "https://api.gap.com/commerce/search/v2/product_listings"
+# Sent on top of the client's _VALIDATE_HEADERS — the API is same-config
+# with the storefront and expects a browser-shaped CORS context.
+_ONAVY_API_HEADERS = {
+    "Accept": "application/json",
+    "Referer": "https://oldnavy.gap.com/",
+    "Origin": "https://oldnavy.gap.com",
+}
+_ONAVY_PAGE_SIZE = 30    # exact-title cards can rank low; top-10 missed some
+_ONAVY_SWATCH_LIMIT = 50  # never cap the colourway family (largest seen: 11)
+# Image types per colourway, best first: Z is the PDP zoom shot (~400 KB
+# jpg), P01 the grid card; the trailing types are progressively smaller.
+_ONAVY_IMAGE_PRIORITY = (
+    "Z", "zoomImage", "pristineImage", "P01", "thumbImage", "VLI",
+)
+
+
+def _onavy_search_products(
+    client, query: str, client_id: str,
+) -> list[dict] | None:
+    """Result cards from Old Navy's product-listings search API.
+
+    ``None`` on any non-200 / unexpected shape (treated like the Shopify
+    rung's "not a storefront we can ask") — an empty list is a real
+    no-hits answer."""
+    params = {
+        "pageSize": str(_ONAVY_PAGE_SIZE), "pageNumber": "0",
+        "redirectEnabled": "true", "keyword": query,
+        "searchVendor": "constructorio", "client_id": client_id,
+        "session_id": "1", "swatchLimit": str(_ONAVY_SWATCH_LIMIT),
+        "brand": "on", "locale": "en_US", "market": "us",
+    }
+    try:
+        resp = client.get(_ONAVY_API, params=params, headers=_ONAVY_API_HEADERS)
+        if resp.status_code != 200:
+            return None
+        products = resp.json().get("products")
+    except Exception:  # noqa: BLE001 — any surprise shape ⇒ no answer
+        return None
+    return products if isinstance(products, list) else None
+
+
+def _squash_title(text: str) -> str:
+    """Case/punctuation/space-blind title key — "So-Soft" == "SoSoft"."""
+    text = unicodedata.normalize("NFKC", text or "").casefold()
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _norm_swatch(text: str) -> str:
+    """Swatch name normalised for exact comparison (curly apostrophes and
+    case folded, punctuation-insensitive word split)."""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.replace("’", "'").casefold()
+    return " ".join(re.findall(r"[a-z0-9']+", text))
+
+
+def _swatch_fold(text: str) -> frozenset[str]:
+    """Swatch tokens with plural-s and spelling variants folded, so the
+    item's "Panthers" matches the swatch "Panther" and "Grey" "Gray"."""
+    out = set()
+    for t in re.findall(r"[a-z0-9]+", _norm_swatch(text)):
+        base = t.rstrip("s") or t
+        out.add(_COLOUR_SYNONYMS.get(base, base))
+    return frozenset(out)
+
+
+def _onavy_style_colourways(style_id: str, products: list[dict]) -> dict[str, dict]:
+    """The matched style's own colourways, deduped by cc id.
+
+    Every card repeats the merged family's full ``colors`` list, and a
+    family spans style ids — the cc-id prefix (style id + 3-digit suffix)
+    is what says which style a colourway actually belongs to."""
+    out: dict[str, dict] = {}
+    for p in products:
+        for c in p.get("colors") or []:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("id") or "")
+            if cid.startswith(style_id) and len(cid) == len(style_id) + 3:
+                out.setdefault(cid, c)
+    return out
+
+
+def _onavy_match_colourway(ccs: dict[str, dict], colour: str) -> dict | None:
+    """The single colourway whose swatch name matches the item's colour.
+
+    Exact normalised equality first, then s-folded token-set equality,
+    then unique containment either way ("Navy Blue" accepts the swatch
+    "Navy"). Any ambiguity ⇒ ``None`` — no stamp beats a wrong-colour
+    photo. An item with no colour matches only a single-colourway style."""
+    want = _norm_swatch(colour)
+    if not want:
+        return next(iter(ccs.values())) if len(ccs) == 1 else None
+    exact = [c for c in ccs.values()
+             if _norm_swatch(str(c.get("shortDescription") or "")) == want]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+    want_toks = _swatch_fold(colour)
+    folded = [c for c in ccs.values()
+              if _swatch_fold(str(c.get("shortDescription") or "")) == want_toks]
+    if folded:
+        return folded[0] if len(folded) == 1 else None
+    contain = []
+    for c in ccs.values():
+        toks = _swatch_fold(str(c.get("shortDescription") or ""))
+        if toks and (toks <= want_toks or want_toks <= toks):
+            contain.append(c)
+    return contain[0] if len(contain) == 1 else None
+
+
+def _onavy_match_style(
+    item_name: str, colour: str, products: list[dict],
+) -> str | None:
+    """The single unambiguous style id for the item, or ``None``.
+
+    Tier 0: exact squash-normalised title; several styles sharing the
+    title resolve only if exactly one carries the item's swatch. Tier 1:
+    the #29 token-overlap match (unique top score), a tie tolerated only
+    when every tied card is the same style."""
+    want = _squash_title(item_name)
+    exact_styles: list[str] = []
+    if want:
+        for p in products:
+            sid = str(p.get("id") or "")
+            if sid and sid not in exact_styles \
+                    and _squash_title(str(p.get("name") or "")) == want:
+                exact_styles.append(sid)
+    if len(exact_styles) == 1:
+        return exact_styles[0]
+    if len(exact_styles) > 1:
+        with_swatch = [
+            sid for sid in exact_styles
+            if _onavy_match_colourway(
+                _onavy_style_colourways(sid, products), colour) is not None
+        ]
+        return with_swatch[0] if len(with_swatch) == 1 else None
+    name_tokens = _tokens(item_name)
+    if not name_tokens or not products:
+        return None
+    item_cats = _garment_categories(item_name)
+    scored: list[tuple[int, dict]] = []
+    for p in products:
+        title = str(p.get("name") or "")
+        overlap = len(name_tokens & _tokens(title))
+        if overlap < _PRODUCT_URL_MIN_OVERLAP:
+            continue
+        if item_cats:
+            title_cats = _garment_categories(title)
+            if title_cats and not (item_cats & title_cats) and overlap < 2:
+                continue
+        scored.append((overlap, p))
+    if not scored:
+        return None
+    best = max(score for score, _ in scored)
+    styles = {str(p.get("id") or "") for score, p in scored if score == best}
+    return next(iter(styles)) if len(styles) == 1 else None
+
+
+def _onavy_image_url(cc: dict) -> str | None:
+    """The best stampable image URL a colourway offers."""
+    imgs = {
+        str(i.get("type")): str(i.get("absoluteUrl") or "")
+        for i in cc.get("images") or []
+        if isinstance(i, dict) and i.get("absoluteUrl")
+    }
+    for t in _ONAVY_IMAGE_PRIORITY:
+        if imgs.get(t):
+            return imgs[t]
+    return None
+
+
+def _onavy_product_url(cc_id: str) -> str:
+    """The colourway's PDP link (pid selects the colourway; kept by
+    ``_clean_product_url`` via ``_KEEP_QUERY_PARAMS``)."""
+    return f"https://oldnavy.gap.com/browse/product.do?pid={quote(cc_id)}"
+
+
 def _search_image_targets(
     items: list[dict], *, image_dir: str | None, limit: int | None,
     shop: str | None,
@@ -3316,16 +3530,18 @@ def _run_search_images(
     http_client=None,
 ) -> dict:
     """Backfill ``image_url`` (and opportunistically ``product_url``) on
-    icon-only items from their shop's own storefront search (issue #29).
+    icon-only items from their shop's own storefront search (issue #29;
+    Old Navy provider issue #31).
 
     Mutates ``wardrobe["items"]`` in place. Sequential with jitter — this is
     a local manual command hitting each shop a handful of times, not the
-    concurrent extractor. Suggest responses are cached per (domain, query)
+    concurrent extractor. Search responses are cached per (domain, query)
     so duplicate purchases of one design cost one request. Returns counts:
-    targeted / shopify_domains / stamped / product_urls / no_match /
-    colour_unconfirmed / skipped_no_storefront."""
+    targeted / shopify_domains / oldnavy_items / stamped / product_urls /
+    no_match / colour_unconfirmed / skipped_no_storefront."""
     import random
     import time
+    import uuid
 
     import httpx
 
@@ -3333,9 +3549,9 @@ def _run_search_images(
     targets = _search_image_targets(
         items, image_dir=image_dir, limit=limit, shop=shop)
     stats = {
-        "targeted": len(targets), "shopify_domains": 0, "stamped": 0,
-        "product_urls": 0, "no_match": 0, "colour_unconfirmed": 0,
-        "skipped_no_storefront": 0,
+        "targeted": len(targets), "shopify_domains": 0, "oldnavy_items": 0,
+        "stamped": 0, "product_urls": 0, "no_match": 0,
+        "colour_unconfirmed": 0, "skipped_no_storefront": 0,
     }
     if not targets:
         return stats
@@ -3350,6 +3566,8 @@ def _run_search_images(
 
     shopify: dict[str, bool] = {}
     suggest_cache: dict[tuple[str, str], list[dict] | None] = {}
+    onavy_client_id = str(uuid.uuid4())  # one browser-like identity per run
+    onavy_cache: dict[str, list[dict] | None] = {}
 
     def _paced_suggest(domain: str, query: str) -> list[dict] | None:
         key = (domain, query)
@@ -3358,12 +3576,56 @@ def _run_search_images(
             suggest_cache[key] = _shopify_suggest_products(client, domain, query)
         return suggest_cache[key]
 
+    def _paced_onavy_search(query: str) -> list[dict] | None:
+        if query not in onavy_cache:
+            _pace()
+            onavy_cache[query] = _onavy_search_products(
+                client, query, onavy_client_id)
+        return onavy_cache[query]
+
+    def _stamp(it: dict, name: str, image_url: str, title, product_url) -> None:
+        it["image_url"] = _heic_safe(image_url)
+        stats["stamped"] += 1
+        log.info("search-images: %s / %s -> %s", it.get("shop"), name, title)
+        if product_url and not (it.get("product_url") or "").strip():
+            purl = _clean_product_url(product_url)
+            if purl:
+                it["product_url"] = purl
+                stats["product_urls"] += 1
+
     try:
         for it in targets:
             raw_domain = (it.get("shop_domain") or "").lower()
             domain = _SHOP_DOMAIN_ALIASES.get(raw_domain, raw_domain)
             if not domain:
                 stats["skipped_no_storefront"] += 1
+                continue
+            if domain in _ONAVY_DOMAINS:
+                stats["oldnavy_items"] += 1
+                name = (it.get("item_name") or "").strip()
+                if not name:
+                    stats["no_match"] += 1
+                    continue
+                products = _paced_onavy_search(name) or []
+                colour = (it.get("color") or "").strip()
+                style_id = _onavy_match_style(name, colour, products)
+                if style_id is None:
+                    stats["no_match"] += 1
+                    continue
+                cc = _onavy_match_colourway(
+                    _onavy_style_colourways(style_id, products), colour)
+                if cc is None:
+                    stats["colour_unconfirmed"] += 1
+                    continue
+                img = _onavy_image_url(cc)
+                if not img:
+                    stats["no_match"] += 1
+                    continue
+                _stamp(
+                    it, name, img,
+                    f"{style_id} {cc.get('shortDescription')}",
+                    _onavy_product_url(str(cc.get("id") or "")),
+                )
                 continue
             if domain not in shopify:
                 shopify[domain] = _paced_suggest(domain, "tee") is not None
@@ -3392,18 +3654,8 @@ def _run_search_images(
             if img is None:
                 stats["colour_unconfirmed"] += 1
                 continue
-            it["image_url"] = _heic_safe(img)
-            stats["stamped"] += 1
-            log.info(
-                "search-images: %s / %s -> %s",
-                it.get("shop"), name, hit.get("title"),
-            )
-            if not (it.get("product_url") or "").strip():
-                purl = _clean_product_url(
-                    _absolute_shop_url(str(hit.get("url") or ""), domain))
-                if purl:
-                    it["product_url"] = purl
-                    stats["product_urls"] += 1
+            _stamp(it, name, img, hit.get("title"),
+                   _absolute_shop_url(str(hit.get("url") or ""), domain))
     finally:
         if own:
             client.close()
@@ -3779,10 +4031,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "shop's own storefront search — Shopify's public suggest "
              "endpoint, matched by product title with the usual tie->None "
              "matcher and colour-confirmed against the product's variants "
-             "(issue #29). A matched product also donates `product_url` when "
-             "the item lacks one. Local-only; sequential + jittered. Composes "
-             "with --limit / --shop / --image-dir / --dry-run. No Gmail "
-             "needed.",
+             "(issue #29); Old Navy via its public product-listings search "
+             "API, colourway-matched by official swatch name (issue #31). "
+             "A matched product also donates `product_url` when the item "
+             "lacks one. Local-only; sequential + jittered. Composes with "
+             "--limit / --shop / --image-dir / --dry-run. No Gmail needed.",
     )
     p.add_argument(
         "--image-dir", default="images", metavar="DIR",
