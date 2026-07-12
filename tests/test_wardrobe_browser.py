@@ -8,6 +8,8 @@ The HTTP server is not exercised here.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from src import wardrobe_browser as wb
@@ -156,8 +158,23 @@ def test_image_url_none_without_dir():
 
 def test_image_url_finds_cached_file(tmp_path):
     (tmp_path / "abc123.png").write_bytes(b"x")
-    assert wb._image_url("abc123", tmp_path) == "/images/abc123.png"
+    url = wb._image_url("abc123", tmp_path)
+    # A ?v=<mtime> cache-buster is appended so an in-place photo replace still
+    # changes the URL (see _image_url's docstring); the path is otherwise stable.
+    assert url.split("?", 1)[0] == "/images/abc123.png"
+    assert url.startswith("/images/abc123.png?v=")
     assert wb._image_url("missing", tmp_path) is None
+
+
+def test_image_url_cache_buster_changes_on_rewrite(tmp_path):
+    f = tmp_path / "abc123.png"
+    f.write_bytes(b"old")
+    before = wb._image_url("abc123", tmp_path)
+    st = f.stat()                   # bump mtime by 1s so the two URLs must differ
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    after = wb._image_url("abc123", tmp_path)
+    assert before != after
+    assert before.split("?", 1)[0] == after.split("?", 1)[0]
 
 
 # --------------------------------------------------------------------------
@@ -1016,7 +1033,7 @@ class TestAddImage:
         item = written["wardrobe"]["items"][0]
         assert item["image_url"] == "https://cdn.x/tee.jpg"
         assert "product_url" not in item          # direct path donates nothing
-        assert payload["items"][0]["image"] == "/images/a.jpg"
+        assert payload["items"][0]["image"].split("?", 1)[0] == "/images/a.jpg"
 
     def test_page_url_extracts_og_image_and_donates_product_url(
             self, tmp_path, monkeypatch):
@@ -1132,7 +1149,7 @@ class TestUploadImage:
         # path must never touch the Gist (it would blow up on fake creds).
         payload = self._cat(tmp_path).upload_image("a", "photo.png", "image/png", b"PNG")
         assert (tmp_path / "a.png").read_bytes() == b"PNG"
-        assert payload["items"][0]["image"] == "/images/a.png"
+        assert payload["items"][0]["image"].split("?", 1)[0] == "/images/a.png"
 
     def test_upload_ext_from_filename_when_ctype_unhelpful(self, tmp_path):
         self._cat(tmp_path).upload_image(
@@ -1179,7 +1196,7 @@ def test_image_file_route_uploads(tmp_path):
             content=b"PNGBYTES", headers={"Content-Type": "image/png"},
             timeout=5.0)
         assert r.status_code == 200
-        assert r.json()["items"][0]["image"] == "/images/a.png"
+        assert r.json()["items"][0]["image"].split("?", 1)[0] == "/images/a.png"
         assert (tmp_path / "a.png").read_bytes() == b"PNGBYTES"
         # Unknown id → clean JSON 404, not a traceback.
         r = httpx.post(

@@ -238,13 +238,22 @@ def _image_url(item_id: str, image_dir: Path | None) -> str | None:
     The ``--fetch-images`` step writes ``<image_dir>/<id>.<ext>``; this
     surfaces it as ``/images/<file>`` so the frontend can show the real
     product photo instead of a category icon. Empty/absent dir -> always None.
+
+    The URL carries a ``?v=<mtime_ns>`` cache-buster. Replacing a photo in
+    place keeps the same id + extension, so the path is byte-identical; the
+    browser then reuses the already-decoded same-URL image from its in-page
+    memory cache (which ``Cache-Control: no-store`` does not govern) and shows
+    the old photo until a full reload. Keying the URL on the file's mtime makes
+    a rewrite yield a new URL — while identical bytes keep a stable mtime, so
+    nothing re-downloads needlessly. The server strips the query before serving
+    (see ``_serve_image``).
     """
     if not image_dir:
         return None
     for ext in _IMAGE_FILE_EXTS:
         f = image_dir / f"{item_id}.{ext}"
         if f.is_file():
-            return f"/images/{f.name}"
+            return f"/images/{f.name}?v={f.stat().st_mtime_ns}"
     return None
 
 
