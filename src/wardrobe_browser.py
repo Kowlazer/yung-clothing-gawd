@@ -16,8 +16,10 @@ Local-only by design (no GitHub Actions workflow). Only ``GITHUB_TOKEN`` and
 ``GIST_ID`` are read from the environment (via ``.env``) — the full pipeline
 config is not required, so the browser runs even when other secrets are absent.
 
-**Read-only.** The browser never writes the Gist; it only GETs it. ``Refresh``
-re-fetches the latest catalogue.
+Reads are GETs against the Gist; ``Refresh`` re-fetches the latest catalogue.
+Interactive writes go through the local server: category edits and manual
+image adds write the Gist read-modify-write style, fit reviews forward to the
+Apps Script web app, and image-file uploads touch only the local cache.
 
 Garment categorisation prefers a **durable stored ``category``** stamped by
 ``order_scan`` (the Claude extraction at scan time, or the ``--classify``
@@ -34,9 +36,12 @@ Product images (issue #19): ``order_scan`` stamps ``image_url`` on items from
 their order-confirmation emails (scan-time + the ``--reharvest-images``
 backfill); ``--fetch-images`` downloads those into a local ``--image-dir``
 cache (default ``./images``, gitignored) served at ``/images/<id>.<ext>``.
-Coverage is partial by design (~24-30% of the catalogue attributes cleanly —
-see the issue-19 probe); items without a cached photo fall back to a
-per-category icon rendered client-side.
+Items without a cached photo fall back to a per-category icon rendered
+client-side. The manual paste-back rung (issue #30) covers what no automation
+reaches: the detail panel's "Add photo" inputs accept a product-page URL
+(og:image + product_url double-stamp), a direct image URL, or a file upload
+(cache-only, no Gist write), and a "No photo" work-queue filter surfaces the
+remaining icon-only items.
 """
 
 from __future__ import annotations
@@ -54,7 +59,7 @@ from collections import Counter
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 from src import fit_links, review_requests, state
 from src.wardrobe_categories import (
@@ -275,6 +280,44 @@ def _ext_from_image_url(url: str) -> str | None:
     return None
 
 
+def _save_image_bytes(item_id: str, ext: str, content: bytes, image_dir: Path) -> str:
+    """Write ``<image_dir>/<item_id>.<ext>``, returning the filename.
+
+    One file per id: other-extension leftovers are dropped first so a format
+    change (or a manual image replacing an old cached one) can't leave a stale
+    .jpg shadowing the new .png in ``_image_url``'s probe order."""
+    image_dir.mkdir(parents=True, exist_ok=True)
+    for old in _IMAGE_FILE_EXTS:
+        stale = image_dir / f"{item_id}.{old}"
+        if old != ext and stale.is_file():
+            stale.unlink()
+    f = image_dir / f"{item_id}.{ext}"
+    f.write_bytes(content)
+    return f.name
+
+
+def _download_image(client, url: str, item_id: str, image_dir: Path) -> str | None:
+    """GET ``url`` and cache it as ``<item_id>.<ext>`` when it's a real image.
+
+    The shared validation rung for ``fetch_images`` and the manual add-image
+    paths: HTTP 200, an image/* (or absent) content-type, and a known extension
+    mapped from the content-type or the URL. A 200 that isn't an image (CDN
+    error page) is never written. Returns the cached filename, or ``None`` when
+    the response isn't usable; network errors propagate to the caller."""
+    resp = client.get(url)
+    ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    ext = _IMAGE_CONTENT_TYPES.get(ctype) or _ext_from_image_url(url)
+    ok = (
+        resp.status_code == 200 and resp.content and ext
+        and (not ctype or ctype.startswith("image/"))
+    )
+    if not ok:
+        log.info("fetch-images: %s -> %s (%s) — skipped",
+                 item_id, resp.status_code, ctype or "no content-type")
+        return None
+    return _save_image_bytes(item_id, ext, resp.content, image_dir)
+
+
 # Amazon order emails embed 90px thumbnails (``..._SS90_.jpg``). The size token
 # is a render instruction on the same image id, so rewriting it requests the
 # identical photo at a usable size. Live-checked 2026-07-10.
@@ -339,31 +382,10 @@ def fetch_images(
             written = False
             for attempt in filter(None, (upgraded, url)):
                 try:
-                    resp = client.get(attempt)
-                    ctype = (resp.headers.get("content-type") or "") \
-                        .split(";")[0].strip().lower()
-                    ext = _IMAGE_CONTENT_TYPES.get(ctype) \
-                        or _ext_from_image_url(attempt)
-                    ok = (
-                        resp.status_code == 200 and resp.content and ext
-                        and (not ctype or ctype.startswith("image/"))
-                    )
-                    if not ok:
-                        log.info("fetch-images: %s -> %s (%s) — skipped",
-                                 item_id, resp.status_code,
-                                 ctype or "no content-type")
-                        continue
-                    # One file per id: drop other-extension leftovers so a
-                    # --refresh that changes format can't leave a stale .jpg
-                    # shadowing the new .png in _image_url's probe order.
-                    for old in _IMAGE_FILE_EXTS:
-                        stale = image_dir / f"{item_id}.{old}"
-                        if old != ext and stale.is_file():
-                            stale.unlink()
-                    (image_dir / f"{item_id}.{ext}").write_bytes(resp.content)
-                    stats["downloaded"] += 1
-                    written = True
-                    break
+                    if _download_image(client, attempt, item_id, image_dir):
+                        stats["downloaded"] += 1
+                        written = True
+                        break
                 except Exception as exc:  # noqa: BLE001 — per-item isolation
                     log.info("fetch-images: %s failed: %s", item_id, exc)
             if not written:
@@ -373,6 +395,104 @@ def fetch_images(
         if own:
             client.close()
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Manual add-image paths (issue #30 — image-gap phase B)
+# ---------------------------------------------------------------------------
+# The paste-back rung for the ~150 items automation can't reach (issues
+# #19/#28/#29 ran to their ceilings): the user pastes a product-page URL, a
+# direct image URL, or uploads a file, from the detail panel. Page fetches run
+# from this machine (residential IP), so shops that bot-wall the Actions IP
+# fetch fine here.
+
+# Browser-shaped headers for the product-page fetch (same UA as the image
+# fetch; an HTML Accept so strict origins don't 406 an image-only Accept).
+_PAGE_FETCH_HEADERS = {
+    "User-Agent": _IMAGE_FETCH_HEADERS["User-Agent"],
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Uploads: bound the request body so a mispasted video can't balloon the cache.
+_UPLOAD_MAX_BYTES = 15 * 1024 * 1024
+
+_META_TAG_RE = re.compile(r"<meta\s[^>]*?/?>", re.IGNORECASE | re.DOTALL)
+_META_ATTR_RE = re.compile(
+    r"""([a-zA-Z:_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+_JSONLD_RE = re.compile(
+    r"<script[^>]+type\s*=\s*[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _meta_attrs(tag: str) -> dict[str, str]:
+    # findall yields '' (not None) for the non-participating quote group.
+    return {k.lower(): (v1 or v2 or "") for k, v1, v2 in _META_ATTR_RE.findall(tag)}
+
+
+def _jsonld_image_value(node) -> str | None:
+    """First usable ``image`` URL anywhere inside a parsed JSON-LD node."""
+    if isinstance(node, dict):
+        img = node.get("image")
+        if img is not None:
+            found = _image_url_from_jsonld_field(img)
+            if found:
+                return found
+        for v in node.values():
+            found = _jsonld_image_value(v)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for v in node:
+            found = _jsonld_image_value(v)
+            if found:
+                return found
+    return None
+
+
+def _image_url_from_jsonld_field(img) -> str | None:
+    """The URL out of a JSON-LD ``image`` field: str, list, or ImageObject."""
+    if isinstance(img, str):
+        return img.strip() or None
+    if isinstance(img, list):
+        for entry in img:
+            found = _image_url_from_jsonld_field(entry)
+            if found:
+                return found
+        return None
+    if isinstance(img, dict):
+        for key in ("url", "contentUrl"):
+            val = img.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def extract_page_image(html: str) -> str | None:
+    """The product photo URL declared by a product page, or ``None``.
+
+    Deliberately dumb (no HTML parser dependency): ``og:image`` meta first —
+    the near-universal product-page convention, attribute order tolerated —
+    then any JSON-LD block's ``image`` field. Entity-unescaped; the caller
+    resolves relative URLs against the page URL."""
+    import html as html_mod
+
+    for tag in _META_TAG_RE.findall(html or ""):
+        attrs = _meta_attrs(tag)
+        if (attrs.get("property") or attrs.get("name")) == "og:image":
+            content = html_mod.unescape(attrs.get("content") or "").strip()
+            if content:
+                return content
+    for m in _JSONLD_RE.finditer(html or ""):
+        try:
+            data = json.loads(m.group(1).strip())
+        except ValueError:
+            continue
+        found = _jsonld_image_value(data)
+        if found:
+            return html_mod.unescape(found)
+    return None
 
 
 _HREF_RE = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
@@ -644,6 +764,25 @@ def apply_category_edit(wardrobe: dict, item_id: str, category: str) -> dict | N
     return None
 
 
+def apply_image_edit(
+    wardrobe: dict, item_id: str, image_url: str, *, product_url: str | None = None,
+) -> dict | None:
+    """Stamp a manually-supplied ``image_url`` on one wardrobe item, in place.
+
+    Mirrors :func:`apply_category_edit`. When ``product_url`` is given and the
+    item has none, it's donated too (the paste-a-product-page path recovers
+    both, same double payoff as the storefront search — issue #29). An existing
+    ``product_url`` is never overwritten. Returns the edited raw item dict, or
+    ``None`` when the id isn't found."""
+    for it in (wardrobe.get("items") or []):
+        if it.get("id") == item_id:
+            it["image_url"] = image_url
+            if product_url and not (it.get("product_url") or "").strip():
+                it["product_url"] = product_url
+            return it
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Data source
 # ---------------------------------------------------------------------------
@@ -740,15 +879,21 @@ class _Catalogue:
         self._rr_days = review_request_days
         self._lock = threading.Lock()
         self._payload: dict = {}
+        # Last raw wardrobe seen (any read or write path) — lets a cache-only
+        # write (image upload) rebuild the served payload without a Gist
+        # round-trip. The payload lock guards it alongside the payload.
+        self._wardrobe: dict | None = None
         # Review-request cache (own lock so a slow IMAP fetch never blocks the
         # payload lock): (result_dict, fetched_at_monotonic).
         self._rr_lock = threading.Lock()
         self._rr_cache: dict | None = None
         self._rr_at = 0.0
 
-    def _store(self, payload: dict) -> dict:
+    def _store(self, payload: dict, wardrobe: dict | None = None) -> dict:
         with self._lock:
             self._payload = payload
+            if wardrobe is not None:
+                self._wardrobe = wardrobe
         return payload
 
     def refresh(self) -> dict:
@@ -757,7 +902,7 @@ class _Catalogue:
         # frontend re-requests them right after a refresh).
         with self._rr_lock:
             self._rr_cache = None
-        return self._store(build_payload(wardrobe, self._image_dir))
+        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
 
     def edit_category(self, item_id: str, category: str) -> dict:
         """Persist a manual category to the Gist (read-modify-write), re-render.
@@ -784,7 +929,127 @@ class _Catalogue:
             codes=st.get("codes") or [],
             wardrobe=wardrobe,
         )
-        return self._store(build_payload(wardrobe, self._image_dir))
+        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+
+    def add_image(self, body: dict) -> dict:
+        """Manually attach a product photo from a pasted URL (issue #30).
+
+        Two paste paths, exclusive (``image_url`` wins when both arrive):
+
+        * ``page_url`` — fetch the product page from this machine (residential
+          IP, so shops that bot-wall the Actions IP work), extract its
+          ``og:image`` / JSON-LD image, download that into the local cache, and
+          stamp ``image_url`` = the extracted URL plus ``product_url`` = the
+          cleaned page URL when the item lacks one.
+        * ``image_url`` — download + stamp directly. The Amazon workhorse
+          (right-click the order-history photo → copy image address); Amazon
+          product *pages* are bot-walled even locally, their image CDN isn't.
+
+        The download is the validation (same rung as ``--fetch-images``): a
+        URL that doesn't yield real image bytes stamps nothing. Raises
+        ``ValueError`` for bad input / an unusable URL, ``KeyError`` for an
+        unknown id — mapped to clean JSON errors by the route handler."""
+        if not self._image_dir:
+            raise RuntimeError("no image directory configured (--image-dir)")
+        item_id = (body.get("id") or "").strip()
+        if not item_id:
+            raise ValueError("missing item id")
+        page_url = (body.get("page_url") or "").strip()
+        image_url = (body.get("image_url") or "").strip()
+        chosen = image_url or page_url
+        if not chosen:
+            raise ValueError("paste a product-page URL or a direct image URL")
+        if not chosen.startswith(("http://", "https://")):
+            raise ValueError("that doesn't look like an http(s) URL")
+
+        import httpx
+
+        from src.order_scan import _clean_product_url, _heic_safe
+
+        product_url: str | None = None
+        with httpx.Client(
+            follow_redirects=True, timeout=30.0, headers=_IMAGE_FETCH_HEADERS,
+        ) as client:
+            if not image_url:
+                try:
+                    resp = client.get(page_url, headers=_PAGE_FETCH_HEADERS)
+                except Exception as exc:
+                    raise ValueError(f"couldn't fetch that page: {exc}") from exc
+                if resp.status_code != 200:
+                    raise ValueError(
+                        f"page fetch failed (HTTP {resp.status_code})")
+                found = extract_page_image(resp.text)
+                if not found:
+                    raise ValueError(
+                        "no product image found on that page — try pasting the "
+                        "image URL directly (right-click the photo → copy image "
+                        "address)")
+                # Relative og:image is rare but cheap to resolve; the final
+                # (post-redirect) page URL is the right base.
+                image_url = urljoin(str(resp.url), found)
+                product_url = _clean_product_url(page_url)
+            image_url = _heic_safe(image_url)
+            try:
+                saved = _download_image(client, image_url, item_id, self._image_dir)
+            except Exception as exc:
+                raise ValueError(f"couldn't download that image: {exc}") from exc
+        if not saved:
+            raise ValueError(
+                "that URL didn't return an image (jpg/png/webp/gif) — check it "
+                "opens as a bare photo in a browser tab")
+
+        # Stamp the Gist (read-modify-write, same pattern as edit_category).
+        st = state.read_state(self._gist_id, self._token, fresh=True)
+        wardrobe = st.get("wardrobe") or {}
+        item = apply_image_edit(
+            wardrobe, item_id, image_url, product_url=product_url)
+        if item is None:
+            # Unknown id: drop the just-written cache file so a bogus request
+            # can't leave an orphan that _image_url would happily serve.
+            stale = self._image_dir / saved
+            if stale.is_file():
+                stale.unlink()
+            raise KeyError(item_id)
+        state.write_state(
+            self._gist_id, self._token,
+            prices=st.get("prices") or {},
+            aliases=st.get("aliases") or {},
+            codes=st.get("codes") or [],
+            wardrobe=wardrobe,
+        )
+        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+
+    def upload_image(
+        self, item_id: str, filename: str, content_type: str, content: bytes,
+    ) -> dict:
+        """Save an uploaded image file into the local cache (issue #30).
+
+        **Cache-only — zero Gist writes.** ``build_payload`` surfaces a cached
+        file by item id regardless of the ``image_url`` stamp, and cache
+        presence is exactly what stops ``order_scan --search-images`` from
+        re-targeting the item. For dead-shop items whose photo only survives as
+        a screenshot/Google/Reddit find."""
+        if not self._image_dir:
+            raise RuntimeError("no image directory configured (--image-dir)")
+        item_id = (item_id or "").strip()
+        if not item_id:
+            raise ValueError("missing item id")
+        if not content:
+            raise ValueError("empty file")
+        ctype = (content_type or "").split(";")[0].strip().lower()
+        ext = _IMAGE_CONTENT_TYPES.get(ctype) or _ext_from_image_url(filename or "")
+        if not ext:
+            raise ValueError("unsupported image type — use jpg/png/webp/gif")
+        with self._lock:
+            wardrobe = self._wardrobe
+        known = {
+            (it.get("id") or "").strip()
+            for it in ((wardrobe or {}).get("items") or [])
+        }
+        if item_id not in known:
+            raise KeyError(item_id)
+        _save_image_bytes(item_id, ext, content, self._image_dir)
+        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
 
     @property
     def fit_enabled(self) -> bool:
@@ -821,7 +1086,7 @@ class _Catalogue:
             raise RuntimeError(data.get("error") or "Apps Script rejected the fit review")
         # Re-read so the freshly-written review is reflected in the served payload.
         wardrobe = fetch_wardrobe(self._gist_id, self._token)
-        return self._store(build_payload(wardrobe, self._image_dir))
+        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
 
     @property
     def review_requests_enabled(self) -> bool:
@@ -953,6 +1218,10 @@ def _make_handler(catalogue: _Catalogue):
                     (b.get("id") or ""), b.get("category")))
             elif path == "/api/item/fit":
                 self._handle_write(lambda b: catalogue.submit_fit(b))
+            elif path == "/api/item/image":
+                self._handle_write(catalogue.add_image)
+            elif path == "/api/item/image-file":
+                self._handle_upload()
             elif path == "/api/shutdown":
                 # Stop the local server cleanly so the user doesn't Ctrl-C the
                 # PowerShell window. ThreadingHTTPServer.shutdown() blocks until
@@ -968,14 +1237,40 @@ def _make_handler(catalogue: _Catalogue):
                 self._send(404, b"not found", "text/plain; charset=utf-8")
 
         def _handle_write(self, action):
-            """Run a payload-returning write action; map errors to status codes."""
+            """Run a payload-returning write action on the JSON body."""
             try:
                 body = self._read_json_body()
             except (ValueError, json.JSONDecodeError):
                 self._send_json({"error": "invalid JSON body"}, code=400)
                 return
+            self._respond_write(lambda: action(body))
+
+        def _handle_upload(self):
+            """POST /api/item/image-file?id=..&name=.. with the raw file bytes.
+
+            Raw-body upload (no multipart parsing): the frontend POSTs the File
+            object directly, so the browser sets Content-Type from the file and
+            the id/filename ride the query string."""
+            q = parse_qs(urlparse(self.path).query)
+            item_id = (q.get("id") or [""])[0]
+            name = (q.get("name") or [""])[0]
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0:
+                self._send_json({"error": "empty upload"}, code=400)
+                return
+            if length > _UPLOAD_MAX_BYTES:
+                self._send_json(
+                    {"error": "file too large (15 MB max)"}, code=400)
+                return
+            content = self.rfile.read(length)
+            ctype = self.headers.get("Content-Type") or ""
+            self._respond_write(
+                lambda: catalogue.upload_image(item_id, name, ctype, content))
+
+        def _respond_write(self, fn):
+            """Run a payload-returning write; map errors to clean JSON codes."""
             try:
-                payload = action(body)
+                payload = fn()
             except KeyError:
                 self._send_json({"error": "item not found"}, code=404)
                 return

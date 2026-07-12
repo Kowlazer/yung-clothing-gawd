@@ -117,6 +117,7 @@
   .chip .n { color: var(--muted); font-variant-numeric: tabular-nums; }
   .chip.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
   .chip.on .n { color: var(--accent); }
+  button.chip { font-family: inherit; }
   select.shopsel {
     border: 1px solid var(--border); background: var(--surface); color: var(--text);
     border-radius: 10px; padding: 8px 12px; font-size: 14px; max-width: 320px;
@@ -308,6 +309,7 @@
       <option value="price_lo">Price: low → high</option>
       <option value="name">Name: A → Z</option>
     </select>
+    <button class="chip" id="noPhotoBtn" title="Work queue: show only items without a photo (add one from the item's detail panel)">No photo <span class="n" id="noPhotoCount"></span></button>
   </div>
   <div class="facets" id="facets"></div>
   <div class="result-line" id="resultLine"></div>
@@ -354,6 +356,7 @@ let view = 'timeline';
 let query = '';
 const selectedCats = new Set();
 let brandFilter = '';   // type-to-filter text on the Brands tab
+let noPhotoOnly = false;  // work-queue filter: only items with no cached photo
 let sortBy = localStorage.getItem('wardrobeSort') || 'newest';
 let META = { category_choices: [], fit_enabled: false, review_requests_enabled: false };
 // Detected post-purchase review requests, grouped by brand_key (loaded async
@@ -405,6 +408,7 @@ function sortItems(arr){
 
 // ----- filtering -----
 function matches(it){
+  if(noPhotoOnly && it.image) return false;
   if(view==='categories' && selectedCats.size && !selectedCats.has(it.category)) return false;
   if(query){
     const hay = (it.name+' '+it.shop+' '+it.color+' '+it.size+' '+it.category_label).toLowerCase();
@@ -489,7 +493,7 @@ function updateBrandCount(shown, total){
 
 function renderContent(){
   const all = sortItems(DATA.items.filter(matches));
-  const filtered = !!(query || selectedCats.size);
+  const filtered = !!(query || selectedCats.size || noPhotoOnly);
   el('resultLine').textContent = filtered
     ? `Showing ${all.length} of ${DATA.items.length} items`
     : `${DATA.items.length} items`;
@@ -770,6 +774,27 @@ function reviewSectionHtml(it){
     + more;
 }
 
+// The manual add-photo inputs (issue #30) — the paste-back rung for items no
+// automation could stamp. Expanded by default when the item has no photo (the
+// work-queue flow: open card → paste → done); tucked behind a "Replace photo…"
+// toggle when one exists. One submit button uses whichever input is filled
+// (file beats direct URL beats page URL).
+function addImageHtml(it){
+  const open = !it.image;
+  return `<div class="dsec" id="imgSec"><h4>Photo</h4>
+    ${it.image ? `<button class="more-toggle" id="imgToggle" type="button">Replace photo…</button>` : ''}
+    <div id="imgWrap" style="display:${open?'block':'none'}">
+      <div class="field"><label>Product page URL — grabs the page's photo (and saves the product link)</label>
+        <input id="imgPage" type="url" autocomplete="off" placeholder="https://shop.com/products/…"></div>
+      <div class="field"><label>…or a direct image URL (right-click a photo → Copy image address)</label>
+        <input id="imgDirect" type="url" autocomplete="off" placeholder="https://…/photo.jpg"></div>
+      <div class="field"><label>…or upload an image file</label>
+        <input id="imgFile" type="file" accept="image/*"></div>
+      <button class="btn" id="imgSubmit" type="button">Add photo</button>
+      <div class="hint" style="margin-top:7px">Amazon items: open your Amazon order history, right-click the item's photo → Copy image address, and paste it as a direct image URL (Amazon product pages themselves can't be fetched).</div>
+    </div></div>`;
+}
+
 function detailHtml(it){
   const thumb = it.image ? `<img src="${esc(it.image)}" alt="">` : icon(it.category);
   const rows = [];
@@ -796,6 +821,7 @@ function detailHtml(it){
       ${catField}
       ${bodyCompHtml(it.body_comp)}
       ${productLinkHtml(it)}
+      ${addImageHtml(it)}
       <div class="dsec" id="fitSec"><h4>Fit feedback</h4>${fitInner}</div>
       <div class="dsec" id="reviewSec">${reviewSectionHtml(it)}</div>
     </div>`;
@@ -817,6 +843,37 @@ function wireDetail(it){
   const more = el('moreToggle'); if(more) more.onclick = () => { const w=el('moreWrap'); w.style.display = w.style.display==='none'?'block':'none'; };
   const submit = el('fitSubmit'); if(submit) submit.onclick = () => doFitSubmit(it.id);
   const redo = el('fitRedo'); if(redo) redo.onclick = () => { el('fitSec').innerHTML = '<h4>Fit feedback</h4>'+fitFormHtml(it); wireDetail(it); };
+  const imgT = el('imgToggle'); if(imgT) imgT.onclick = () => { const w=el('imgWrap'); w.style.display = w.style.display==='none'?'block':'none'; };
+  const imgS = el('imgSubmit'); if(imgS) imgS.onclick = () => doAddImage(it.id);
+}
+
+// Add / replace a photo from whichever input the user filled. The server
+// returns the rebuilt payload (like category edits), so the card + modal show
+// the photo immediately — and with the "No photo" queue on, the item drops out
+// of the queue, leaving the next one ready.
+async function doAddImage(id){
+  const fileEl = el('imgFile');
+  const file = fileEl && fileEl.files && fileEl.files[0];
+  const direct = el('imgDirect') ? el('imgDirect').value.trim() : '';
+  const page = el('imgPage') ? el('imgPage').value.trim() : '';
+  if(!file && !direct && !page){ toast('Paste a URL or choose a file first'); return; }
+  const btn = el('imgSubmit');
+  if(btn){ btn.disabled = true; btn.textContent = file ? 'Uploading…' : 'Fetching…'; }
+  try {
+    let d;
+    if(file){
+      const r = await fetch('/api/item/image-file?id='+encodeURIComponent(id)+'&name='+encodeURIComponent(file.name), { method:'POST', body:file });
+      d = await r.json().catch(()=>({ error:'bad response' }));
+      if(!r.ok || d.error) throw new Error(d.error || ('HTTP '+r.status));
+    } else {
+      d = await postJson('/api/item/image', direct ? { id, image_url: direct } : { id, page_url: page });
+    }
+    DATA = d; setSub(); render(); openDetail(id);
+    toastOk('Photo added');
+  } catch(e){
+    toast('Could not add photo: ' + e.message);
+    if(btn){ btn.disabled = false; btn.textContent = 'Add photo'; }
+  }
 }
 
 async function doCategoryEdit(id, category){
@@ -904,6 +961,12 @@ el('content').addEventListener('click', e => {
 
 el('sortsel').addEventListener('change', e => { sortBy = e.target.value; saveSort(); render(); });
 
+el('noPhotoBtn').addEventListener('click', () => {
+  noPhotoOnly = !noPhotoOnly;
+  el('noPhotoBtn').classList.toggle('on', noPhotoOnly);
+  render();
+});
+
 // Modal: click the backdrop or press Escape to close.
 el('modalBack').addEventListener('click', e => { if(e.target === el('modalBack')) closeDetail(); });
 document.addEventListener('keydown', e => { if(e.key === 'Escape' && el('modalBack').classList.contains('open')) closeDetail(); });
@@ -944,6 +1007,12 @@ function setSub(){
   const range = s.date_min ? `${(s.date_min||'').slice(0,4)}–${(s.date_max||'').slice(0,4)}` : '';
   const spent = spentLabel(s.total_spent);
   el('subline').textContent = `${s.total||0} items · ${s.shop_count||0} brands` + (range?` · ${range}`:'') + (spent?` · ${spent} spent`:'');
+  updateNoPhotoCount();
+}
+
+function updateNoPhotoCount(){
+  const n = DATA.items.filter(i => !i.image).length;
+  const c = el('noPhotoCount'); if(c) c.textContent = n;
 }
 
 function toast(msg){ showToast(msg, false); }

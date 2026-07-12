@@ -871,6 +871,327 @@ def test_shutdown_route_stops_server():
         server.server_close()
 
 
+# --------------------------------------------------------------------------
+# extract_page_image (issue #30 — manual paste-back, phase B)
+# --------------------------------------------------------------------------
+
+def test_extract_page_image_og_meta():
+    html = '<html><head><meta property="og:image" content="https://cdn.x/tee.jpg"></head></html>'
+    assert wb.extract_page_image(html) == "https://cdn.x/tee.jpg"
+
+
+def test_extract_page_image_attribute_order_and_quotes():
+    # Reversed attribute order, single quotes, self-closing.
+    html = "<meta content='https://cdn.x/a.png' property='og:image'/>"
+    assert wb.extract_page_image(html) == "https://cdn.x/a.png"
+
+
+def test_extract_page_image_name_attr_and_entities():
+    html = '<meta name="og:image" content="https://cdn.x/a.jpg?w=600&amp;h=600">'
+    assert wb.extract_page_image(html) == "https://cdn.x/a.jpg?w=600&h=600"
+
+
+def test_extract_page_image_og_wins_over_jsonld():
+    html = (
+        '<script type="application/ld+json">{"image": "https://cdn.x/ld.jpg"}</script>'
+        '<meta property="og:image" content="https://cdn.x/og.jpg">'
+    )
+    assert wb.extract_page_image(html) == "https://cdn.x/og.jpg"
+
+
+@pytest.mark.parametrize("block", [
+    '{"@type": "Product", "image": "https://cdn.x/ld.jpg"}',
+    '{"@type": "Product", "image": ["https://cdn.x/ld.jpg", "https://cdn.x/2.jpg"]}',
+    '{"@type": "Product", "image": {"@type": "ImageObject", "url": "https://cdn.x/ld.jpg"}}',
+    '{"@type": "Product", "image": {"contentUrl": "https://cdn.x/ld.jpg"}}',
+    '{"@graph": [{"@type": "Product", "image": "https://cdn.x/ld.jpg"}]}',
+])
+def test_extract_page_image_jsonld_shapes(block):
+    html = f'<script type="application/ld+json">{block}</script>'
+    assert wb.extract_page_image(html) == "https://cdn.x/ld.jpg"
+
+
+def test_extract_page_image_tolerates_bad_jsonld():
+    html = (
+        '<script type="application/ld+json">not json {{</script>'
+        '<script type="application/ld+json">{"image": "https://cdn.x/ok.jpg"}</script>'
+    )
+    assert wb.extract_page_image(html) == "https://cdn.x/ok.jpg"
+
+
+def test_extract_page_image_none_when_absent():
+    assert wb.extract_page_image("<html><body>plain page</body></html>") is None
+    assert wb.extract_page_image("") is None
+
+
+# --------------------------------------------------------------------------
+# apply_image_edit
+# --------------------------------------------------------------------------
+
+def _image_edit_wardrobe(**extra):
+    return {"items": [
+        {"id": "a", "item_name": "Kitsune Tee", "shop": "Sumie",
+         "category": "tshirt", "purchased_at": "2026-04-15", **extra},
+    ]}
+
+
+def test_apply_image_edit_stamps_image_url():
+    w = _image_edit_wardrobe()
+    item = wb.apply_image_edit(w, "a", "https://cdn.x/tee.jpg")
+    assert item["image_url"] == "https://cdn.x/tee.jpg"
+    assert "product_url" not in item
+
+
+def test_apply_image_edit_donates_product_url_when_missing():
+    w = _image_edit_wardrobe()
+    item = wb.apply_image_edit(
+        w, "a", "https://cdn.x/t.jpg", product_url="https://shop.x/products/tee")
+    assert item["product_url"] == "https://shop.x/products/tee"
+
+
+def test_apply_image_edit_never_overwrites_product_url():
+    w = _image_edit_wardrobe(product_url="https://shop.x/products/orig")
+    item = wb.apply_image_edit(
+        w, "a", "https://cdn.x/t.jpg", product_url="https://shop.x/products/new")
+    assert item["product_url"] == "https://shop.x/products/orig"
+
+
+def test_apply_image_edit_unknown_id_returns_none():
+    assert wb.apply_image_edit(_image_edit_wardrobe(), "zzz", "https://x/t.jpg") is None
+
+
+# --------------------------------------------------------------------------
+# _Catalogue.add_image (paste a product-page / direct image URL)
+# --------------------------------------------------------------------------
+
+class _CMClient(_FakeClient):
+    """_FakeClient variant for add_image: context-manager + headers kwarg."""
+
+    def get(self, url, **kw):
+        return super().get(url)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _PageResp:
+    """A fake product-page response (the og:image extraction input)."""
+
+    def __init__(self, text, status=200, url="https://shop.x/products/tee"):
+        self.status_code = status
+        self.text = text
+        self.content = text.encode()
+        self.headers = {"content-type": "text/html"}
+        self.url = url
+
+
+class TestAddImage:
+    def _state(self, **extra):
+        return {
+            "wardrobe": {"items": [
+                {"id": "a", "item_name": "Kitsune Tee", "shop": "Sumie",
+                 "category": "tshirt", "purchased_at": "2026-04-15", **extra},
+            ]},
+            "prices": {}, "aliases": {}, "codes": [],
+        }
+
+    def _cat(self, tmp_path, monkeypatch, client, state=None):
+        import httpx
+        st = state or self._state()
+        written = {}
+        monkeypatch.setattr(wb.state, "read_state", lambda g, t, **k: st)
+        monkeypatch.setattr(wb.state, "write_state",
+                            lambda g, t, **kw: written.update(kw))
+        monkeypatch.setattr(httpx, "Client", lambda **kw: client)
+        return wb._Catalogue("g", "t", tmp_path), written
+
+    def test_direct_image_url_downloads_and_stamps(self, tmp_path, monkeypatch):
+        client = _CMClient({"https://cdn.x/tee.jpg": _FakeResp(content=b"IMG")})
+        cat, written = self._cat(tmp_path, monkeypatch, client)
+        payload = cat.add_image({"id": "a", "image_url": "https://cdn.x/tee.jpg"})
+        assert (tmp_path / "a.jpg").read_bytes() == b"IMG"
+        item = written["wardrobe"]["items"][0]
+        assert item["image_url"] == "https://cdn.x/tee.jpg"
+        assert "product_url" not in item          # direct path donates nothing
+        assert payload["items"][0]["image"] == "/images/a.jpg"
+
+    def test_page_url_extracts_og_image_and_donates_product_url(
+            self, tmp_path, monkeypatch):
+        page = '<meta property="og:image" content="https://cdn.x/tee.jpg">'
+        client = _CMClient({
+            "https://shop.x/products/tee?utm_source=news": _PageResp(page),
+            "https://cdn.x/tee.jpg": _FakeResp(content=b"IMG"),
+        })
+        cat, written = self._cat(tmp_path, monkeypatch, client)
+        cat.add_image({"id": "a",
+                       "page_url": "https://shop.x/products/tee?utm_source=news"})
+        item = written["wardrobe"]["items"][0]
+        assert item["image_url"] == "https://cdn.x/tee.jpg"
+        # product_url donated, cleaned of tracking params (order_scan's cleaner).
+        assert item["product_url"] == "https://shop.x/products/tee"
+        assert (tmp_path / "a.jpg").read_bytes() == b"IMG"
+
+    def test_page_url_keeps_existing_product_url(self, tmp_path, monkeypatch):
+        page = '<meta property="og:image" content="https://cdn.x/tee.jpg">'
+        client = _CMClient({
+            "https://shop.x/products/tee": _PageResp(page),
+            "https://cdn.x/tee.jpg": _FakeResp(content=b"IMG"),
+        })
+        st = self._state(product_url="https://shop.x/products/orig")
+        cat, written = self._cat(tmp_path, monkeypatch, client, state=st)
+        cat.add_image({"id": "a", "page_url": "https://shop.x/products/tee"})
+        assert written["wardrobe"]["items"][0]["product_url"] == \
+            "https://shop.x/products/orig"
+
+    def test_relative_og_image_resolved_against_final_page_url(
+            self, tmp_path, monkeypatch):
+        page = '<meta property="og:image" content="/cdn/tee.jpg">'
+        client = _CMClient({
+            "https://shop.x/products/tee": _PageResp(page),
+            "https://shop.x/cdn/tee.jpg": _FakeResp(content=b"IMG"),
+        })
+        cat, written = self._cat(tmp_path, monkeypatch, client)
+        cat.add_image({"id": "a", "page_url": "https://shop.x/products/tee"})
+        assert written["wardrobe"]["items"][0]["image_url"] == \
+            "https://shop.x/cdn/tee.jpg"
+
+    def test_heic_image_url_converted_before_download(self, tmp_path, monkeypatch):
+        # Chrome can't decode HEIC; the Shopify CDN converts on request — the
+        # converted URL is both fetched and stamped (order_scan._heic_safe).
+        heic = "https://cdn.shopify.com/s/files/1/tee.heic"
+        converted = heic + "?format=pjpg"
+        client = _CMClient({converted: _FakeResp(content=b"IMG")})
+        cat, written = self._cat(tmp_path, monkeypatch, client)
+        cat.add_image({"id": "a", "image_url": heic})
+        assert client.calls == [converted]
+        assert written["wardrobe"]["items"][0]["image_url"] == converted
+
+    def test_no_image_on_page_raises_and_writes_nothing(self, tmp_path, monkeypatch):
+        client = _CMClient(
+            {"https://shop.x/products/tee": _PageResp("<html>no og here</html>")})
+        cat, written = self._cat(tmp_path, monkeypatch, client)
+        with pytest.raises(ValueError, match="no product image"):
+            cat.add_image({"id": "a", "page_url": "https://shop.x/products/tee"})
+        assert written == {}
+        assert list(tmp_path.iterdir()) == []
+
+    def test_page_fetch_error_status_raises(self, tmp_path, monkeypatch):
+        client = _CMClient(
+            {"https://shop.x/products/tee": _PageResp("blocked", status=403)})
+        cat, written = self._cat(tmp_path, monkeypatch, client)
+        with pytest.raises(ValueError, match="HTTP 403"):
+            cat.add_image({"id": "a", "page_url": "https://shop.x/products/tee"})
+        assert written == {}
+
+    def test_non_image_download_raises_and_writes_nothing(self, tmp_path, monkeypatch):
+        client = _CMClient(
+            {"https://cdn.x/err": _FakeResp(ctype="text/html", content=b"<html>")})
+        cat, written = self._cat(tmp_path, monkeypatch, client)
+        with pytest.raises(ValueError, match="didn't return an image"):
+            cat.add_image({"id": "a", "image_url": "https://cdn.x/err"})
+        assert written == {}
+        assert list(tmp_path.iterdir()) == []
+
+    def test_unknown_id_cleans_up_cache_file(self, tmp_path, monkeypatch):
+        client = _CMClient({"https://cdn.x/tee.jpg": _FakeResp(content=b"IMG")})
+        cat, written = self._cat(tmp_path, monkeypatch, client)
+        with pytest.raises(KeyError):
+            cat.add_image({"id": "zzz", "image_url": "https://cdn.x/tee.jpg"})
+        assert written == {}
+        assert not (tmp_path / "zzz.jpg").exists()
+
+    def test_rejects_missing_or_non_http_input(self, tmp_path, monkeypatch):
+        cat, _ = self._cat(tmp_path, monkeypatch, _CMClient({}))
+        with pytest.raises(ValueError, match="paste"):
+            cat.add_image({"id": "a"})
+        with pytest.raises(ValueError, match="http"):
+            cat.add_image({"id": "a", "image_url": "ftp://x/y.jpg"})
+        with pytest.raises(ValueError, match="missing item id"):
+            cat.add_image({"id": "", "image_url": "https://x/y.jpg"})
+
+
+# --------------------------------------------------------------------------
+# _Catalogue.upload_image (file upload — cache-only, zero Gist writes)
+# --------------------------------------------------------------------------
+
+class TestUploadImage:
+    def _cat(self, tmp_path):
+        cat = wb._Catalogue("g", "t", tmp_path)
+        wardrobe = {"items": [
+            {"id": "a", "item_name": "Kitsune Tee", "shop": "Sumie",
+             "category": "tshirt", "purchased_at": "2026-04-15"},
+        ]}
+        cat._store(wb.build_payload(wardrobe, tmp_path), wardrobe)
+        return cat
+
+    def test_upload_writes_cache_and_rebuilds_payload(self, tmp_path):
+        # No state.read_state/write_state monkeypatch on purpose: the upload
+        # path must never touch the Gist (it would blow up on fake creds).
+        payload = self._cat(tmp_path).upload_image("a", "photo.png", "image/png", b"PNG")
+        assert (tmp_path / "a.png").read_bytes() == b"PNG"
+        assert payload["items"][0]["image"] == "/images/a.png"
+
+    def test_upload_ext_from_filename_when_ctype_unhelpful(self, tmp_path):
+        self._cat(tmp_path).upload_image(
+            "a", "photo.webp", "application/octet-stream", b"WEBP")
+        assert (tmp_path / "a.webp").read_bytes() == b"WEBP"
+
+    def test_upload_replaces_other_extension_cache(self, tmp_path):
+        (tmp_path / "a.jpg").write_bytes(b"OLD")
+        self._cat(tmp_path).upload_image("a", "new.png", "image/png", b"NEW")
+        assert not (tmp_path / "a.jpg").exists()
+        assert (tmp_path / "a.png").read_bytes() == b"NEW"
+
+    def test_upload_unknown_id_raises(self, tmp_path):
+        with pytest.raises(KeyError):
+            self._cat(tmp_path).upload_image("zzz", "p.png", "image/png", b"x")
+
+    def test_upload_unsupported_type_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="unsupported"):
+            self._cat(tmp_path).upload_image("a", "notes.txt", "text/plain", b"x")
+
+    def test_upload_empty_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="empty"):
+            self._cat(tmp_path).upload_image("a", "p.png", "image/png", b"")
+
+
+def test_image_file_route_uploads(tmp_path):
+    """POST /api/item/image-file over a live server: raw body + query params."""
+    import threading
+    import httpx
+    from http.server import ThreadingHTTPServer
+
+    cat = wb._Catalogue("g", "t", tmp_path)
+    wardrobe = {"items": [
+        {"id": "a", "item_name": "Kitsune Tee", "shop": "Sumie",
+         "category": "tshirt", "purchased_at": "2026-04-15"},
+    ]}
+    cat._store(wb.build_payload(wardrobe, tmp_path), wardrobe)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), wb._make_handler(cat))
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        r = httpx.post(
+            f"http://127.0.0.1:{port}/api/item/image-file?id=a&name=p.png",
+            content=b"PNGBYTES", headers={"Content-Type": "image/png"},
+            timeout=5.0)
+        assert r.status_code == 200
+        assert r.json()["items"][0]["image"] == "/images/a.png"
+        assert (tmp_path / "a.png").read_bytes() == b"PNGBYTES"
+        # Unknown id → clean JSON 404, not a traceback.
+        r = httpx.post(
+            f"http://127.0.0.1:{port}/api/item/image-file?id=zzz&name=p.png",
+            content=b"x", headers={"Content-Type": "image/png"}, timeout=5.0)
+        assert r.status_code == 404
+        assert r.json()["error"] == "item not found"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_build_payload_uses_stored_categories():
     # Stored categories (issue #18) move a design-only tee out of "Other" and
     # hide a stored non_clothing item the name heuristic would have shown.
