@@ -3293,3 +3293,280 @@ class TestSelfForwardGuardInScan:
             shop_filter=None)
         assert items == []
         assert processed == ["777"]   # recorded so it isn't re-fetched forever
+
+
+# ---------------------------------------------------------------------------
+# Storefront-search image backfill (issue #29)
+# ---------------------------------------------------------------------------
+
+import httpx  # noqa: E402
+
+
+def _suggest_response(products):
+    return httpx.Response(
+        200, json={"resources": {"results": {"products": products}}})
+
+
+class TestMatchSearchProduct:
+    def test_unique_title_wins(self):
+        prods = [
+            {"title": "Raijin Oversize Tee", "handle": "raijin"},
+            {"title": "Totoro Wash Hoodie", "handle": "totoro"},
+        ]
+        assert order_scan._match_search_product(
+            "Raijin Oversize Tee", prods) is prods[0]
+
+    def test_same_design_cross_cut_family_ties_to_none(self):
+        # Garment nouns are stopwords, so a design family (cardigan + sweater
+        # of one design) scores identically -> tie -> None. The RUNNER avoids
+        # this in practice by querying with the full item name first, which
+        # lets the shop's own search engine narrow to the right cut.
+        prods = [
+            {"title": "Twice as Many Stars Cardigan", "handle": "c"},
+            {"title": "Twice as Many Stars Sweater", "handle": "s"},
+        ]
+        assert order_scan._match_search_product(
+            "Twice as Many Stars Cardigan", prods) is None
+
+    def test_category_gate_blocks_sibling_skus(self):
+        prods = [{"title": "Bee Hoodie", "handle": "bee-hoodie"}]
+        assert order_scan._match_search_product("Bee Beanie", prods) is None
+
+    def test_low_signal_candidates_dropped(self):
+        prods = [{"title": "Custom Item Listing", "handle": "custom"}]
+        assert order_scan._match_search_product(
+            "Rosy Maple Moth Button Up", prods) is None
+
+    def test_empty_inputs(self):
+        assert order_scan._match_search_product("", [{"title": "X Tee"}]) is None
+        assert order_scan._match_search_product("Raijin Tee", []) is None
+
+
+class TestSearchImageHelpers:
+    def test_colour_tokens_fold_grey(self):
+        assert order_scan._colour_tokens("Dark GREY") == {"dark", "gray"}
+
+    def test_heic_gets_cdn_conversion_param(self):
+        assert order_scan._heic_safe(
+            "https://cdn.shopify.com/f/IMG-5732.heic?v=1"
+        ) == "https://cdn.shopify.com/f/IMG-5732.heic?v=1&format=pjpg"
+        assert order_scan._heic_safe(
+            "https://cdn.shopify.com/f/IMG-5732.heic"
+        ) == "https://cdn.shopify.com/f/IMG-5732.heic?format=pjpg"
+        assert order_scan._heic_safe(
+            "https://cdn.shopify.com/f/a.jpg?v=1"
+        ) == "https://cdn.shopify.com/f/a.jpg?v=1"
+
+    def test_filename_colour_match(self):
+        m = order_scan._filename_colour_match
+        assert m(frozenset({"red"}), "//c.test/files/Kireina_2-0_red1.jpg?v=2")
+        assert m(frozenset({"dark", "gray"}), "https://c.test/f/tee_dark_grey2.jpg")
+        assert not m(frozenset({"red"}), "https://c.test/f/bored-tee.jpg")
+        assert not m(frozenset(), "https://c.test/f/red1.jpg")
+
+    def test_absolute_shop_url(self):
+        a = order_scan._absolute_shop_url
+        assert a("//cdn.shopify.com/x.jpg", "s.test") == "https://cdn.shopify.com/x.jpg"
+        assert a("/products/x", "s.test") == "https://s.test/products/x"
+        assert a("https://done.test/x", "s.test") == "https://done.test/x"
+        assert a(None, "s.test") is None
+
+
+class TestSearchRefinedImage:
+    """Colour confirmation against the product .js (the issue-29 probe caught
+    two featured images that were a different colourway than the purchase)."""
+
+    @staticmethod
+    def _client(pjs=None, status=200):
+        def handler(request):
+            if request.url.path.endswith(".js"):
+                return httpx.Response(status, json=pjs or {})
+            return httpx.Response(404)
+        return httpx.Client(transport=httpx.MockTransport(handler))
+
+    def _product(self):
+        return {"title": "Kireina Pants", "handle": "kireina",
+                "image": "//cdn.test/files/kireina_black1.jpg"}
+
+    def test_no_colour_takes_featured(self):
+        got = order_scan._search_refined_image(
+            self._client(), "s.test", self._product(), "")
+        assert got == "https://cdn.test/files/kireina_black1.jpg"
+
+    def test_no_colour_option_takes_featured(self):
+        pjs = {"options": ["Size"], "variants": [{"option1": "M"}]}
+        got = order_scan._search_refined_image(
+            self._client(pjs), "s.test", self._product(), "Black")
+        assert got == "https://cdn.test/files/kireina_black1.jpg"
+
+    def test_variant_featured_image_wins(self):
+        pjs = {"options": [{"name": "Color"}, {"name": "Size"}],
+               "variants": [
+                   {"option1": "Black",
+                    "featured_image": {"src": "//cdn.test/f/black1.jpg"}},
+                   {"option1": "Red",
+                    "featured_image": {"src": "//cdn.test/f/red1.jpg"}},
+               ]}
+        got = order_scan._search_refined_image(
+            self._client(pjs), "s.test", self._product(), "Red")
+        assert got == "https://cdn.test/f/red1.jpg"
+
+    def test_exact_colour_beats_containment(self):
+        pjs = {"options": ["Color"],
+               "variants": [
+                   {"option1": "Olive Green",
+                    "featured_image": {"src": "//cdn.test/f/olive.jpg"}},
+                   {"option1": "Green",
+                    "featured_image": {"src": "//cdn.test/f/green.jpg"}},
+               ]}
+        got = order_scan._search_refined_image(
+            self._client(pjs), "s.test", self._product(), "Green")
+        assert got == "https://cdn.test/f/green.jpg"
+
+    def test_gallery_filename_fallback(self):
+        pjs = {"options": ["Color"],
+               "variants": [{"option1": "Red"}],  # matched but imageless
+               "images": ["//cdn.test/f/kireina_black1.jpg",
+                          "//cdn.test/f/kireina_red1.jpg"]}
+        got = order_scan._search_refined_image(
+            self._client(pjs), "s.test", self._product(), "Red")
+        assert got == "https://cdn.test/f/kireina_red1.jpg"
+
+    def test_unconfirmable_colour_is_no_stamp(self):
+        pjs = {"options": ["Color"],
+               "variants": [{"option1": "Heather Grey",
+                             "featured_image": {"src": "//cdn.test/f/grey.jpg"}}],
+               "images": ["//cdn.test/f/01408308-02-4_front.png"]}
+        got = order_scan._search_refined_image(
+            self._client(pjs), "s.test", self._product(), "Black")
+        assert got is None
+
+    def test_js_error_is_no_stamp(self):
+        got = order_scan._search_refined_image(
+            self._client(status=500), "s.test", self._product(), "Black")
+        assert got is None
+
+
+class TestSearchImageTargets:
+    @staticmethod
+    def _items():
+        return [
+            {"id": "a", "item_name": "A", "purchased_at": "2026-01-01"},
+            {"id": "b", "item_name": "B", "purchased_at": "2026-02-01",
+             "image_url": "https://cdn.test/b.jpg"},
+            {"id": "c", "item_name": "C", "purchased_at": "2026-03-01",
+             "image_url": "https://cdn.test/c.jpg"},
+            {"id": "d", "item_name": "D", "purchased_at": "2026-04-01",
+             "is_clothing": False},
+        ]
+
+    def test_missing_and_rotted_targeted(self, tmp_path):
+        (tmp_path / "b.jpg").write_bytes(b"x")  # b cached; c rotted
+        got = order_scan._search_image_targets(
+            self._items(), image_dir=str(tmp_path), limit=None, shop=None)
+        assert [it["id"] for it in got] == ["c", "a"]  # newest first
+
+    def test_without_cache_dir_only_unstamped(self):
+        got = order_scan._search_image_targets(
+            self._items(), image_dir=None, limit=None, shop=None)
+        assert [it["id"] for it in got] == ["a"]
+
+    def test_shop_filter_and_limit(self, tmp_path):
+        items = self._items()
+        items[0]["shop"] = "Kidoriman"
+        items[2]["shop_domain"] = "kidoriman.com"
+        (tmp_path / "nothing.jpg").write_bytes(b"x")
+        got = order_scan._search_image_targets(
+            items, image_dir=str(tmp_path), limit=1, shop="kidori")
+        assert [it["id"] for it in got] == ["c"]
+
+
+class TestRunSearchImages:
+    """End-to-end over a MockTransport: probe -> suggest -> colour -> stamp."""
+
+    @staticmethod
+    def _wardrobe():
+        return {"items": [
+            {"id": "1", "item_name": "Raijin Oversize Tee", "color": None,
+             "shop": "Bosuman", "shop_domain": "bosuman.test",
+             "purchased_at": "2026-01-01"},
+            {"id": "2", "item_name": "Kireina Pants", "color": "Red",
+             "shop": "Kidoriman", "shop_domain": "kidoriman.test",
+             "purchased_at": "2026-01-02"},
+            {"id": "3", "item_name": "Old Navy Thing", "color": None,
+             "shop": "Oldnavy", "shop_domain": "walled.test",
+             "purchased_at": "2026-01-03"},
+        ]}
+
+    @staticmethod
+    def _transport():
+        def handler(request):
+            host, path = request.url.host, request.url.path
+            q = request.url.params.get("q", "")
+            if host == "walled.test":
+                return httpx.Response(403)
+            if path == "/search/suggest.json":
+                if host == "bosuman.test" and "Raijin" in q:
+                    return _suggest_response([{
+                        "title": "Raijin Oversize Tee", "handle": "raijin",
+                        "url": "/products/raijin?_pos=1&_psq=raijin&_ss=e",
+                        "image": "//cdn.test/f/raijin-tee.jpg"}])
+                if host == "kidoriman.test" and "Kireina" in q:
+                    return _suggest_response([{
+                        "title": "Kireina Pants", "handle": "kireina",
+                        "url": "/products/kireina?_pos=1",
+                        "image": "//cdn.test/f/kireina_black1.jpg"}])
+                return _suggest_response([])
+            if host == "kidoriman.test" and path == "/products/kireina.js":
+                return httpx.Response(200, json={
+                    "options": [{"name": "Color"}, {"name": "Size"}],
+                    "variants": [
+                        {"option1": "Black",
+                         "featured_image": {"src": "//cdn.test/f/kireina_black1.jpg"}},
+                        {"option1": "Red",
+                         "featured_image": {"src": "//cdn.test/f/kireina_red1.jpg"}},
+                    ]})
+            return httpx.Response(404)
+        return httpx.MockTransport(handler)
+
+    def _run(self, monkeypatch, wardrobe, **kw):
+        monkeypatch.setattr(order_scan, "_SEARCH_JITTER", (0, 0))
+        client = httpx.Client(transport=self._transport())
+        return order_scan._run_search_images(
+            wardrobe, image_dir=None, http_client=client, **kw)
+
+    def test_stamps_images_and_product_urls(self, monkeypatch):
+        w = self._wardrobe()
+        stats = self._run(monkeypatch, w)
+        by_id = {it["id"]: it for it in w["items"]}
+        assert by_id["1"]["image_url"] == "https://cdn.test/f/raijin-tee.jpg"
+        # Tracking params stripped by _clean_product_url:
+        assert by_id["1"]["product_url"] == "https://bosuman.test/products/raijin"
+        # Colour-refined to the RED variant, not the black featured image:
+        assert by_id["2"]["image_url"] == "https://cdn.test/f/kireina_red1.jpg"
+        assert by_id["2"]["product_url"] == "https://kidoriman.test/products/kireina"
+        # Non-Shopify (403) domain untouched:
+        assert "image_url" not in by_id["3"]
+        assert stats == {"targeted": 3, "shopify_domains": 2, "stamped": 2,
+                         "product_urls": 2, "no_match": 0,
+                         "colour_unconfirmed": 0, "skipped_no_storefront": 1}
+
+    def test_existing_product_url_not_overwritten(self, monkeypatch):
+        w = self._wardrobe()
+        w["items"][0]["product_url"] = "https://bosuman.test/products/original"
+        self._run(monkeypatch, w)
+        assert w["items"][0]["product_url"] == "https://bosuman.test/products/original"
+        assert w["items"][0]["image_url"] == "https://cdn.test/f/raijin-tee.jpg"
+
+    def test_no_hit_counts_no_match(self, monkeypatch):
+        w = {"items": [{"id": "9", "item_name": "Delisted Thing",
+                        "shop": "Bosuman", "shop_domain": "bosuman.test",
+                        "purchased_at": "2026-01-01"}]}
+        stats = self._run(monkeypatch, w)
+        assert stats["no_match"] == 1 and stats["stamped"] == 0
+        assert "image_url" not in w["items"][0]
+
+    def test_limit_caps_targets(self, monkeypatch):
+        w = self._wardrobe()
+        stats = self._run(monkeypatch, w, limit=1)
+        assert stats["targeted"] == 1

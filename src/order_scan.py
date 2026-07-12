@@ -20,6 +20,7 @@ Usage::
     python -m src.order_scan --classify       # stamp garment category on items (issue #18)
     python -m src.order_scan --reharvest-urls # backfill product_url on old items (issue #23)
     python -m src.order_scan --reharvest-images # backfill image_url on old items (issue #19)
+    python -m src.order_scan --search-images  # image_url from the live storefront (issue #29)
     python -m src.order_scan --since 2023-01-01
     python -m src.order_scan --shop "Norse Projects"
     python -m src.order_scan --reprocess "Fabletics"  # recover a burned shop (see below)
@@ -122,7 +123,9 @@ import re
 import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import (
+    parse_qs, parse_qsl, quote, unquote, urlencode, urlparse, urlunparse,
+)
 
 from src import bodyspec, log_privacy, order_classify
 from src.classify import _NON_CLOTHING_HEADER_RE
@@ -3079,6 +3082,336 @@ def _run_reharvest_images(
 
 
 # ---------------------------------------------------------------------------
+# Storefront-search image backfill (issue #29)
+# ---------------------------------------------------------------------------
+#
+# Last-resort image recovery for items whose order email carried no per-item
+# photo at all (big-box placeholder / text-only templates — the #19/#28
+# residual) or whose stamped email-CDN URL rotted before the browser cached
+# it. The shop's own storefront is asked instead: Shopify exposes a public,
+# unauthenticated ``/search/suggest.json`` endpoint that returns product
+# matches WITH image and product URLs — no bot wall (verified live in the
+# issue-29 probe). Only live Shopify storefronts participate (probed once per
+# domain per run); big-box platforms (Old Navy / H&M / Amazon), dead shops,
+# and shops that delisted the item fall through untouched to the manual
+# paste-back rung.
+#
+# Precision bar is the usual conservative matcher (unique top score, tie →
+# None, garment-category gate), plus one rule the probe forced: a matched
+# product's FEATURED image is often a different colourway than the one
+# purchased (two of eleven probe hits — a black featured image for red/green
+# pants, a heather-grey one for black joggers). So when the item carries a
+# colour AND the product has a colour option, the image must be confirmed
+# against the product's ``.js`` variants (the matching variant's
+# ``featured_image``, else a colour-token filename match in the gallery);
+# unconfirmable colour means NO stamp rather than a wrong-colour photo.
+# A matched product also donates its URL to items that lack ``product_url``
+# — a hit from the shop's own search is live by construction, which cracks
+# issue #23's opaque-click-tracker ceiling for these shops.
+
+_SHOP_DOMAIN_ALIASES = {
+    # Shops that moved domains after the purchase: search the live storefront.
+    # steadyhandsapparel.com's cert is now a hostname mismatch — the shop
+    # relocated to steady-hands.com (issue-29 probe, 2026-07-11).
+    "steadyhandsapparel.com": "www.steady-hands.com",
+}
+_SUGGEST_LIMIT = 10
+_SEARCH_JITTER = (0.4, 0.9)  # sequential courtesy delay; tests zero it
+_COLOUR_SYNONYMS = {"grey": "gray"}
+_COLOUR_OPTION_RE = re.compile(r"colou?r", re.IGNORECASE)
+
+
+def _absolute_shop_url(url: str | None, domain: str) -> str | None:
+    """Absolutize a storefront-relative or protocol-relative URL."""
+    if not url or not isinstance(url, str):
+        return None
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("/"):
+        return f"https://{domain}{url}"
+    return url
+
+
+def _shopify_suggest_products(client, domain: str, query: str) -> list[dict] | None:
+    """Products from the storefront's public search-suggest endpoint.
+
+    ``None`` when the domain isn't a live Shopify storefront (non-200,
+    non-JSON, or an unexpected shape) — an empty list means "Shopify, but no
+    hits", and the two are distinguished so a domain is probed only once."""
+    url = (
+        f"https://{domain}/search/suggest.json?q={quote(query)}"
+        f"&resources[type]=product&resources[limit]={_SUGGEST_LIMIT}"
+    )
+    try:
+        resp = client.get(url)
+        if resp.status_code != 200:
+            return None
+        products = resp.json()["resources"]["results"]["products"]
+    except Exception:  # noqa: BLE001 — any surprise shape ⇒ not Shopify
+        return None
+    return products if isinstance(products, list) else None
+
+
+def _match_search_product(item_name: str, products: list[dict]) -> dict | None:
+    """The single unambiguous product whose TITLE matches the item name.
+
+    Mirrors ``_match_product_url`` (same ``_tokens`` overlap +
+    garment-category gate + unique-top-score, tie → ``None``) but scores
+    against the product title rather than a slug — titles track a renamed
+    listing while the handle keeps its original slug (observed live: a
+    hoodie retitled for a new drop kept its old handle)."""
+    name_tokens = _tokens(item_name)
+    if not name_tokens or not products:
+        return None
+    item_cats = _garment_categories(item_name)
+    scored: list[tuple[int, dict]] = []
+    for p in products:
+        title = str(p.get("title") or "")
+        overlap = len(name_tokens & _tokens(title))
+        if overlap < _PRODUCT_URL_MIN_OVERLAP:
+            continue
+        if item_cats:
+            title_cats = _garment_categories(title)
+            if title_cats and not (item_cats & title_cats) and overlap < 2:
+                continue
+        scored.append((overlap, p))
+    if not scored:
+        return None
+    best = max(score for score, _ in scored)
+    top = [p for score, p in scored if score == best]
+    return top[0] if len(top) == 1 else None
+
+
+def _colour_tokens(text: str) -> frozenset[str]:
+    """Lowercased alphanumeric tokens with spelling variants folded."""
+    toks = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return frozenset(_COLOUR_SYNONYMS.get(t, t) for t in toks)
+
+
+def _filename_colour_match(colour_toks: frozenset[str], src: str) -> bool:
+    """Does the image FILENAME carry every colour token?
+
+    Matches the Shopify gallery convention of colour-suffixed shot names
+    (``Kireina_2-0_red1.jpg``): filename parts are compared with trailing
+    shot-number digits stripped and spelling variants folded, so "Dark gray"
+    matches ``…_dark_grey2.jpg`` but "Red" can never match ``bored``."""
+    if not colour_toks:
+        return False
+    name = urlparse(src).path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+    bases: set[str] = set()
+    for part in re.split(r"[^a-z0-9]+", name):
+        base = part.rstrip("0123456789") or part
+        if base:
+            bases.add(_COLOUR_SYNONYMS.get(base, base))
+    return colour_toks <= bases
+
+
+def _heic_safe(url: str) -> str:
+    """Chrome can't decode HEIC; Shopify's CDN converts on request."""
+    if urlparse(url).path.lower().endswith(".heic"):
+        return url + ("&" if "?" in url else "?") + "format=pjpg"
+    return url
+
+
+def _search_refined_image(
+    client, domain: str, product: dict, color: str, *, pace=lambda: None,
+) -> str | None:
+    """The image to stamp for a search-matched product — colour-confirmed.
+
+    No colour on the item ⇒ the product's featured image. Otherwise the
+    product's ``.js`` decides: a product without a colour option sells one
+    colourway (its featured image is the purchase); a product WITH a colour
+    option must confirm — the colour-matching variant's ``featured_image``
+    (exact colour match tried before containment, so "Green" can't shadow a
+    sibling "Olive Green"), else the first gallery image whose filename
+    carries the colour tokens (the ``…_red1.jpg`` pattern), else ``None``:
+    no stamp beats a wrong-colour photo."""
+    featured = _absolute_shop_url(
+        product.get("image") or (product.get("featured_image") or {}).get("url"),
+        domain,
+    )
+    item_toks = _colour_tokens(color)
+    if not item_toks:
+        return featured
+    handle = str(
+        product.get("handle")
+        or urlparse(str(product.get("url") or "")).path.rsplit("/", 1)[-1]
+    )
+    if not handle:
+        return None
+    pace()
+    try:
+        resp = client.get(f"https://{domain}/products/{quote(handle)}.js")
+        if resp.status_code != 200:
+            return None
+        pjs = resp.json()
+    except Exception:  # noqa: BLE001 — can't confirm colour ⇒ no stamp
+        return None
+    option_names = [
+        str(o.get("name") if isinstance(o, dict) else o)
+        for o in pjs.get("options") or []
+    ]
+    colour_idx = next(
+        (n for n, name in enumerate(option_names) if _COLOUR_OPTION_RE.search(name)),
+        None,
+    )
+    if colour_idx is None:
+        return featured
+    variants = [v for v in pjs.get("variants") or [] if isinstance(v, dict)]
+
+    def _variant_image(match) -> str | None:
+        for v in variants:
+            vtoks = _colour_tokens(str(v.get(f"option{colour_idx + 1}") or ""))
+            if vtoks and match(vtoks):
+                src = (v.get("featured_image") or {}).get("src")
+                if src:
+                    return _absolute_shop_url(str(src), domain)
+        return None
+
+    img = _variant_image(lambda vt: vt == item_toks) or _variant_image(
+        lambda vt: vt <= item_toks or item_toks <= vt
+    )
+    if img:
+        return img
+    for src in pjs.get("images") or []:
+        if _filename_colour_match(item_toks, str(src)):
+            return _absolute_shop_url(str(src), domain)
+    return None
+
+
+def _search_image_targets(
+    items: list[dict], *, image_dir: str | None, limit: int | None,
+    shop: str | None,
+) -> list[dict]:
+    """Icon-only clothing items, newest first: no ``image_url``, or stamped
+    but never cached (the browser's ``--fetch-images`` cache is the liveness
+    verdict — a stamped URL with no cached file is rotted). Without a cache
+    dir to consult, only unstamped items are targeted."""
+    cached: set[str] | None = None
+    if image_dir and os.path.isdir(image_dir):
+        cached = {os.path.splitext(f)[0] for f in os.listdir(image_dir)}
+    needle = (shop or "").strip().lower()
+    out: list[dict] = []
+    for it in items:
+        if it.get("is_clothing") is False:
+            continue
+        if needle and needle not in (it.get("shop") or "").lower() \
+                and needle not in (it.get("shop_domain") or "").lower():
+            continue
+        if (it.get("image_url") or "").strip() and (
+            cached is None or it.get("id") in cached
+        ):
+            continue
+        out.append(it)
+    out.sort(key=lambda it: it.get("purchased_at") or "", reverse=True)
+    return out[:limit] if limit is not None else out
+
+
+def _run_search_images(
+    wardrobe: dict,
+    *,
+    image_dir: str | None = "images",
+    limit: int | None = None,
+    shop: str | None = None,
+    http_client=None,
+) -> dict:
+    """Backfill ``image_url`` (and opportunistically ``product_url``) on
+    icon-only items from their shop's own storefront search (issue #29).
+
+    Mutates ``wardrobe["items"]`` in place. Sequential with jitter — this is
+    a local manual command hitting each shop a handful of times, not the
+    concurrent extractor. Suggest responses are cached per (domain, query)
+    so duplicate purchases of one design cost one request. Returns counts:
+    targeted / shopify_domains / stamped / product_urls / no_match /
+    colour_unconfirmed / skipped_no_storefront."""
+    import random
+    import time
+
+    import httpx
+
+    items = wardrobe.get("items") or []
+    targets = _search_image_targets(
+        items, image_dir=image_dir, limit=limit, shop=shop)
+    stats = {
+        "targeted": len(targets), "shopify_domains": 0, "stamped": 0,
+        "product_urls": 0, "no_match": 0, "colour_unconfirmed": 0,
+        "skipped_no_storefront": 0,
+    }
+    if not targets:
+        return stats
+    own = http_client is None
+    client = http_client or httpx.Client(
+        headers=_VALIDATE_HEADERS, timeout=_VALIDATE_TIMEOUT,
+        follow_redirects=True,
+    )
+
+    def _pace() -> None:
+        time.sleep(random.uniform(*_SEARCH_JITTER))
+
+    shopify: dict[str, bool] = {}
+    suggest_cache: dict[tuple[str, str], list[dict] | None] = {}
+
+    def _paced_suggest(domain: str, query: str) -> list[dict] | None:
+        key = (domain, query)
+        if key not in suggest_cache:
+            _pace()
+            suggest_cache[key] = _shopify_suggest_products(client, domain, query)
+        return suggest_cache[key]
+
+    try:
+        for it in targets:
+            raw_domain = (it.get("shop_domain") or "").lower()
+            domain = _SHOP_DOMAIN_ALIASES.get(raw_domain, raw_domain)
+            if not domain:
+                stats["skipped_no_storefront"] += 1
+                continue
+            if domain not in shopify:
+                shopify[domain] = _paced_suggest(domain, "tee") is not None
+                if shopify[domain]:
+                    stats["shopify_domains"] += 1
+            if not shopify[domain]:
+                stats["skipped_no_storefront"] += 1
+                continue
+            name = (it.get("item_name") or "").strip()
+            if not name:
+                stats["no_match"] += 1
+                continue
+            products = _paced_suggest(domain, name)
+            if not products:
+                # Suggest is prefix-y; long names with punctuation can miss
+                # where a head-of-name query hits (probe-verified).
+                short = " ".join(name.split()[:4])
+                if short and short.lower() != name.lower():
+                    products = _paced_suggest(domain, short)
+            hit = _match_search_product(name, products or [])
+            if hit is None:
+                stats["no_match"] += 1
+                continue
+            img = _search_refined_image(
+                client, domain, hit, it.get("color") or "", pace=_pace)
+            if img is None:
+                stats["colour_unconfirmed"] += 1
+                continue
+            it["image_url"] = _heic_safe(img)
+            stats["stamped"] += 1
+            log.info(
+                "search-images: %s / %s -> %s",
+                it.get("shop"), name, hit.get("title"),
+            )
+            if not (it.get("product_url") or "").strip():
+                purl = _clean_product_url(
+                    _absolute_shop_url(str(hit.get("url") or ""), domain))
+                if purl:
+                    it["product_url"] = purl
+                    stats["product_urls"] += 1
+    finally:
+        if own:
+            client.close()
+    log.info("search-images: done — %s", stats)
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Targeted scrape (one hand-picked / forwarded email)
 # ---------------------------------------------------------------------------
 
@@ -3440,6 +3773,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "GMAIL_APP_PASSWORD.",
     )
     p.add_argument(
+        "--search-images", action="store_true",
+        help="Skip scanning; backfill `image_url` on icon-only items (no "
+             "stamped image, or stamped but never cached = rotted) from the "
+             "shop's own storefront search — Shopify's public suggest "
+             "endpoint, matched by product title with the usual tie->None "
+             "matcher and colour-confirmed against the product's variants "
+             "(issue #29). A matched product also donates `product_url` when "
+             "the item lacks one. Local-only; sequential + jittered. Composes "
+             "with --limit / --shop / --image-dir / --dry-run. No Gmail "
+             "needed.",
+    )
+    p.add_argument(
+        "--image-dir", default="images", metavar="DIR",
+        help="With --search-images: the wardrobe browser's local image-cache "
+             "dir, consulted to detect rotted stamps (a stamped image_url "
+             "with no cached file). Default: ./images.",
+    )
+    p.add_argument(
         "--reclassify-category", default=None, metavar="KEY",
         help="With --classify: re-run Claude over ONLY the items currently "
              "stored as this taxonomy category KEY (e.g. `shorts`), retyping "
@@ -3611,6 +3962,29 @@ def run(argv: list[str] | None = None, cfg: Config | None = None) -> int:
                 wardrobe=wardrobe,
             )
         log.info("order_scan: reharvest-images summary — %s", stats)
+        return 0
+
+    # Storefront-search image backfill is its own mode — asks each icon-only
+    # item's LIVE shop (Shopify suggest endpoint) instead of its order email
+    # (issue #29). No Gmail, no Claude. Short-circuit before any scanning.
+    if args.search_images:
+        stats = _run_search_images(
+            wardrobe, image_dir=args.image_dir, limit=args.limit,
+            shop=args.shop,
+        )
+        if dry_run:
+            log.info("order_scan: DRY_RUN — skipping write_state")
+        else:
+            log.info("order_scan: writing wardrobe to gist")
+            write_state(
+                cfg.gist_id,
+                cfg.github_token,
+                prices=state.get("prices") or {},
+                aliases=state.get("aliases") or {},
+                codes=state.get("codes") or [],
+                wardrobe=wardrobe,
+            )
+        log.info("order_scan: search-images summary — %s", stats)
         return 0
 
     # Targeted scrape is its own mode — ingest a hand-picked set of (usually
