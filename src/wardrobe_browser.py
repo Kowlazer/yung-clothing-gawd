@@ -61,7 +61,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
-from src import fit_links, review_requests, state
+from src import email_sales, fit_links, review_requests, state
 from src.wardrobe_categories import (
     CATEGORY_LABELS,
     CATEGORY_ORDER,
@@ -694,13 +694,73 @@ def _apply_brand_canonicalisation(items: list[dict]) -> None:
 # Payload building (continued)
 # ---------------------------------------------------------------------------
 
-def build_payload(wardrobe: dict | None, image_dir: Path | None = None) -> dict:
+def _sales_countdown(entry: dict, today: date) -> str:
+    """Human countdown suffix for an announced sale ("" when none).
+
+    Mirrors ``digest._email_sale_countdown`` byte-for-byte so the Calendar tab
+    reads exactly like the emailed digest's "Sales announced by email" line:
+    "starts in 3 days (Sat May 24)" upcoming, "ends in 2 days (Sun May 26)"
+    already underway, "" for an ongoing/undated sale with no date to count to.
+    """
+    phase, days, on = email_sales.relative_days(entry, today)
+    if phase not in ("upcoming", "ending") or on is None or days is None:
+        return ""
+    verb = "starts" if phase == "upcoming" else "ends"
+    if days == 0:
+        rel = "today"
+    elif days == 1:
+        rel = "tomorrow"
+    else:
+        rel = f"in {days} days"
+    return f"{verb} {rel} ({on.strftime('%a %b %d')})"
+
+
+def build_sales_section(
+    entries: list[dict] | None, today: date | None = None,
+) -> dict:
+    """Shape the persisted email/SMS sale announcements for the Calendar tab.
+
+    ``entries`` is the raw ``email_sales.json`` list (as read from the Gist).
+    Reuses ``src/email_sales.py`` — the same pure logic the daily digest uses —
+    to drop expired announcements and order them upcoming-first, then annotates
+    each with its countdown ``phase`` / ``days`` / label. The frontend places
+    dated ones on the month grid and lists undated/active ones in the agenda
+    strip below it.
+
+    Returns ``{"today": iso, "entries": [{shop, description, starts_on,
+    ends_on, phase, days, countdown}, ...]}`` — an empty entries list when
+    nothing is active (the tab then shows an empty month with an empty agenda).
+    """
+    today = today or datetime.now(timezone.utc).date()
+    out: list[dict] = []
+    for e in email_sales.active(entries or [], today):
+        phase, days, _on = email_sales.relative_days(e, today)
+        out.append({
+            "shop": (e.get("shop") or "").strip() or "(unknown shop)",
+            "description": (e.get("description") or "").strip(),
+            "starts_on": e.get("starts_on"),
+            "ends_on": e.get("ends_on"),
+            "phase": phase,
+            "days": days,
+            "countdown": _sales_countdown(e, today),
+        })
+    return {"today": today.isoformat(), "entries": out}
+
+
+def build_payload(
+    wardrobe: dict | None,
+    image_dir: Path | None = None,
+    email_sales_list: list[dict] | None = None,
+) -> dict:
     """Shape ``wardrobe.json`` into the frontend payload.
 
-    Returns ``{items, categories, shops, stats}`` where ``items`` is the
+    Returns ``{items, categories, shops, stats, sales}`` where ``items`` is the
     clothing-only catalogue (newest purchase first), ``categories`` and
-    ``shops`` are present-value facets with counts, and ``stats`` carries the
-    headline totals (including how many non-clothing items were hidden).
+    ``shops`` are present-value facets with counts, ``stats`` carries the
+    headline totals (including how many non-clothing items were hidden), and
+    ``sales`` carries the active email/SMS sale announcements for the Calendar
+    tab (see :func:`build_sales_section`; empty when ``email_sales_list`` is
+    None/empty).
 
     The ``shops`` facet is **brand-canonicalised** — display-name and
     domain-slug variants of one brand (e.g. "SORA Clothing" / "Soraclothing")
@@ -767,7 +827,13 @@ def build_payload(wardrobe: dict | None, image_dir: Path | None = None) -> dict:
         "spent_by_month": {k: _round_money(v) for k, v in spent_by_month.items()},
         "generated_on": date.today().isoformat(),
     }
-    return {"items": items, "categories": categories, "shops": shops, "stats": stats}
+    return {
+        "items": items,
+        "categories": categories,
+        "shops": shops,
+        "stats": stats,
+        "sales": build_sales_section(email_sales_list),
+    }
 
 
 def apply_category_edit(wardrobe: dict, item_id: str, category: str) -> dict | None:
@@ -980,26 +1046,57 @@ class _Catalogue:
         # write (image upload) rebuild the served payload without a Gist
         # round-trip. The payload lock guards it alongside the payload.
         self._wardrobe: dict | None = None
+        # Last email/SMS sale announcements seen (from the Gist's
+        # email_sales.json) — cached so a rebuild that doesn't re-read state
+        # (an image upload) keeps the Calendar tab populated. Payload-lock
+        # guarded like ``_wardrobe``.
+        self._email_sales: list[dict] = []
         # Review-request cache (own lock so a slow IMAP fetch never blocks the
         # payload lock): (result_dict, fetched_at_monotonic).
         self._rr_lock = threading.Lock()
         self._rr_cache: dict | None = None
         self._rr_at = 0.0
 
-    def _store(self, payload: dict, wardrobe: dict | None = None) -> dict:
+    def _store(
+        self, payload: dict, wardrobe: dict | None = None,
+        email_sales_list: list[dict] | None = None,
+    ) -> dict:
         with self._lock:
             self._payload = payload
             if wardrobe is not None:
                 self._wardrobe = wardrobe
+            if email_sales_list is not None:
+                self._email_sales = email_sales_list
         return payload
 
+    def _rebuild(
+        self, wardrobe: dict | None, email_sales_list: list[dict] | None = None,
+    ) -> dict:
+        """Build + store the served payload, caching wardrobe + email_sales.
+
+        ``email_sales_list`` None means "reuse the last-seen announcements" —
+        the path a cache-only write (image upload) takes, so the Calendar tab
+        stays populated without a fresh state read. A write path that re-read
+        the whole Gist passes the fresh ``email_sales`` so the tab reflects it.
+        """
+        with self._lock:
+            if email_sales_list is not None:
+                self._email_sales = email_sales_list
+            sales = self._email_sales
+        payload = build_payload(wardrobe, self._image_dir, sales)
+        return self._store(payload, wardrobe)
+
     def refresh(self) -> dict:
-        wardrobe = fetch_wardrobe(self._gist_id, self._token)
+        # Full state read (not just wardrobe) so the Calendar tab's sale
+        # announcements refresh alongside the catalogue. ``fresh=True`` for the
+        # same edge-cache reason as every other read (issue #20).
+        st = state.read_state(self._gist_id, self._token, fresh=True)
+        wardrobe = st.get("wardrobe") or {}
         # Drop the cached review requests so a Refresh re-checks Gmail (the
         # frontend re-requests them right after a refresh).
         with self._rr_lock:
             self._rr_cache = None
-        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+        return self._rebuild(wardrobe, st.get("email_sales") or [])
 
     def edit_category(self, item_id: str, category: str) -> dict:
         """Persist a manual category to the Gist (read-modify-write), re-render.
@@ -1026,7 +1123,7 @@ class _Catalogue:
             codes=st.get("codes") or [],
             wardrobe=wardrobe,
         )
-        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+        return self._rebuild(wardrobe, st.get("email_sales") or [])
 
     def edit_name(self, item_id: str, name: str) -> dict:
         """Persist a manual product name to the Gist (read-modify-write), re-render.
@@ -1049,7 +1146,7 @@ class _Catalogue:
             codes=st.get("codes") or [],
             wardrobe=wardrobe,
         )
-        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+        return self._rebuild(wardrobe, st.get("email_sales") or [])
 
     def delete_item(self, item_id: str) -> dict:
         """Hard-delete one item from the Gist (read-modify-write), re-render.
@@ -1076,7 +1173,7 @@ class _Catalogue:
         )
         # The item's gone; its cached bytes are dead weight. Never fatal.
         _remove_cached_image(item_id, self._image_dir)
-        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+        return self._rebuild(wardrobe, st.get("email_sales") or [])
 
     def add_image(self, body: dict) -> dict:
         """Manually attach a product photo from a pasted URL (issue #30).
@@ -1164,7 +1261,7 @@ class _Catalogue:
             codes=st.get("codes") or [],
             wardrobe=wardrobe,
         )
-        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+        return self._rebuild(wardrobe, st.get("email_sales") or [])
 
     def upload_image(
         self, item_id: str, filename: str, content_type: str, content: bytes,
@@ -1196,7 +1293,7 @@ class _Catalogue:
         if item_id not in known:
             raise KeyError(item_id)
         _save_image_bytes(item_id, ext, content, self._image_dir)
-        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+        return self._rebuild(wardrobe)
 
     @property
     def fit_enabled(self) -> bool:
@@ -1233,7 +1330,7 @@ class _Catalogue:
             raise RuntimeError(data.get("error") or "Apps Script rejected the fit review")
         # Re-read so the freshly-written review is reflected in the served payload.
         wardrobe = fetch_wardrobe(self._gist_id, self._token)
-        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+        return self._rebuild(wardrobe)
 
     @property
     def review_requests_enabled(self) -> bool:

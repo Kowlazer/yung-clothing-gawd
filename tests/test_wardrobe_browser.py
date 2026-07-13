@@ -9,6 +9,7 @@ The HTTP server is not exercised here.
 from __future__ import annotations
 
 import os
+from datetime import date
 
 import pytest
 
@@ -443,6 +444,45 @@ def test_build_payload_shops_facet_sorted_by_count():
 
 
 # --------------------------------------------------------------------------
+# sales calendar section (email/SMS announcements → the "Sales" tab)
+# --------------------------------------------------------------------------
+
+def test_build_payload_sales_empty_without_announcements():
+    p = wb.build_payload(_wardrobe())
+    assert p["sales"]["entries"] == []
+    assert p["sales"]["today"]                       # ISO date string present
+
+
+def test_build_sales_section_classifies_and_orders():
+    today = date(2026, 5, 20)
+    entries = [
+        # ongoing, no dates → active, no countdown
+        {"shop": "Fabletics", "status": "yes", "description": "30% off",
+         "starts_on": None, "ends_on": None, "last_seen": "2026-05-20T00:00:00+00:00"},
+        # advance notice → upcoming with a start date + countdown
+        {"shop": "Aniqi", "status": "yes", "description": "Memorial Day 30% off",
+         "starts_on": "2026-05-24", "ends_on": "2026-05-26",
+         "last_seen": "2026-05-20T00:00:00+00:00"},
+    ]
+    out = wb.build_sales_section(entries, today)
+    assert out["today"] == "2026-05-20"
+    # active() orders upcoming-first, so Aniqi leads.
+    assert [e["shop"] for e in out["entries"]] == ["Aniqi", "Fabletics"]
+    aniqi, fab = out["entries"]
+    assert aniqi["phase"] == "upcoming" and aniqi["days"] == 4
+    assert aniqi["countdown"] == "starts in 4 days (Sun May 24)"
+    assert fab["phase"] == "active" and fab["countdown"] == ""
+
+
+def test_build_sales_section_drops_expired():
+    today = date(2026, 5, 20)
+    entries = [{"shop": "Gone", "status": "yes", "description": "old sale",
+                "starts_on": "2026-05-01", "ends_on": "2026-05-03",
+                "last_seen": "2026-05-03T00:00:00+00:00"}]
+    assert wb.build_sales_section(entries, today)["entries"] == []
+
+
+# --------------------------------------------------------------------------
 # brand canonicalisation (merge name variants of one brand)
 # --------------------------------------------------------------------------
 
@@ -868,7 +908,8 @@ class TestReviewRequests:
         monkeypatch.setattr("src.gmail.fetch_review_requests",
                             lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1)
                                              or self._emails()))
-        monkeypatch.setattr(wb, "fetch_wardrobe", lambda g, t: {"items": []})
+        monkeypatch.setattr("src.state.read_state",
+                            lambda *a, **k: {"wardrobe": {"items": []}, "email_sales": []})
         cat = wb._Catalogue("g", "t", None,
                             gmail_username="me@gmail.com", gmail_app_password="pw")
         cat.review_requests()

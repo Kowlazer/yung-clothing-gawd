@@ -207,6 +207,67 @@
     .spend-row .s-amt { width: 96px; }
   }
 
+  /* ----- sales calendar (the "Sales" tab) ----- */
+  .calwrap { margin-top: 4px; }
+  .cal-head { display: flex; align-items: center; gap: 8px; margin: 2px 0 12px; }
+  .cal-title { font-size: 17px; font-weight: 600; letter-spacing: -.01em; min-width: 148px; }
+  .cal-nav, .cal-today {
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    border-radius: 9px; cursor: pointer; font-family: inherit;
+  }
+  .cal-nav { width: 32px; height: 32px; font-size: 19px; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center; }
+  .cal-today { padding: 6px 12px; font-size: 13px; margin-left: 2px; }
+  .cal-nav:hover, .cal-today:hover { background: var(--surface-2); }
+
+  .cal-grid { border: 1px solid var(--border); border-radius: var(--radius);
+    overflow: hidden; background: var(--surface); box-shadow: var(--shadow); }
+  .cal-wd { display: grid; grid-template-columns: repeat(7, 1fr);
+    background: var(--surface-2); border-bottom: 1px solid var(--border); }
+  .cal-wd span { padding: 7px 9px; font-size: 12px; color: var(--muted); font-weight: 600; }
+  .cal-week { position: relative; border-bottom: 1px solid var(--border); }
+  .cal-week:last-child { border-bottom: none; }
+  .cal-cells { position: absolute; inset: 0; display: grid; grid-template-columns: repeat(7, 1fr); }
+  .cal-cell { border-right: 1px solid var(--border); padding: 5px 8px; }
+  .cal-cell:last-child { border-right: none; }
+  .cal-cell.out { background: var(--surface-2); }
+  .cal-cell.out .cal-dnum { opacity: .4; }
+  .cal-dnum { font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--text); }
+  .cal-cell.today .cal-dnum {
+    background: var(--accent); color: #fff; border-radius: 999px;
+    padding: 1px 6px; font-weight: 600;
+  }
+  .cal-bars { position: absolute; top: 25px; left: 0; right: 0; bottom: 3px;
+    display: grid; grid-template-columns: repeat(7, 1fr); grid-auto-rows: 16px;
+    gap: 3px 2px; padding: 0 3px; pointer-events: none; }
+  .cal-bar {
+    --c: var(--accent);
+    background: color-mix(in srgb, var(--c) 15%, transparent);
+    border-left: 3px solid var(--c);
+    font-size: 11.5px; line-height: 16px; height: 16px; padding: 0 6px;
+    border-radius: 5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    pointer-events: auto; cursor: default;
+  }
+  .cal-bar span { color: var(--c); font-weight: 600; }
+  .cal-bar:not(.s) { border-left: none; border-top-left-radius: 0; border-bottom-left-radius: 0; }
+  .cal-bar:not(.e) { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  .cal-hint { color: var(--muted); font-size: 12.5px; margin: 10px 2px 0; }
+
+  .cal-agenda { margin-top: 22px; }
+  .ag-list { display: flex; flex-direction: column; gap: 2px; }
+  .ag-row { display: flex; align-items: center; gap: 10px; padding: 9px 6px;
+    border-bottom: 1px solid var(--border); }
+  .ag-row:last-child { border-bottom: none; }
+  .ag-dot { width: 9px; height: 9px; border-radius: 999px; flex: none; }
+  .ag-shop { font-weight: 600; flex: none; }
+  .ag-desc { color: var(--muted); font-size: 13.5px; flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ag-badge { font-size: 11.5px; font-weight: 600; color: #059669;
+    background: color-mix(in srgb, #059669 14%, transparent);
+    padding: 2px 9px; border-radius: 999px; flex: none; }
+  @media (prefers-color-scheme: dark) { .ag-badge { color: #34d399; } }
+  .empty-agenda { text-align: center; color: var(--muted); padding: 54px 20px; line-height: 1.7; }
+
   .empty { text-align: center; color: var(--muted); padding: 70px 20px; }
   .empty svg { width: 42px; height: 42px; opacity: .5; margin-bottom: 12px; }
   .toast {
@@ -326,6 +387,7 @@
       <button data-view="categories">Categories</button>
       <button data-view="shops">Brands</button>
       <button data-view="spend">Spend</button>
+      <button data-view="calendar">Sales</button>
     </div>
     <select class="shopsel" id="sortsel" title="Sort items">
       <option value="newest">Newest first</option>
@@ -377,8 +439,11 @@ const CAT_ICON = {
 function icon(cat){ return SVG_OPEN + (ICONS[CAT_ICON[cat] || 'other']) + '</svg>'; }
 
 // ----- state -----
-let DATA = { items: [], categories: [], shops: [], stats: {} };
+let DATA = { items: [], categories: [], shops: [], stats: {}, sales: { today: null, entries: [] } };
 let view = 'timeline';
+// Calendar tab: first-of-month currently shown (a Date). null → derived from
+// DATA.sales.today on first render; the ◀ ▶ nav steps it a month at a time.
+let calMonth = null;
 let query = '';
 const selectedCats = new Set();
 let brandFilter = '';   // type-to-filter text on the Brands tab
@@ -505,7 +570,13 @@ function emptyHtml(msg){
 // dashboard, and keep its value in sync with the persisted `sortBy`.
 function syncControls(){
   const ss = el('sortsel');
-  if(ss){ ss.value = sortBy; ss.style.display = (view==='spend') ? 'none' : ''; }
+  if(ss){ ss.value = sortBy; ss.style.display = (view==='spend'||view==='calendar') ? 'none' : ''; }
+  // Search + the item-filter chips are meaningless on the Sales calendar
+  // (it lists shop announcements, not wardrobe items) — hide them there.
+  const cal = (view==='calendar');
+  el('searchWrap').style.display = cal ? 'none' : '';
+  el('noPhotoBtn').style.display = cal ? 'none' : '';
+  el('editedBtn').style.display = cal ? 'none' : '';
 }
 
 // render() rebuilds the facets + content. renderContent() rebuilds just the
@@ -535,6 +606,15 @@ function renderContent(){
   const content = el('content');
 
   if(view==='spend'){ content.innerHTML = spendView(all, filtered); return; }
+
+  if(view==='calendar'){
+    const n = (DATA.sales.entries||[]).length;
+    el('resultLine').textContent = n
+      ? `${n} announced sale${n===1?'':'s'} at shops you track`
+      : 'No announced sales right now';
+    content.innerHTML = calendarView();
+    return;
+  }
 
   if(!all.length){ content.innerHTML = emptyHtml('No items match.'); return; }
 
@@ -638,6 +718,135 @@ function spendView(items, filtered){
   monthRows.sort((a,b)=> (b.key||'').localeCompare(a.key||''));   // newest month first
   return spendSection('Spend by category', catRows, { icon:true, label:catLabel, avg:true, click:true })
        + spendSection('Spend by month', monthRows, { icon:false, label:fmtMonth, avg:true, click:false });
+}
+
+// ----- sales calendar view (the "Sales" tab) -----
+// Plots DATA.sales — the persisted email/SMS sale announcements built
+// server-side from email_sales.json, the same store the daily digest's "Sales
+// announced by email" section reads. Dated sales get a bar on the month grid
+// spanning their run; active/undated ones list in the agenda strip below. The
+// data is sparse by nature (only sales announced early by email/SMS, judged
+// real by Claude, with a resolvable date land on the grid), so the grid is
+// often near-empty and the agenda carries the rest — that's expected.
+const DAY_MS = 86400000;
+const CAL_WD = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const CAL_MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const CAL_COLORS = ['#4f46e5','#0891b2','#059669','#d97706','#db2777','#7c3aed','#dc2626','#2563eb'];
+
+function calParseISO(s){ const m = s && /^(\d{4})-(\d{2})-(\d{2})/.exec(s); return m ? new Date(+m[1], +m[2]-1, +m[3]) : null; }
+function calYmd(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function calDayDiff(a,b){ return Math.round((b-a)/DAY_MS); }
+function calToday(){ return calParseISO(DATA.sales.today) || new Date(); }
+function startOfMonth(d){ return new Date(d.getFullYear(), d.getMonth(), 1); }
+function shopColor(shop){ let h=0; for(const ch of (shop||'')) h=(h*31+ch.charCodeAt(0))>>>0; return CAL_COLORS[h % CAL_COLORS.length]; }
+
+// Placeable [start,end] span (local midnights) for a sale on the grid, or null
+// when it carries no date at all (→ agenda strip). An end-only "active" sale
+// runs today→end; a start-only "upcoming" sale is a single-day marker.
+function saleSpan(e, today){
+  const s0 = calParseISO(e.starts_on), e0 = calParseISO(e.ends_on);
+  const s = s0 || (e0 ? today : null);
+  let end = e0 || s0;
+  if(!s || !end) return null;
+  if(end < s) end = s;                 // guard a mis-resolved end before start
+  return { s, e: end };
+}
+
+function calendarView(){
+  const today = calToday();
+  if(!calMonth) calMonth = startOfMonth(today);
+  const entries = DATA.sales.entries || [];
+  const dated = [], undated = [];
+  for(const e of entries){ (saleSpan(e, today) ? dated : undated).push(e); }
+
+  const grid = monthGrid(calMonth, today, dated);
+  // Discoverability: dated sales that fall outside the shown month (sparse data
+  // makes an off-month sale easy to miss).
+  const mStart = startOfMonth(calMonth);
+  const mEnd = new Date(calMonth.getFullYear(), calMonth.getMonth()+1, 0);
+  const off = dated.filter(e => { const sp = saleSpan(e, today); return sp.e < mStart || sp.s > mEnd; }).length;
+  const hint = off ? `<div class="cal-hint">${off} dated sale${off===1?'':'s'} in other months — use ‹ › to browse</div>` : '';
+  return `<section class="calwrap">${calHeader(calMonth)}${grid}${hint}</section>${agendaStrip(undated, entries.length)}`;
+}
+
+function calHeader(m){
+  const label = CAL_MONTHS[m.getMonth()]+' '+m.getFullYear();
+  return `<div class="cal-head">`
+    + `<button class="cal-nav" data-calnav="-1" aria-label="Previous month">‹</button>`
+    + `<div class="cal-title">${esc(label)}</div>`
+    + `<button class="cal-nav" data-calnav="1" aria-label="Next month">›</button>`
+    + `<button class="cal-today" data-calnav="0">Today</button>`
+    + `</div>`;
+}
+
+function monthGrid(m, today, dated){
+  const first = startOfMonth(m);
+  const gridStart = new Date(first); gridStart.setDate(1 - first.getDay());   // back to the Sunday
+  const wdHead = `<div class="cal-wd">${CAL_WD.map(d=>`<span>${d}</span>`).join('')}</div>`;
+  let body = '';
+  for(let w=0; w<6; w++){
+    const days = [];
+    for(let d=0; d<7; d++){ const dt = new Date(gridStart); dt.setDate(gridStart.getDate()+w*7+d); days.push(dt); }
+    body += weekRow(days, m, today, dated);
+  }
+  return `<div class="cal-grid">${wdHead}${body}</div>`;
+}
+
+function weekRow(days, m, today, dated){
+  const weekStart = days[0], weekEnd = days[6], tYmd = calYmd(today);
+  const cells = days.map(dt => {
+    const out = dt.getMonth() !== m.getMonth();
+    const isToday = calYmd(dt) === tYmd;
+    return `<div class="cal-cell${out?' out':''}${isToday?' today':''}"><span class="cal-dnum">${dt.getDate()}</span></div>`;
+  }).join('');
+
+  // Bars for sales overlapping this week, clamped to the 7 columns.
+  const bars = [];
+  for(const e of dated){
+    const sp = saleSpan(e, today);
+    if(!sp || sp.e < weekStart || sp.s > weekEnd) continue;
+    const cs = Math.max(0, calDayDiff(weekStart, sp.s));
+    const ce = Math.min(6, calDayDiff(weekStart, sp.e));
+    bars.push({ e, cs, ce, startsHere: sp.s >= weekStart, endsHere: sp.e <= weekEnd });
+  }
+  // Greedy lane assignment so overlapping bars stack rather than collide.
+  bars.sort((a,b)=> a.cs-b.cs || a.ce-b.ce);
+  const laneEnds = [];
+  for(const b of bars){
+    let lane = 0;
+    while(lane < laneEnds.length && laneEnds[lane] >= b.cs) lane++;
+    laneEnds[lane] = b.ce; b.lane = lane;
+  }
+  const barsHtml = bars.map(b => {
+    const col = shopColor(b.e.shop);
+    const tip = b.e.shop + (b.e.description ? ' · ' + b.e.description : '') + (b.e.countdown ? ' — ' + b.e.countdown : '');
+    const cls = 'cal-bar' + (b.startsHere?' s':'') + (b.endsHere?' e':'');
+    return `<div class="${cls}" style="grid-column:${b.cs+1}/${b.ce+2};grid-row:${b.lane+1};--c:${col}" title="${esc(tip)}"><span>${esc(b.e.shop)}</span></div>`;
+  }).join('');
+  const lanes = Math.max(1, laneEnds.length);
+  const h = 26 + lanes*19 + 4;
+  return `<div class="cal-week" style="height:${h}px"><div class="cal-cells">${cells}</div>`
+    + `<div class="cal-bars">${barsHtml}</div></div>`;
+}
+
+function agendaStrip(undated, totalCount){
+  if(!undated.length){
+    return totalCount
+      ? ''   // everything dated is on the grid
+      : `<div class="empty-agenda">No sales announced by email or text right now.<br>`
+        + `Advance sale announcements from shops you track will appear here.</div>`;
+  }
+  const rows = undated.map(e =>
+    `<div class="ag-row">`
+    + `<span class="ag-dot" style="background:${shopColor(e.shop)}"></span>`
+    + `<span class="ag-shop">${esc(e.shop)}</span>`
+    + `<span class="ag-desc">${esc(e.description||'')}</span>`
+    + `<span class="ag-badge">Live now</span>`
+    + `</div>`).join('');
+  return `<section class="cal-agenda">`
+    + `<div class="group-head" style="cursor:default"><h2>Active now (no fixed dates)</h2>`
+    + `<span class="count">${undated.length}</span></div>`
+    + `<div class="ag-list">${rows}</div></section>`;
 }
 
 function sumSpent(items){
@@ -1039,6 +1248,14 @@ el('clearBtn').addEventListener('click', () => { searchInput.value=''; query='';
 // category; a card opens its detail. (Spend-view headers are `.group-head` but
 // NOT inside a `.group`, so the collapse branch falls through to a no-op.)
 el('content').addEventListener('click', e => {
+  const nav = e.target.closest('[data-calnav]');
+  if(nav){
+    const d = +nav.dataset.calnav;
+    calMonth = (d===0) ? startOfMonth(calToday())
+                       : new Date(calMonth.getFullYear(), calMonth.getMonth()+d, 1);
+    renderContent();
+    return;
+  }
   const head = e.target.closest('.group-head');
   if(head){
     const sec = head.closest('.group'); if(!sec) return;
