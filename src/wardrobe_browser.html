@@ -156,6 +156,12 @@
     border: 1px solid var(--border); color: var(--muted); font-size: 11px;
     padding: 2px 8px; border-radius: 999px;
   }
+  .card .thumb .edited-badge {
+    position: absolute; top: 8px; right: 8px; background: var(--surface);
+    border: 1px solid var(--border); color: var(--muted); border-radius: 999px;
+    width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center;
+  }
+  .card .thumb .edited-badge svg { width: 12px; height: 12px; opacity: 1; }
   .card .body { padding: 11px 12px 12px; display: flex; flex-direction: column; gap: 7px; flex: 1; }
   .card .name { font-weight: 600; font-size: 14px; line-height: 1.3;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -232,8 +238,21 @@
   .modal .mthumb svg { width: 60%; height: 60%; opacity: .6; }
   .modal .mthumb img { width: 100%; height: 100%; object-fit: cover; }
   .modal .mtitle { flex: 1; min-width: 0; }
+  .modal .mtitle-row { display: flex; align-items: flex-start; gap: 6px; }
   .modal .mh h3 { margin: 0 0 2px; font-size: 16px; line-height: 1.3; }
   .modal .mh .msub { color: var(--muted); font-size: 13px; }
+  .modal .msub .edited-tag { color: var(--accent); }
+  .name-edit {
+    border: none; background: transparent; color: var(--muted); cursor: pointer;
+    padding: 2px; line-height: 0; flex: none; border-radius: 6px; margin-top: 1px;
+  }
+  .name-edit:hover { color: var(--accent); background: var(--chip); }
+  .name-edit svg { width: 15px; height: 15px; }
+  .name-input {
+    flex: 1; min-width: 0; border: 1px solid var(--border); background: var(--surface);
+    color: var(--text); border-radius: 8px; padding: 6px 9px; font-size: 15px; font-family: inherit;
+  }
+  .btn.sm { padding: 6px 12px; font-size: 13px; border-radius: 8px; font-weight: 500; flex: none; }
   .modal .mclose { border: none; background: transparent; color: var(--muted); font-size: 23px; cursor: pointer; line-height: 1; padding: 0 4px; }
   .modal .mbody { padding: 14px 18px 18px; display: flex; flex-direction: column; gap: 12px; }
   .drow { display: flex; gap: 10px; font-size: 13.5px; }
@@ -310,6 +329,7 @@
       <option value="name">Name: A → Z</option>
     </select>
     <button class="chip" id="noPhotoBtn" title="Work queue: show only items without a photo (add one from the item's detail panel)">No photo <span class="n" id="noPhotoCount"></span></button>
+    <button class="chip" id="editedBtn" title="Show only items whose product name you manually edited">Edited names <span class="n" id="editedCount"></span></button>
   </div>
   <div class="facets" id="facets"></div>
   <div class="result-line" id="resultLine"></div>
@@ -357,6 +377,7 @@ let query = '';
 const selectedCats = new Set();
 let brandFilter = '';   // type-to-filter text on the Brands tab
 let noPhotoOnly = false;  // work-queue filter: only items with no cached photo
+let editedOnly = false;   // filter: only items whose name was manually edited
 let sortBy = localStorage.getItem('wardrobeSort') || 'newest';
 let META = { category_choices: [], fit_enabled: false, review_requests_enabled: false };
 // Detected post-purchase review requests, grouped by brand_key (loaded async
@@ -409,6 +430,7 @@ function sortItems(arr){
 // ----- filtering -----
 function matches(it){
   if(noPhotoOnly && it.image) return false;
+  if(editedOnly && !it.name_edited) return false;
   if(view==='categories' && selectedCats.size && !selectedCats.has(it.category)) return false;
   if(query){
     const hay = (it.name+' '+it.shop+' '+it.color+' '+it.size+' '+it.category_label).toLowerCase();
@@ -419,6 +441,9 @@ function matches(it){
 
 // ----- card -----
 const EXT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>';
+const PENCIL_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
+// Tooltip text for the "name manually edited" flag (card badge + detail tag).
+function editedTitle(it){ return it.name_original ? 'Name manually edited — originally: '+it.name_original : 'Name manually edited'; }
 const PRODUCT_LINK_TITLE = { search: 'Search the web for this product', watchlist: 'Open product page (from your watchlist)' };
 function card(it){
   const thumb = it.image
@@ -432,8 +457,11 @@ function card(it){
   const ext = pl
     ? `<a class="cardlink" href="${esc(pl.href)}" target="_blank" rel="noopener" title="${esc(PRODUCT_LINK_TITLE[pl.kind] || 'Open product page')}" onclick="event.stopPropagation()">${EXT_ICON}</a>`
     : '';
+  const editedBadge = it.name_edited
+    ? `<span class="edited-badge" title="${esc(editedTitle(it))}">${PENCIL_ICON}</span>`
+    : '';
   return `<div class="card" data-id="${esc(it.id)}">
-    <div class="thumb">${thumb}<span class="cat-tag">${esc(it.category_label)}</span></div>
+    <div class="thumb">${thumb}<span class="cat-tag">${esc(it.category_label)}</span>${editedBadge}</div>
     <div class="body">
       <div class="name" title="${esc(it.name)}">${esc(it.name)||'—'}</div>
       <div class="shop">${esc(it.shop)}</div>
@@ -493,7 +521,7 @@ function updateBrandCount(shown, total){
 
 function renderContent(){
   const all = sortItems(DATA.items.filter(matches));
-  const filtered = !!(query || selectedCats.size || noPhotoOnly);
+  const filtered = !!(query || selectedCats.size || noPhotoOnly || editedOnly);
   el('resultLine').textContent = filtered
     ? `Showing ${all.length} of ${DATA.items.length} items`
     : `${DATA.items.length} items`;
@@ -813,7 +841,13 @@ function detailHtml(it){
   return `
     <div class="mh">
       <div class="mthumb">${thumb}</div>
-      <div class="mtitle"><h3>${esc(it.name)||'—'}</h3><div class="msub">${esc(it.shop)}</div></div>
+      <div class="mtitle">
+        <div class="mtitle-row" id="mNameRow">
+          <h3 id="mName">${esc(it.name)||'—'}</h3>
+          <button class="name-edit" id="nameEditBtn" type="button" title="Edit product name" aria-label="Edit product name">${PENCIL_ICON}</button>
+        </div>
+        <div class="msub">${esc(it.shop)}${it.name_edited?` · <span class="edited-tag" title="${esc(editedTitle(it))}">edited</span>`:''}</div>
+      </div>
       <button class="mclose" id="mclose" title="Close">×</button>
     </div>
     <div class="mbody">
@@ -839,6 +873,7 @@ function closeDetail(){ el('modalBack').classList.remove('open'); currentId = nu
 
 function wireDetail(it){
   const close = el('mclose'); if(close) close.onclick = closeDetail;
+  const nameBtn = el('nameEditBtn'); if(nameBtn) nameBtn.onclick = () => startNameEdit(it);
   const catSel = el('catSel'); if(catSel) catSel.onchange = () => doCategoryEdit(it.id, catSel.value);
   const more = el('moreToggle'); if(more) more.onclick = () => { const w=el('moreWrap'); w.style.display = w.style.display==='none'?'block':'none'; };
   const submit = el('fitSubmit'); if(submit) submit.onclick = () => doFitSubmit(it.id);
@@ -873,6 +908,41 @@ async function doAddImage(id){
   } catch(e){
     toast('Could not add photo: ' + e.message);
     if(btn){ btn.disabled = false; btn.textContent = 'Add photo'; }
+  }
+}
+
+// Swap the detail-panel title into an inline editor (input + Save/Cancel).
+// Cancel/Escape just re-renders the modal from unchanged DATA.
+function startNameEdit(it){
+  const row = el('mNameRow');
+  if(!row) return;
+  row.innerHTML =
+    `<input id="nameInput" class="name-input" type="text" maxlength="300" value="${esc(it.name)}">`
+    + `<button class="btn sm" id="nameSave" type="button">Save</button>`
+    + `<button class="more-toggle" id="nameCancel" type="button">Cancel</button>`;
+  const inp = el('nameInput'); inp.focus(); inp.select();
+  el('nameSave').onclick = () => doNameEdit(it.id);
+  el('nameCancel').onclick = () => openDetail(it.id);
+  inp.addEventListener('keydown', e => {
+    if(e.key === 'Enter'){ e.preventDefault(); doNameEdit(it.id); }
+    else if(e.key === 'Escape'){ e.preventDefault(); openDetail(it.id); }
+  });
+}
+
+// Persist a manually-edited name. The server returns the rebuilt payload (like
+// category/photo edits), so the card, title, and "edited" flag update at once.
+async function doNameEdit(id){
+  const inp = el('nameInput'); if(!inp) return;
+  const name = inp.value.trim();
+  if(!name){ toast('Name can’t be empty'); return; }
+  const btn = el('nameSave'); if(btn){ btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    const d = await postJson('/api/item/name', { id, name });
+    DATA = d; setSub(); render(); openDetail(id);
+    toastOk('Name updated');
+  } catch(e){
+    toast('Could not update name: ' + e.message);
+    if(btn){ btn.disabled = false; btn.textContent = 'Save'; }
   }
 }
 
@@ -967,6 +1037,12 @@ el('noPhotoBtn').addEventListener('click', () => {
   render();
 });
 
+el('editedBtn').addEventListener('click', () => {
+  editedOnly = !editedOnly;
+  el('editedBtn').classList.toggle('on', editedOnly);
+  render();
+});
+
 // Modal: click the backdrop or press Escape to close.
 el('modalBack').addEventListener('click', e => { if(e.target === el('modalBack')) closeDetail(); });
 document.addEventListener('keydown', e => { if(e.key === 'Escape' && el('modalBack').classList.contains('open')) closeDetail(); });
@@ -1008,11 +1084,17 @@ function setSub(){
   const spent = spentLabel(s.total_spent);
   el('subline').textContent = `${s.total||0} items · ${s.shop_count||0} brands` + (range?` · ${range}`:'') + (spent?` · ${spent} spent`:'');
   updateNoPhotoCount();
+  updateEditedCount();
 }
 
 function updateNoPhotoCount(){
   const n = DATA.items.filter(i => !i.image).length;
   const c = el('noPhotoCount'); if(c) c.textContent = n;
+}
+
+function updateEditedCount(){
+  const n = DATA.items.filter(i => i.name_edited).length;
+  const c = el('editedCount'); if(c) c.textContent = n;
 }
 
 function toast(msg){ showToast(msg, false); }

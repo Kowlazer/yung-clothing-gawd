@@ -682,6 +682,34 @@ class TestCatalogueWrites:
         with pytest.raises(KeyError):
             cat.edit_category("missing", "hoodie")
 
+    def test_edit_name_writes_and_returns_payload(self, monkeypatch):
+        st = self._state()
+        written = {}
+        monkeypatch.setattr(wb.state, "read_state", lambda g, t, **k: st)
+        monkeypatch.setattr(wb.state, "write_state",
+                            lambda g, t, **kw: written.update(kw))
+        cat = wb._Catalogue("g", "t", None)
+        payload = cat.edit_name("a", "Corrected Name")
+        assert written["wardrobe"]["items"][0]["item_name"] == "Corrected Name"
+        assert written["wardrobe"]["items"][0]["item_name_original"] == "Kitsune"
+        pitem = next(i for i in payload["items"] if i["id"] == "a")
+        assert pitem["name"] == "Corrected Name"
+        assert pitem["name_edited"] is True
+
+    def test_edit_name_unknown_id_raises_keyerror(self, monkeypatch):
+        monkeypatch.setattr(wb.state, "read_state", lambda g, t, **k: self._state())
+        monkeypatch.setattr(wb.state, "write_state", lambda *a, **k: None)
+        cat = wb._Catalogue("g", "t", None)
+        with pytest.raises(KeyError):
+            cat.edit_name("missing", "X")
+
+    def test_edit_name_empty_raises_valueerror(self, monkeypatch):
+        monkeypatch.setattr(wb.state, "read_state", lambda g, t, **k: self._state())
+        monkeypatch.setattr(wb.state, "write_state", lambda *a, **k: None)
+        cat = wb._Catalogue("g", "t", None)
+        with pytest.raises(ValueError):
+            cat.edit_name("a", "  ")
+
     def test_submit_fit_unconfigured_raises(self):
         cat = wb._Catalogue("g", "t", None)  # no fit secrets
         assert cat.fit_enabled is False
@@ -975,6 +1003,77 @@ def test_apply_image_edit_never_overwrites_product_url():
 
 def test_apply_image_edit_unknown_id_returns_none():
     assert wb.apply_image_edit(_image_edit_wardrobe(), "zzz", "https://x/t.jpg") is None
+
+
+# --------------------------------------------------------------------------
+# apply_name_edit + the name-edited payload flag
+# --------------------------------------------------------------------------
+
+def _name_edit_wardrobe(**extra):
+    return {"items": [
+        {"id": "a", "item_name": "Loose Fit Sweatpants", "shop": "Old Navy",
+         "category": "sweatpants", "purchased_at": "2026-04-15", **extra},
+    ]}
+
+
+def test_apply_name_edit_sets_name_and_flag():
+    w = _name_edit_wardrobe()
+    item = wb.apply_name_edit(w, "a", "  Rotation Tapered Jogger  ")
+    assert item["item_name"] == "Rotation Tapered Jogger"        # trimmed
+    assert item["item_name_original"] == "Loose Fit Sweatpants"  # original recorded
+    assert item["name_edited_at"]                                # flag timestamp set
+
+
+def test_apply_name_edit_keeps_first_original_across_edits():
+    w = _name_edit_wardrobe()
+    wb.apply_name_edit(w, "a", "First Rename")
+    item = wb.apply_name_edit(w, "a", "Second Rename")
+    assert item["item_name"] == "Second Rename"
+    assert item["item_name_original"] == "Loose Fit Sweatpants"  # the true original
+
+
+def test_apply_name_edit_unchanged_is_noop():
+    item = wb.apply_name_edit(_name_edit_wardrobe(), "a", "Loose Fit Sweatpants")
+    assert "name_edited_at" not in item
+    assert "item_name_original" not in item
+
+
+def test_apply_name_edit_revert_to_original_clears_flag():
+    w = _name_edit_wardrobe()
+    wb.apply_name_edit(w, "a", "Renamed")
+    item = wb.apply_name_edit(w, "a", "Loose Fit Sweatpants")   # back to original
+    assert item["item_name"] == "Loose Fit Sweatpants"
+    assert "name_edited_at" not in item
+    assert "item_name_original" not in item
+
+
+def test_apply_name_edit_empty_raises():
+    with pytest.raises(ValueError):
+        wb.apply_name_edit(_name_edit_wardrobe(), "a", "   ")
+
+
+def test_apply_name_edit_too_long_raises():
+    with pytest.raises(ValueError):
+        wb.apply_name_edit(_name_edit_wardrobe(), "a", "x" * 301)
+
+
+def test_apply_name_edit_unknown_id_returns_none():
+    assert wb.apply_name_edit(_name_edit_wardrobe(), "zzz", "New") is None
+
+
+def test_build_payload_surfaces_name_edit_flag():
+    w = {"items": [
+        {"id": "a", "item_name": "Renamed", "item_name_original": "Orig",
+         "name_edited_at": "2026-07-12T00:00:00+00:00", "shop": "S",
+         "category": "tshirt", "purchased_at": "2026-04-15"},
+        {"id": "b", "item_name": "Plain", "shop": "S",
+         "category": "tshirt", "purchased_at": "2026-04-15"},
+    ]}
+    by_id = {i["id"]: i for i in wb.build_payload(w, None)["items"]}
+    assert by_id["a"]["name_edited"] is True
+    assert by_id["a"]["name_original"] == "Orig"
+    assert by_id["b"]["name_edited"] is False
+    assert by_id["b"]["name_original"] is None
 
 
 # --------------------------------------------------------------------------

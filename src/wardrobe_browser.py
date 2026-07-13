@@ -56,7 +56,7 @@ import threading
 import time
 import webbrowser
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
@@ -581,6 +581,10 @@ def _normalise_item(item: dict, category: str, image_dir: Path | None) -> dict:
     return {
         "id": item.get("id") or "",
         "name": (item.get("item_name") or "").strip(),
+        # Manual-edit flag (see apply_name_edit): name_edited drives the card
+        # badge / filter chip; name_original is the pre-edit name for a tooltip.
+        "name_edited": bool(item.get("name_edited_at")),
+        "name_original": (item.get("item_name_original") or "").strip() or None,
         "shop": (item.get("shop") or "").strip() or "Unknown",
         "shop_domain": item.get("shop_domain") or "",
         "category": category,
@@ -792,6 +796,51 @@ def apply_image_edit(
     return None
 
 
+_NAME_MAX_LEN = 300
+
+
+def apply_name_edit(wardrobe: dict, item_id: str, new_name: str) -> dict | None:
+    """Set a manual ``item_name`` on one wardrobe item, in place.
+
+    Mirrors :func:`apply_category_edit`. Extraction gives every item a name, but
+    it can be wrong (a generic big-box title, a colourway-only string), so this
+    lets the user correct it from the browser and *flags* the change:
+
+    * ``item_name_original`` records the pre-edit name — set once, on the first
+      edit, so it always holds the true original across repeated edits and backs
+      the "originally: …" tooltip.
+    * ``name_edited_at`` timestamps the edit; its presence is the flag
+      (``_normalise_item`` derives ``name_edited`` from it).
+
+    An unchanged submit is a no-op (never flags). Reverting to the original name
+    clears both markers, so the flag means exactly "differs from the extracted
+    name". Raises ``ValueError`` on an empty/over-long name; returns the edited
+    raw item dict, or ``None`` when the id isn't found.
+    """
+    name = (new_name or "").strip()
+    if not name:
+        raise ValueError("product name can't be empty")
+    if len(name) > _NAME_MAX_LEN:
+        raise ValueError(f"product name too long (max {_NAME_MAX_LEN} characters)")
+    for it in (wardrobe.get("items") or []):
+        if it.get("id") == item_id:
+            if name == (it.get("item_name") or "").strip():
+                return it  # unchanged — don't flag a no-op submit
+            stored_original = it.get("item_name_original")
+            if stored_original is not None and name == stored_original.strip():
+                # Reverted to the extracted name — drop the edited markers.
+                it["item_name"] = stored_original
+                it.pop("item_name_original", None)
+                it.pop("name_edited_at", None)
+                return it
+            if stored_original is None:
+                it["item_name_original"] = it.get("item_name") or ""
+            it["item_name"] = name
+            it["name_edited_at"] = datetime.now(timezone.utc).isoformat()
+            return it
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Data source
 # ---------------------------------------------------------------------------
@@ -929,6 +978,29 @@ class _Catalogue:
         st = state.read_state(self._gist_id, self._token, fresh=True)
         wardrobe = st.get("wardrobe") or {}
         item = apply_category_edit(wardrobe, item_id, category)
+        if item is None:
+            raise KeyError(item_id)
+        state.write_state(
+            self._gist_id, self._token,
+            prices=st.get("prices") or {},
+            aliases=st.get("aliases") or {},
+            codes=st.get("codes") or [],
+            wardrobe=wardrobe,
+        )
+        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+
+    def edit_name(self, item_id: str, name: str) -> dict:
+        """Persist a manual product name to the Gist (read-modify-write), re-render.
+
+        Same read-modify-write shape as :meth:`edit_category` (fresh read so a
+        concurrent cron/scan write isn't clobbered). Raises ``KeyError`` for an
+        unknown id, ``ValueError`` for an empty/over-long name.
+        """
+        if not (item_id or "").strip():
+            raise ValueError("missing item id")
+        st = state.read_state(self._gist_id, self._token, fresh=True)
+        wardrobe = st.get("wardrobe") or {}
+        item = apply_name_edit(wardrobe, item_id, name)
         if item is None:
             raise KeyError(item_id)
         state.write_state(
@@ -1225,6 +1297,9 @@ def _make_handler(catalogue: _Catalogue):
             elif path == "/api/item/category":
                 self._handle_write(lambda b: catalogue.edit_category(
                     (b.get("id") or ""), b.get("category")))
+            elif path == "/api/item/name":
+                self._handle_write(lambda b: catalogue.edit_name(
+                    (b.get("id") or ""), b.get("name")))
             elif path == "/api/item/fit":
                 self._handle_write(lambda b: catalogue.submit_fit(b))
             elif path == "/api/item/image":
