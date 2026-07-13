@@ -710,6 +710,45 @@ class TestCatalogueWrites:
         with pytest.raises(ValueError):
             cat.edit_name("a", "  ")
 
+    def test_delete_item_writes_without_it_and_returns_payload(self, monkeypatch):
+        st = self._state()
+        st["wardrobe"]["items"].append(
+            {"id": "b", "item_name": "Chino", "shop": "Norse", "category": "pants"})
+        written = {}
+        monkeypatch.setattr(wb.state, "read_state", lambda g, t, **k: st)
+        monkeypatch.setattr(wb.state, "write_state",
+                            lambda g, t, **kw: written.update(kw))
+        cat = wb._Catalogue("g", "t", None)
+        payload = cat.delete_item("a")
+        assert [i["id"] for i in written["wardrobe"]["items"]] == ["b"]
+        assert [i["id"] for i in payload["items"]] == ["b"]
+
+    def test_delete_item_unknown_id_raises_and_does_not_write(self, monkeypatch):
+        wrote = []
+        monkeypatch.setattr(wb.state, "read_state", lambda g, t, **k: self._state())
+        monkeypatch.setattr(wb.state, "write_state",
+                            lambda *a, **k: wrote.append(True))
+        cat = wb._Catalogue("g", "t", None)
+        with pytest.raises(KeyError):
+            cat.delete_item("missing")
+        assert wrote == []   # a no-op delete must never write to the Gist
+
+    def test_delete_item_empty_id_raises_valueerror(self, monkeypatch):
+        monkeypatch.setattr(wb.state, "read_state", lambda g, t, **k: self._state())
+        monkeypatch.setattr(wb.state, "write_state", lambda *a, **k: None)
+        cat = wb._Catalogue("g", "t", None)
+        with pytest.raises(ValueError):
+            cat.delete_item("  ")
+
+    def test_delete_item_removes_cached_image(self, monkeypatch, tmp_path):
+        st = self._state()
+        (tmp_path / "a.jpg").write_bytes(b"x")   # a cached photo for the item
+        monkeypatch.setattr(wb.state, "read_state", lambda g, t, **k: st)
+        monkeypatch.setattr(wb.state, "write_state", lambda *a, **k: None)
+        cat = wb._Catalogue("g", "t", tmp_path)
+        cat.delete_item("a")
+        assert not (tmp_path / "a.jpg").exists()   # orphan bytes cleaned up
+
     def test_submit_fit_unconfigured_raises(self):
         cat = wb._Catalogue("g", "t", None)  # no fit secrets
         assert cat.fit_enabled is False
@@ -1059,6 +1098,42 @@ def test_apply_name_edit_too_long_raises():
 
 def test_apply_name_edit_unknown_id_returns_none():
     assert wb.apply_name_edit(_name_edit_wardrobe(), "zzz", "New") is None
+
+
+# --------------------------------------------------------------------------
+# apply_item_delete
+# --------------------------------------------------------------------------
+
+def _delete_wardrobe(**extra):
+    return {"items": [
+        {"id": "a", "item_name": "Kitsune Tee", "shop": "Sumie"},
+        {"id": "b", "item_name": "Aros Chino", "shop": "Norse Projects"},
+    ], **extra}
+
+
+def test_apply_item_delete_removes_and_returns_item():
+    w = _delete_wardrobe()
+    removed = wb.apply_item_delete(w, "a")
+    assert removed["id"] == "a"
+    assert [it["id"] for it in w["items"]] == ["b"]   # only the target is gone
+
+
+def test_apply_item_delete_unknown_id_returns_none_and_keeps_items():
+    w = _delete_wardrobe()
+    assert wb.apply_item_delete(w, "zzz") is None
+    assert [it["id"] for it in w["items"]] == ["a", "b"]   # nothing removed
+
+
+def test_apply_item_delete_leaves_processed_email_ids_untouched():
+    # Deleting an item must NOT un-record its order email, or the next scan
+    # would re-ingest the same mis-extraction.
+    w = _delete_wardrobe(scan_state={"processed_email_ids": {"123": "2026-01-01"}})
+    wb.apply_item_delete(w, "a")
+    assert w["scan_state"]["processed_email_ids"] == {"123": "2026-01-01"}
+
+
+def test_apply_item_delete_empty_items_returns_none():
+    assert wb.apply_item_delete({}, "a") is None
 
 
 def test_build_payload_surfaces_name_edit_flag():

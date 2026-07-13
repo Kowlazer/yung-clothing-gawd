@@ -257,6 +257,23 @@ def _image_url(item_id: str, image_dir: Path | None) -> str | None:
     return None
 
 
+def _remove_cached_image(item_id: str, image_dir: Path | None) -> None:
+    """Delete any locally-cached ``<image_dir>/<id>.<ext>`` for an item.
+
+    Best-effort cleanup after a hard delete so the removed item leaves no orphan
+    bytes behind; never fatal (the Gist write has already succeeded by the time
+    this runs)."""
+    if not image_dir:
+        return
+    for ext in _IMAGE_FILE_EXTS:
+        f = image_dir / f"{item_id}.{ext}"
+        try:
+            if f.is_file():
+                f.unlink()
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Product-image fetch step (--fetch-images, issue #19)
 # ---------------------------------------------------------------------------
@@ -841,6 +858,28 @@ def apply_name_edit(wardrobe: dict, item_id: str, new_name: str) -> dict | None:
     return None
 
 
+def apply_item_delete(wardrobe: dict, item_id: str) -> dict | None:
+    """Hard-delete one wardrobe item from ``wardrobe["items"]``, in place.
+
+    The browser's only *destructive* edit — unlike the ``order_scan`` fit-review
+    "dropped" sentinel (a soft flag that keeps the row), this physically removes
+    the item, so it's gone from every view and from ``wardrobe.json``. Returns
+    the removed raw item dict, or ``None`` when the id isn't found (so the route
+    can 404 without writing).
+
+    ``scan_state.processed_email_ids`` is deliberately left untouched: the order
+    email stays recorded, so the next scan does not re-ingest the same item.
+    Deleting a mis-extraction therefore makes it stay gone.
+    """
+    items = wardrobe.get("items") or []
+    for i, it in enumerate(items):
+        if it.get("id") == item_id:
+            del items[i]
+            wardrobe["items"] = items
+            return it
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Data source
 # ---------------------------------------------------------------------------
@@ -1010,6 +1049,33 @@ class _Catalogue:
             codes=st.get("codes") or [],
             wardrobe=wardrobe,
         )
+        return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
+
+    def delete_item(self, item_id: str) -> dict:
+        """Hard-delete one item from the Gist (read-modify-write), re-render.
+
+        Same read-modify-write shape as :meth:`edit_category` (a *fresh* read so
+        a concurrent cron/scan write isn't clobbered), plus a best-effort cleanup
+        of the item's locally-cached photo so no orphan lingers in the image dir.
+        Raises ``ValueError`` for a missing id, ``KeyError`` for an unknown id.
+        """
+        item_id = (item_id or "").strip()
+        if not item_id:
+            raise ValueError("missing item id")
+        st = state.read_state(self._gist_id, self._token, fresh=True)
+        wardrobe = st.get("wardrobe") or {}
+        removed = apply_item_delete(wardrobe, item_id)
+        if removed is None:
+            raise KeyError(item_id)
+        state.write_state(
+            self._gist_id, self._token,
+            prices=st.get("prices") or {},
+            aliases=st.get("aliases") or {},
+            codes=st.get("codes") or [],
+            wardrobe=wardrobe,
+        )
+        # The item's gone; its cached bytes are dead weight. Never fatal.
+        _remove_cached_image(item_id, self._image_dir)
         return self._store(build_payload(wardrobe, self._image_dir), wardrobe)
 
     def add_image(self, body: dict) -> dict:
@@ -1300,6 +1366,9 @@ def _make_handler(catalogue: _Catalogue):
             elif path == "/api/item/name":
                 self._handle_write(lambda b: catalogue.edit_name(
                     (b.get("id") or ""), b.get("name")))
+            elif path == "/api/item/delete":
+                self._handle_write(lambda b: catalogue.delete_item(
+                    (b.get("id") or "")))
             elif path == "/api/item/fit":
                 self._handle_write(lambda b: catalogue.submit_fit(b))
             elif path == "/api/item/image":

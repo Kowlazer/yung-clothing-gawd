@@ -14,6 +14,8 @@
     --muted: #6b7280;
     --accent: #4f46e5;
     --accent-soft: #eef0fe;
+    --danger: #dc2626;
+    --danger-soft: #fef2f2;
     --chip: #eef1f5;
     --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
     --radius: 14px;
@@ -28,6 +30,8 @@
       --muted: #9aa3b2;
       --accent: #818cf8;
       --accent-soft: #20243a;
+      --danger: #f87171;
+      --danger-soft: #2a1a1d;
       --chip: #232834;
       --shadow: 0 1px 2px rgba(0,0,0,.4);
     }
@@ -271,6 +275,8 @@
   .btn { border: 1px solid var(--accent); background: var(--accent); color: #fff;
     border-radius: 10px; padding: 9px 16px; cursor: pointer; font-size: 14px; font-weight: 500; }
   .btn:disabled { opacity: .55; cursor: default; }
+  .btn.danger { border-color: var(--danger); background: transparent; color: var(--danger); }
+  .btn.danger:hover { background: var(--danger-soft); }
   .linkbtn { color: var(--accent); font-size: 13.5px; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
   .linkbtn svg { width: 15px; height: 15px; }
   .more-toggle { color: var(--accent); font-size: 13px; cursor: pointer; background: none; border: none; padding: 0 0 8px; display: inline-block; }
@@ -858,6 +864,10 @@ function detailHtml(it){
       ${addImageHtml(it)}
       <div class="dsec" id="fitSec"><h4>Fit feedback</h4>${fitInner}</div>
       <div class="dsec" id="reviewSec">${reviewSectionHtml(it)}</div>
+      <div class="dsec" id="deleteSec"><h4>Remove</h4>
+        <button class="btn danger" id="deleteBtn" type="button">Delete from wardrobe</button>
+        <div class="hint" style="margin-top:7px">Permanently removes this item from the wardrobe — this can’t be undone.</div>
+      </div>
     </div>`;
 }
 
@@ -880,6 +890,7 @@ function wireDetail(it){
   const redo = el('fitRedo'); if(redo) redo.onclick = () => { el('fitSec').innerHTML = '<h4>Fit feedback</h4>'+fitFormHtml(it); wireDetail(it); };
   const imgT = el('imgToggle'); if(imgT) imgT.onclick = () => { const w=el('imgWrap'); w.style.display = w.style.display==='none'?'block':'none'; };
   const imgS = el('imgSubmit'); if(imgS) imgS.onclick = () => doAddImage(it.id);
+  const del = el('deleteBtn'); if(del) del.onclick = () => doDeleteItem(it);
 }
 
 // Add / replace a photo from whichever input the user filled. The server
@@ -908,6 +919,25 @@ async function doAddImage(id){
   } catch(e){
     toast('Could not add photo: ' + e.message);
     if(btn){ btn.disabled = false; btn.textContent = 'Add photo'; }
+  }
+}
+
+// Hard-delete an item after an explicit confirm (matches the Stop-server
+// pattern). The server returns the rebuilt payload like the other edits, so we
+// close the now-stale detail panel and re-render from it.
+async function doDeleteItem(it){
+  const name = it.name || 'this item';
+  const where = it.shop ? ` from ${it.shop}` : '';
+  if(!confirm(`Delete “${name}”${where}?\n\nThis permanently removes it from your wardrobe and can’t be undone.`)) return;
+  const btn = el('deleteBtn');
+  if(btn){ btn.disabled = true; btn.textContent = 'Deleting…'; }
+  try {
+    const d = await postJson('/api/item/delete', { id: it.id });
+    DATA = d; setSub(); closeDetail(); render();
+    toastOk('Item deleted');
+  } catch(e){
+    toast('Could not delete item: ' + e.message);
+    if(btn){ btn.disabled = false; btn.textContent = 'Delete from wardrobe'; }
   }
 }
 
