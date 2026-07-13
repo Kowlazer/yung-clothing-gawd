@@ -722,6 +722,65 @@ def test_run_threads_data_through_pipeline(monkeypatch):
     assert "20% off everything" in digest_md
 
 
+def test_run_feeds_sale_tracking_allowlist_to_both_channels(monkeypatch):
+    """The Doc's "Shops to track sales for:" section AND the SMS_SALE_SHOPS env
+    feed the sale-attribution ``known_shops`` for BOTH the email (gmail) and SMS
+    (voice) pipelines — not SMS only. Regression guard for the fix that widened
+    the email path to the same allowlist the SMS path already used."""
+    import dataclasses
+    captured: dict = {}
+
+    def capture_gmail(cfg, aliases, known_shops, prior, *, now_iso):
+        captured["gmail_known"] = list(known_shops)
+        return _empty_gmail_result()
+
+    def capture_voice(cfg, sms_aliases, known_shops, prior, *, now_iso, label):
+        captured["voice_known"] = list(known_shops)
+        return _empty_voice_result()
+
+    watchlist = (
+        "Aniqi:\n"
+        "https://aniqi.com\n"
+        "https://aniqi.com/products/x\n"
+        "\n"
+        "Shops to track sales for:\n"
+        "Vitaly\n"
+        "Quince\n"
+    )
+    cfg = dataclasses.replace(_FAKE_CONFIG, sms_sale_shops=("Wayfair",))
+
+    monkeypatch.setattr(main_mod, "fetch_watchlist", lambda url: watchlist)
+    monkeypatch.setattr(main_mod, "_gmail_pipeline", capture_gmail)
+    monkeypatch.setattr(main_mod, "_voice_pipeline", capture_voice)
+    monkeypatch.setattr(main_mod, "_review_requests_pipeline", lambda *a, **k: ([], None))
+    monkeypatch.setattr(main_mod, "_restock_emails_pipeline", lambda *a, **k: ([], None))
+    monkeypatch.setattr(main_mod, "read_state", lambda gist_id, token: {
+        "prices": {}, "aliases": {}, "codes": [], "fx": {},
+        "gmail": {"processed_ids": {}}, "voice": {"processed_ids": {}},
+        "sms_aliases": {},
+    })
+    monkeypatch.setattr(main_mod, "get_rates", lambda cache: (None, {}))
+    monkeypatch.setattr(main_mod, "extract", lambda url: {
+        "current_price": 10.0, "original_price": None, "currency": "USD",
+        "on_sale": False, "out_of_stock": False, "low_stock": False,
+        "label": "x", "total_variant_count": 1, "available_variant_count": None,
+        "color_options": [], "error": None, "error_kind": None})
+    monkeypatch.setattr(main_mod, "resolve_fuzzy", lambda **k: {
+        "shop_sales": [], "resolutions": [], "loose_matches": [],
+        "email_sales": [], "unresolved": [], "shop_verdicts": [],
+        "usage": {"input_tokens": 0, "output_tokens": 0}})
+    monkeypatch.setattr(main_mod, "write_state", lambda *a, **k: None)
+    monkeypatch.setattr(main_mod, "send_email", lambda *a, **k: "id")
+
+    main_mod.run(cfg)
+
+    for chan in ("gmail_known", "voice_known"):
+        assert "Vitaly" in captured[chan]      # Doc "track sales for" section
+        assert "Quince" in captured[chan]
+        assert "Wayfair" in captured[chan]     # SMS_SALE_SHOPS env
+        assert "Aniqi" in captured[chan]       # watchlist shop still present
+
+
 def test_run_skips_extracting_when_no_loose_matches(monkeypatch):
     """When resolve_fuzzy returns no loose-match URLs, the second extract pass
     is skipped (no spurious calls). Verifies _extract_many is only called once

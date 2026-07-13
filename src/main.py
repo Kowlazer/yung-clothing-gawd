@@ -1061,7 +1061,21 @@ def run(cfg: Config | None = None) -> str:
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
     today = now.date()
-    known_shops = sorted({s["shop"] for s in buckets["shops_to_check"] if s.get("shop")})
+    # Sale-announcement attribution covers watchlist shops PLUS the sale-tracking
+    # allowlist — shops the user gets marketing from but hasn't watchlisted, so no
+    # homepage price check runs for them (classify() strips the section before it
+    # can become a SHOP_NAME entry); only their *announced* sales are surfaced.
+    # The allowlist is the Doc's "Shops to track sales for:" section
+    # (doc_sale_shops) unioned with the legacy SMS_SALE_SHOPS env var. BOTH
+    # channels use the same set so a tracked shop's sale is caught on whichever
+    # one it announces — a promo email OR a Google-Voice-forwarded text (an
+    # allowlist shop is matched by its name appearing in the email subject / SMS
+    # body, since it has no homepage domain in shop_aliases to match on).
+    known_shops = sorted({
+        *(s["shop"] for s in buckets["shops_to_check"] if s.get("shop")),
+        *cfg.sms_sale_shops,
+        *doc_sale_shops,
+    })
     gmail_result = _gmail_pipeline(
         cfg, aliases, known_shops, prior_gmail, now_iso=now_iso,
     )
@@ -1074,15 +1088,8 @@ def run(cfg: Config | None = None) -> str:
 
     # --- Voice (Google Voice SMS forwards) — failure-isolated -----------
     voice_label = os.environ.get("VOICE_GMAIL_LABEL", _VOICE_DEFAULT_LABEL)
-    # SMS attribution covers watchlist shops PLUS the sale-tracking allowlist —
-    # shops the user gets marketing texts from but hasn't watchlisted. That
-    # allowlist now comes from the Doc's "Shops to track sales for:" section
-    # (doc_sale_shops), unioned with the legacy SMS_SALE_SHOPS env var. Their
-    # texted sales would otherwise be dropped (no homepage check is done for
-    # them; only their SMS-announced sales are surfaced).
-    sms_known_shops = sorted({*known_shops, *cfg.sms_sale_shops, *doc_sale_shops})
     voice_result = _voice_pipeline(
-        cfg, sms_aliases, sms_known_shops, prior_voice,
+        cfg, sms_aliases, known_shops, prior_voice,
         now_iso=now_iso, label=voice_label,
     )
     log.info(
