@@ -961,6 +961,48 @@ class TestSignupInPopup:
             ("email", "form_fill_failed"),
         ]
 
+    def test_two_step_reveal_exposes_email(self, monkeypatch):
+        """A two-step popup: the first screen has no field, only an intro CTA.
+        Clicking the reveal exposes the email step, which then fills (#14)."""
+        ef, sb, reveal = FakeField(), FakeField(), FakeField()
+        self._patch(monkeypatch, email_field=None, submit=None)
+        # find_email_field / find_submit_button: None (initial) → None (settle)
+        # → real field (after the reveal click).
+        email_seq = iter([None, None, ef])
+        submit_seq = iter([None, None, sb])
+        monkeypatch.setattr(ns, "find_email_field", lambda popup, **k: next(email_seq, ef))
+        monkeypatch.setattr(ns, "find_submit_button", lambda popup, **k: next(submit_seq, sb))
+        monkeypatch.setattr(ns, "find_reveal_trigger", lambda popup, **k: reveal)
+        out = self._call(["email"])
+        assert [(r["channel"], r["result"]) for r in out] == [("email", "success")]
+        assert reveal.clicks == 1
+        assert ef.fills == ["user@gmail.com"] and sb.clicks == 1
+
+    def test_reveal_absent_records_miss(self, monkeypatch):
+        """No reveal trigger present → the popup stays unfillable and records a
+        miss (no spurious click)."""
+        self._patch(monkeypatch, email_field=None, submit=None)
+        monkeypatch.setattr(ns, "find_reveal_trigger", lambda popup, **k: None)
+        out = self._call(["email"])
+        assert [(r["channel"], r["result"]) for r in out] == [
+            ("email", "form_fill_failed"),
+        ]
+
+    def test_no_reveal_when_form_already_fillable(self, monkeypatch):
+        """A popup that's already fillable never triggers a reveal probe."""
+        ef, sb = FakeField(), FakeField()
+        seen = {"reveal": 0}
+        self._patch(monkeypatch, email_field=ef, submit=sb)
+
+        def _spy(popup, **k):
+            seen["reveal"] += 1
+            return None
+
+        monkeypatch.setattr(ns, "find_reveal_trigger", _spy)
+        out = self._call(["email"])
+        assert seen["reveal"] == 0
+        assert [(r["channel"], r["result"]) for r in out] == [("email", "success")]
+
 
 # ---------------------------------------------------------------------------
 # Phase 4 — Claude vision/DOM fallback

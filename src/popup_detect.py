@@ -168,6 +168,7 @@ def detect_popup(
     per_selector_timeout_ms: int = 500,
     trigger_exit_intent: bool = True,
     trigger_scroll: bool = True,
+    trigger_reveal: bool = True,
 ) -> tuple[Any, str | None]:
     """Look for a newsletter popup on ``page``.
 
@@ -180,8 +181,10 @@ def detect_popup(
          fire on their own — then scan.
       2. Scroll down and back (scroll-trigger popups), scan again.
       3. Move the mouse to ``(0, 0)`` to fake exit-intent, scan again.
+      4. Click a promo *reveal* control (a collapsed "GET 10% OFF" teaser tab)
+         if one is present, scan again — the popup renders on click.
     An already-visible popup is returned by the first scan without any mouse
-    activity. Both nudges are best-effort (a failure falls through to the scan).
+    activity. All nudges are best-effort (a failure falls through to the scan).
     """
     page.wait_for_timeout(initial_wait_ms)
     popup, vendor = _scan_for_popup(page, per_selector_timeout_ms)
@@ -212,6 +215,19 @@ def detect_popup(
         if popup is not None:
             log.info("popup detected: vendor=%s stage=exit-intent", vendor)
             return popup, vendor
+
+    if trigger_reveal:
+        trigger = find_reveal_trigger(page)
+        if trigger is not None:
+            try:
+                trigger.click()
+                page.wait_for_timeout(1_500)
+            except Exception:  # noqa: BLE001 — reveal click is best-effort
+                pass
+            popup, vendor = _scan_for_popup(page, per_selector_timeout_ms)
+            if popup is not None:
+                log.info("popup detected: vendor=%s stage=reveal", vendor)
+                return popup, vendor
 
     return None, None
 
@@ -272,6 +288,67 @@ def find_submit_button(popup: Any, *, timeout_ms: int = 500) -> Any | None:
     if _try_visible(btn, timeout_ms):
         return btn
     return _sole_actionable_button(popup, timeout_ms)
+
+
+# Reveal / teaser triggers ---------------------------------------------------
+# Not every shop shows the signup form outright. Two live patterns (issue #14)
+# hide the email field behind a click:
+#   * a collapsed "GET 10% OFF" flyout *tab* that expands the popup on click;
+#   * a two-step popup whose first screen is only a promo CTA ("CLAIM NOW")
+#     with the email field revealed after it.
+# Both are recovered by clicking the reveal control, then re-scanning. The
+# match is a deliberately tight promo-*reveal* phrase — a reward verb
+# (unlock/claim/reveal/redeem/activate) that reads as promo on its own, or a
+# weaker verb (get/grab/snag/score) next to a discount noun, or a bare "N% off"
+# / "I'm in" — so we don't click a plain nav link or a bare submit, and never a
+# decline/close.
+_REVEAL_TRIGGER_RE = re.compile(
+    r"\b(?:unlock|claim|reveal|redeem|activate)\b"
+    r"|\b(?:get|grab|snag|score)\b[^\n]{0,24}?"
+    r"(?:\d{1,3}\s*%|\boff\b|\bcode\b|\bdiscount\b|\bdeal\b|\boffer\b|\bgift\b)"
+    r"|\b\d{1,3}\s*%\s*off\b"
+    r"|\bi'?m\s+in\b",
+    re.I,
+)
+
+# Where a reveal trigger can live: buttons + explicit button-role links + the
+# common vendor "teaser/flyout/tab/sticky" containers. Plain ``<a>`` is
+# excluded on purpose — a bare anchor is far more likely a nav link that would
+# navigate the page away than a popup opener.
+_REVEAL_TRIGGER_SELECTOR = (
+    "button, [role='button'], a[role='button'], "
+    "[class*='teaser'], [class*='flyout'], [class*='tab'], [class*='sticky']"
+)
+
+
+def find_reveal_trigger(scope: Any, *, timeout_ms: int = 300) -> Any | None:
+    """A promo *reveal* control that opens a collapsed teaser or advances a
+    two-step popup to its email step.
+
+    Text-matched against ``_REVEAL_TRIGGER_RE`` (e.g. "GET 10% OFF", "CLAIM
+    NOW", "Unlock my code"), skipping ``_DECLINE_BUTTON_RE``. Returns the first
+    visible match, or None. Conservative by construction — a miss just leaves
+    detection where it was, and a wrong click at worst follows a promo link and
+    the re-scan still finds no popup (it never fills or submits anything).
+    """
+    try:
+        cands = scope.locator(_REVEAL_TRIGGER_SELECTOR)
+        n = cands.count()
+    except Exception:  # noqa: BLE001 — defensive against a detached / non-locator scope
+        return None
+    for i in range(min(n, 25)):
+        el = cands.nth(i)
+        if not _try_visible(el, timeout_ms):
+            continue
+        try:
+            text = (el.inner_text(timeout=timeout_ms) or "").strip()
+        except Exception:  # noqa: BLE001 — stale handle mid-iteration
+            continue
+        if not text or _DECLINE_BUTTON_RE.search(text):
+            continue
+        if _REVEAL_TRIGGER_RE.search(text):
+            return el
+    return None
 
 
 # ---------------------------------------------------------------------------

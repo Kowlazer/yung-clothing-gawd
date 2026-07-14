@@ -88,6 +88,7 @@ from src.popup_detect import (
     dismiss_cookie_banner,
     find_email_field,
     find_phone_field,
+    find_reveal_trigger,
     find_submit_button,
     looks_like_otp,
     phone_formats,
@@ -620,6 +621,26 @@ def _signup_in_popup(
         phone_field = find_phone_field(popup) if want_phone else None
         submit_btn = find_submit_button(popup)
 
+    # Two-step / teaser popup: a detected popup whose first screen shows only an
+    # intro CTA ("CLAIM NOW", "GET 10% OFF") with no field yet — the email step
+    # renders only after it's clicked (observed live, issue #14). Click the
+    # reveal control once and re-scan. Non-destructive: the reveal click enters
+    # no data and submits nothing, so it's safe even in a dry run (and lets the
+    # dry run see the real form).
+    if email_field is None and phone_field is None:
+        reveal = find_reveal_trigger(popup)
+        if reveal is not None:
+            log.info("popup at %s (vendor=%s) — clicking reveal to expose form",
+                     shop, vendor)
+            try:
+                reveal.click()
+                page.wait_for_timeout(_FORM_SETTLE_MS)
+            except Exception as exc:  # noqa: BLE001 — reveal click is best-effort
+                log.info("reveal click failed at %s: %s", shop, exc)
+            email_field = find_email_field(popup) if want_email else None
+            phone_field = find_phone_field(popup) if want_phone else None
+            submit_btn = find_submit_button(popup)
+
     # Not a usable form: no submit button, or none of our target fields.
     if submit_btn is None or (email_field is None and phone_field is None):
         missing = "submit button" if submit_btn is None else "target fields"
@@ -803,6 +824,7 @@ def _signup_phone_step2(
         step2, _ = detect_popup(
             page, initial_wait_ms=500,
             trigger_exit_intent=False, trigger_scroll=False,
+            trigger_reveal=False,
         )
         field = find_phone_field(step2) if step2 is not None else None
     if field is None:

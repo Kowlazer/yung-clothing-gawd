@@ -254,6 +254,33 @@ class TestDetectPopup:
         pd.detect_popup(page, initial_wait_ms=10, trigger_scroll=False)
         assert page.mouse.wheels == []
 
+    def test_reveal_stage_opens_teaser_popup(self):
+        """A collapsed 'GET 10% OFF' teaser tab is clicked to reveal the popup
+        after the earlier stages find nothing (issue #14)."""
+        klaviyo = FakeLocator(selector="klaviyo", visible=False)
+        trigger = FakeLocator(visible=True, text="GET 10% OFF")
+        trigger.click = lambda: setattr(klaviyo, "_visible", True)
+        page = FakePage(selectors={
+            pd._REVEAL_TRIGGER_SELECTOR: trigger,
+            pd.VENDOR_SELECTORS["klaviyo"]: klaviyo,
+        })
+        popup, vendor = pd.detect_popup(page, initial_wait_ms=10)
+        assert vendor == "klaviyo"
+        assert popup is klaviyo
+
+    def test_reveal_stage_skipped_when_disabled(self):
+        klaviyo = FakeLocator(selector="klaviyo", visible=False)
+        trigger = FakeLocator(visible=True, text="GET 10% OFF")
+        trigger.click = lambda: setattr(klaviyo, "_visible", True)
+        page = FakePage(selectors={
+            pd._REVEAL_TRIGGER_SELECTOR: trigger,
+            pd.VENDOR_SELECTORS["klaviyo"]: klaviyo,
+        })
+        popup, vendor = pd.detect_popup(
+            page, initial_wait_ms=10, trigger_reveal=False,
+        )
+        assert popup is None and vendor is None
+
 
 # ---------------------------------------------------------------------------
 # Field-finding helpers
@@ -347,6 +374,64 @@ class TestSoleActionableButtonFallback:
             },
         )
         assert pd.find_submit_button(popup) is selector_btn
+
+
+class TestFindRevealTrigger:
+    """find_reveal_trigger: the collapsed-teaser / two-step CTA opener (#14)."""
+
+    def _scope(self, buttons: list[FakeLocator]) -> FakeLocator:
+        return FakeLocator(
+            visible=True,
+            children={pd._REVEAL_TRIGGER_SELECTOR: _ButtonList(buttons)},
+        )
+
+    def test_matches_get_percent_off(self):
+        trig = FakeLocator(visible=True, text="GET 10% OFF")
+        assert pd.find_reveal_trigger(self._scope([trig])) is trig
+
+    def test_matches_claim_now(self):
+        trig = FakeLocator(visible=True, text="CLAIM NOW")
+        assert pd.find_reveal_trigger(self._scope([trig])) is trig
+
+    def test_matches_unlock_reward_verb_alone(self):
+        trig = FakeLocator(visible=True, text="Unlock my code")
+        assert pd.find_reveal_trigger(self._scope([trig])) is trig
+
+    def test_skips_decline_button(self):
+        assert pd.find_reveal_trigger(
+            self._scope([FakeLocator(visible=True, text="No, thanks")]),
+        ) is None
+
+    def test_skips_plain_nav_and_bare_submit(self):
+        # "Shop now" has no reward verb; "Sign up" is a submit, not a reveal.
+        scope = self._scope([
+            FakeLocator(visible=True, text="Shop now"),
+            FakeLocator(visible=True, text="Sign up"),
+        ])
+        assert pd.find_reveal_trigger(scope) is None
+
+    def test_weak_verb_needs_discount_noun(self):
+        # "Get help now" — weak verb, no discount noun nearby → not a trigger.
+        assert pd.find_reveal_trigger(
+            self._scope([FakeLocator(visible=True, text="Get help now")]),
+        ) is None
+
+    def test_skips_hidden_candidate(self):
+        assert pd.find_reveal_trigger(
+            self._scope([FakeLocator(visible=False, text="GET 10% OFF")]),
+        ) is None
+
+    def test_returns_first_match_among_many(self):
+        first = FakeLocator(visible=True, text="Grab 15% off")
+        scope = self._scope([
+            FakeLocator(visible=True, text="Menu"),
+            first,
+            FakeLocator(visible=True, text="Unlock deal"),
+        ])
+        assert pd.find_reveal_trigger(scope) is first
+
+    def test_no_candidates_returns_none(self):
+        assert pd.find_reveal_trigger(self._scope([])) is None
 
 
 # ---------------------------------------------------------------------------
