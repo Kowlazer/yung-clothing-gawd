@@ -75,9 +75,11 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+from src import popup_claude
 from src.classify import classify
 from src.config import Config, load_config
 from src.gmail import subscribed_shop_domains
+from src.popup_claude import DEFAULT_MODEL
 from src.popup_detect import (
     check_consent_if_present,
     detect_bot_block,
@@ -342,6 +344,166 @@ def _subscribed_channels(entry: dict | None) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Claude vision/DOM fallback (Phase 4)
+# ---------------------------------------------------------------------------
+
+# Heuristic outcomes that mean "found nothing usable" — the only results that
+# warrant paying for a Claude fallback. A captcha block can't be helped by
+# Claude, a network error means the page never loaded, and requires_otp /
+# already_subscribed are real (partial) outcomes, not misses.
+_CLAUDE_RETRY_RESULTS = frozenset(
+    {"no_popup_detected", "form_fill_failed", "no_phone_field"}
+)
+
+_CLAUDE_MAX_CALLS_DEFAULT = 30
+
+
+class _ClaudeFallback:
+    """Per-run Claude fallback context + call budget.
+
+    Bounds spend: each shop that falls back costs one batched vision/DOM call
+    (~$0.02-0.05), so a run full of unrecognised popups is capped at
+    ``max_calls`` calls total. Mirrors ``BROWSER_FALLBACK_MAX_ITEMS`` in
+    ``browser_fetch``.
+    """
+
+    def __init__(
+        self,
+        client: object,
+        model: str,
+        *,
+        want_screenshot: bool,
+        max_calls: int,
+    ) -> None:
+        self.client = client
+        self.model = model
+        self.want_screenshot = want_screenshot
+        self.max_calls = max_calls
+        self.used = 0
+
+    def take(self) -> bool:
+        """Reserve one call; False once the budget is exhausted."""
+        if self.used >= self.max_calls:
+            return False
+        self.used += 1
+        return True
+
+
+def _anthropic_client(cfg: Config) -> object:
+    """Construct an Anthropic client from config (lazy import — the SDK is only
+    needed when the fallback actually fires)."""
+    import anthropic
+    return anthropic.Anthropic(api_key=cfg.anthropic_api_key)
+
+
+def _heuristic_missed(attempts: list[dict]) -> bool:
+    """True iff the heuristic path found nothing usable (so a Claude fallback
+    is warranted): no channel succeeded and every outcome is a recoverable
+    miss (``_CLAUDE_RETRY_RESULTS``)."""
+    if any(a.get("result") == "success" for a in attempts):
+        return False
+    return bool(attempts) and all(
+        a.get("result") in _CLAUDE_RETRY_RESULTS for a in attempts
+    )
+
+
+def _signup_via_claude(
+    page: object,
+    *,
+    email: str,
+    phone: str,
+    channels: list[str],
+    dry_run: bool,
+    now_iso: str,
+    shop: str,
+    claude: _ClaudeFallback,
+    post_submit_wait_ms: int = _POST_SUBMIT_WAIT_MS,
+    post_path: str | None = None,
+) -> list[dict] | None:
+    """Phase 4 fallback: ask Claude to locate the signup form, then fill it.
+
+    Returns per-channel attempt records (``vendor="claude"``), or ``None`` when
+    Claude finds no usable form — in which case the caller keeps the heuristic
+    miss it already recorded. Resolves Claude's stamped-element indices to
+    locators via ``popup_claude.index_locator`` and hands them to the shared
+    ``_fill_and_submit`` core (``allow_phone_step2=False`` — Claude reports both
+    fields from one snapshot).
+    """
+    want_email = "email" in channels
+    want_phone = "phone" in channels
+
+    form = popup_claude.locate_form(
+        page, client=claude.client, model=claude.model,
+        want_screenshot=claude.want_screenshot,
+    )
+    if form is None:
+        log.info("claude fallback found no form at %s", shop)
+        return None
+
+    email_field = (
+        popup_claude.index_locator(page, form.email_index) if want_email else None
+    )
+    phone_field = (
+        popup_claude.index_locator(page, form.phone_index) if want_phone else None
+    )
+    submit_btn = popup_claude.index_locator(page, form.submit_index)
+    container = popup_claude.stamp_container(page, form.submit_index)
+
+    def rec(channel: str, result: str, *, code: str | None = None) -> dict:
+        return {
+            "at": now_iso, "channel": channel, "result": result,
+            "vendor": "claude", "code_received": code,
+            "dry_run": True if dry_run else None,
+        }
+
+    # Claude claimed a form but its indices didn't resolve to live elements.
+    if submit_btn is None or (email_field is None and phone_field is None):
+        log.info("claude form at %s not resolvable (submit/fields missing)", shop)
+        out: list[dict] = []
+        if want_email:
+            out.append(rec("email", "form_fill_failed"))
+        if want_phone:
+            out.append(rec("phone",
+                           "form_fill_failed" if phone_field is not None
+                           else "no_phone_field"))
+        return out
+
+    if dry_run:
+        present = "+".join(
+            c for c in ("email", "phone")
+            if (c == "email" and email_field is not None)
+            or (c == "phone" and phone_field is not None)
+        )
+        log.info("DRY_RUN: %s — claude would fill %s + submit",
+                 shop, present or "<nothing>")
+        out = []
+        if email_field is not None:
+            out.append(rec("email", "success"))
+        if phone_field is not None:
+            out.append(rec("phone", "success"))
+        elif want_phone:
+            out.append(rec("phone", "no_phone_field"))
+        return out
+
+    attempts = _fill_and_submit(
+        page, container if container is not None else submit_btn,
+        vendor="claude", email=email, phone=phone,
+        email_field=email_field, phone_field=phone_field, submit_btn=submit_btn,
+        now_iso=now_iso, shop=shop,
+        want_phone=want_phone, allow_phone_step2=False,
+        post_submit_wait_ms=post_submit_wait_ms, post_path=post_path,
+    )
+    # Claude reports the whole form from one snapshot, so a phone channel it
+    # didn't locate has no SMS field here — mark it unavailable (as the
+    # heuristic path's phone-second re-detect does) so ``both`` runs stop
+    # re-visiting an email-only shop. There's no multi-step re-detect to try.
+    if (want_phone and phone_field is None
+            and not any(a["channel"] == "phone" for a in attempts)):
+        attempts.append(rec("phone", "no_phone_field"))
+    return attempts
+
+
+# ---------------------------------------------------------------------------
 # Visit — headless Chromium → popup detect → fill + submit (Phase 3)
 # ---------------------------------------------------------------------------
 
@@ -451,6 +613,53 @@ def _signup_in_popup(
         return out
 
     # ---- Real submission ----
+    return _fill_and_submit(
+        page, popup,
+        vendor=vendor, email=email, phone=phone,
+        email_field=email_field, phone_field=phone_field, submit_btn=submit_btn,
+        now_iso=now_iso, shop=shop,
+        want_phone=want_phone, allow_phone_step2=True,
+        post_submit_wait_ms=post_submit_wait_ms, post_path=post_path,
+    )
+
+
+def _fill_and_submit(
+    page: object,
+    container: object,
+    *,
+    vendor: str | None,
+    email: str,
+    phone: str,
+    email_field: object | None,
+    phone_field: object | None,
+    submit_btn: object,
+    now_iso: str,
+    shop: str,
+    want_phone: bool,
+    allow_phone_step2: bool,
+    post_submit_wait_ms: int = _POST_SUBMIT_WAIT_MS,
+    post_path: str | None = None,
+) -> list[dict]:
+    """Fill the resolved fields, submit, and record per-channel outcomes.
+
+    The shared core of the heuristic (``_signup_in_popup``) and Claude
+    (``_signup_via_claude``) paths — everything from field-fill through
+    success/OTP detection is identical once the fields + submit button are
+    resolved, so both callers pass their already-resolved locators here.
+
+    ``container`` is the popup / dialog / form used for post-submit success
+    detection and OTP text (``detect_success`` / ``_visible_text`` fall back to
+    the page body when it isn't visible). ``allow_phone_step2`` gates the
+    email-first / phone-second re-detect — enabled for the heuristic popup path
+    (a real multi-screen popup), disabled for the Claude path (which is handed
+    both fields in one shot from a single page snapshot).
+    """
+    def rec(channel: str, result: str, *, code: str | None = None) -> dict:
+        return {
+            "at": now_iso, "channel": channel, "result": result,
+            "vendor": vendor, "code_received": code, "dry_run": None,
+        }
+
     results: list[dict] = []
 
     email_filled = False
@@ -472,7 +681,7 @@ def _signup_in_popup(
             results.append(rec("phone", "form_fill_failed"))
             phone_done = True
 
-    check_consent_if_present(popup)
+    check_consent_if_present(container)
 
     if not (email_filled or phone_filled):
         return results
@@ -488,7 +697,7 @@ def _signup_in_popup(
         return results
 
     success, code = detect_success(
-        page, popup, original_url=shop, post_submit_wait_ms=post_submit_wait_ms,
+        page, container, original_url=shop, post_submit_wait_ms=post_submit_wait_ms,
     )
     if post_path:
         _screenshot(page, post_path)
@@ -502,7 +711,7 @@ def _signup_in_popup(
             results.append(rec("email", "form_fill_failed"))
 
     if phone_filled:
-        if looks_like_otp(_visible_text(page, popup)):
+        if looks_like_otp(_visible_text(page, container)):
             log.info("phone signup at %s needs OTP — skipping", shop)
             results.append(rec("phone", "requires_otp"))
         elif success:
@@ -514,10 +723,10 @@ def _signup_in_popup(
 
     # Email-first / phone-second (SMS opt-in) popup: only when phone is wanted,
     # wasn't in step 1, and the email step succeeded — the SMS step is revealed
-    # after the email submit. Try the same popup first, then one re-detect.
-    if want_phone and not phone_done and success:
+    # after the email submit. Try the same container first, then one re-detect.
+    if want_phone and allow_phone_step2 and not phone_done and success:
         results.append(_signup_phone_step2(
-            page, popup, vendor,
+            page, container, vendor,
             phone=phone, now_iso=now_iso, shop=shop,
             post_submit_wait_ms=post_submit_wait_ms,
         ))
@@ -583,6 +792,7 @@ def _visit(
     channels: list[str],
     dry_run: bool,
     screenshot_dir: str,
+    claude: _ClaudeFallback | None = None,
     page_timeout_ms: int = _PAGE_TIMEOUT_MS,
     popup_wait_ms: int = _POPUP_WAIT_MS,
     post_submit_wait_ms: int = _POST_SUBMIT_WAIT_MS,
@@ -652,14 +862,33 @@ def _visit(
                 popup, vendor = detect_popup(page, initial_wait_ms=0)
                 if popup is None:
                     log.info("no popup at %s", shop)
-                    return visit_rec("no_popup_detected")
+                    attempts = visit_rec("no_popup_detected")
+                else:
+                    attempts = _signup_in_popup(
+                        page, popup, vendor,
+                        email=email, phone=phone, channels=channels,
+                        dry_run=dry_run, now_iso=now_iso, shop=shop,
+                        post_submit_wait_ms=post_submit_wait_ms,
+                        post_path=post_path,
+                    )
 
-                return _signup_in_popup(
-                    page, popup, vendor,
-                    email=email, phone=phone, channels=channels,
-                    dry_run=dry_run, now_iso=now_iso, shop=shop,
-                    post_submit_wait_ms=post_submit_wait_ms, post_path=post_path,
-                )
+                # Phase 4 — Claude vision/DOM fallback when the heuristics
+                # missed (no popup, or a popup with no fillable form). Budgeted
+                # per run; a bot-block / network error never reaches here.
+                if (claude is not None and _heuristic_missed(attempts)
+                        and claude.take()):
+                    log.info("heuristics missed at %s — trying Claude fallback",
+                             shop)
+                    claude_attempts = _signup_via_claude(
+                        page, email=email, phone=phone, channels=channels,
+                        dry_run=dry_run, now_iso=now_iso, shop=shop,
+                        claude=claude, post_submit_wait_ms=post_submit_wait_ms,
+                        post_path=post_path,
+                    )
+                    if claude_attempts is not None:
+                        attempts = claude_attempts
+
+                return attempts
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -720,6 +949,36 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.set_defaults(infer_subscribed=True)
+    p.add_argument(
+        "--no-claude-fallback",
+        dest="claude_fallback",
+        action="store_false",
+        help=(
+            "Disable the Phase 4 Claude vision/DOM fallback that fires when the "
+            "heuristic popup detection misses. On by default when "
+            "ANTHROPIC_API_KEY is set."
+        ),
+    )
+    p.set_defaults(claude_fallback=True)
+    p.add_argument(
+        "--claude-no-screenshot",
+        dest="claude_screenshot",
+        action="store_false",
+        help=(
+            "Send only the DOM digest (no screenshot) to the Claude fallback — "
+            "cheaper, slightly less accurate."
+        ),
+    )
+    p.set_defaults(claude_screenshot=True)
+    p.add_argument(
+        "--claude-max-calls",
+        type=int,
+        default=_CLAUDE_MAX_CALLS_DEFAULT,
+        help=(
+            "Cap the number of Claude fallback API calls this run "
+            f"(default {_CLAUDE_MAX_CALLS_DEFAULT}). 0 disables the fallback."
+        ),
+    )
     p.add_argument("--screenshot-dir", default=DEFAULT_SCREENSHOT_DIR)
     return p.parse_args(argv)
 
@@ -795,6 +1054,22 @@ def run(argv: list[str] | None = None, cfg: Config | None = None) -> int:
         channels_to_fill = [c for c in channels_to_fill if c != "phone"]
     channels_for_skip = list(channels_to_fill)
 
+    # Phase 4 — Claude vision/DOM fallback context. On by default when an API
+    # key is configured and the budget is positive; the daily cron never runs
+    # this command so there's no unattended spend.
+    claude_fb: _ClaudeFallback | None = None
+    if (args.claude_fallback and args.claude_max_calls > 0
+            and cfg.anthropic_api_key):
+        claude_fb = _ClaudeFallback(
+            _anthropic_client(cfg), DEFAULT_MODEL,
+            want_screenshot=args.claude_screenshot,
+            max_calls=args.claude_max_calls,
+        )
+        log.info("Claude fallback enabled (budget=%d, screenshot=%s)",
+                 args.claude_max_calls, args.claude_screenshot)
+    elif args.claude_fallback and not cfg.anthropic_api_key:
+        log.info("Claude fallback unavailable — ANTHROPIC_API_KEY not set")
+
     log.info("reading state from gist")
     state = read_state(cfg.gist_id, cfg.github_token)
     signup_state = dict(state.get("signup") or {})
@@ -858,6 +1133,7 @@ def run(argv: list[str] | None = None, cfg: Config | None = None) -> int:
             channels=effective,
             dry_run=args.dry_run,
             screenshot_dir=args.screenshot_dir,
+            claude=claude_fb,
         )
         for attempt in attempts:
             _record_attempt(signup_state, shop, attempt)
@@ -869,6 +1145,9 @@ def run(argv: list[str] | None = None, cfg: Config | None = None) -> int:
         "done — visited=%d (success=%d) skipped=%d total_shops=%d",
         visited, successes, skipped, len(shops),
     )
+    if claude_fb is not None:
+        log.info("Claude fallback used %d/%d calls",
+                 claude_fb.used, claude_fb.max_calls)
 
     if args.dry_run:
         log.info("DRY_RUN: skipping write_state")

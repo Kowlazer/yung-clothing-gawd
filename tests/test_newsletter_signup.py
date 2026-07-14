@@ -941,3 +941,152 @@ class TestSignupInPopup:
         assert [(r["channel"], r["result"]) for r in out] == [
             ("email", "form_fill_failed"),
         ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Claude vision/DOM fallback
+# ---------------------------------------------------------------------------
+
+from src import popup_claude as _pc  # noqa: E402
+
+
+class TestHeuristicMissed:
+    def test_success_is_not_a_miss(self):
+        assert ns._heuristic_missed(
+            [{"result": "success"}, {"result": "form_fill_failed"}]) is False
+
+    def test_no_popup_is_a_miss(self):
+        assert ns._heuristic_missed([{"result": "no_popup_detected"}]) is True
+
+    def test_form_and_phone_misses(self):
+        assert ns._heuristic_missed(
+            [{"result": "form_fill_failed"}, {"result": "no_phone_field"}]) is True
+
+    def test_captcha_is_not_a_miss(self):
+        # Claude can't defeat a bot wall — don't pay for a fallback.
+        assert ns._heuristic_missed([{"result": "captcha_blocked"}]) is False
+
+    def test_network_error_is_not_a_miss(self):
+        assert ns._heuristic_missed([{"result": "network_error"}]) is False
+
+    def test_requires_otp_is_not_a_miss(self):
+        # A real (partial) outcome, not a detection miss.
+        assert ns._heuristic_missed([{"result": "requires_otp"}]) is False
+
+    def test_empty_is_not_a_miss(self):
+        assert ns._heuristic_missed([]) is False
+
+
+class TestClaudeFallbackBudget:
+    def test_take_decrements_until_exhausted(self):
+        fb = ns._ClaudeFallback(object(), "m", want_screenshot=True, max_calls=2)
+        assert fb.take() is True
+        assert fb.take() is True
+        assert fb.take() is False
+        assert fb.used == 2
+
+    def test_zero_budget_never_takes(self):
+        fb = ns._ClaudeFallback(object(), "m", want_screenshot=True, max_calls=0)
+        assert fb.take() is False
+        assert fb.used == 0
+
+
+class TestSignupViaClaude:
+    """``_signup_via_claude`` with popup_claude + popup_detect helpers faked."""
+
+    def _fb(self):
+        return ns._ClaudeFallback(object(), "m", want_screenshot=False, max_calls=5)
+
+    def _patch(self, monkeypatch, *, form, email_field=None, phone_field=None,
+               submit=None, container=None, success=True, code=None,
+               visible_text=""):
+        monkeypatch.setattr(ns.popup_claude, "locate_form",
+                            lambda page, **k: form)
+
+        def _index_locator(page, idx):  # noqa: ARG001
+            if form is None or idx is None:
+                return None
+            if idx == form.email_index:
+                return email_field
+            if idx == form.phone_index:
+                return phone_field
+            if idx == form.submit_index:
+                return submit
+            return None
+
+        monkeypatch.setattr(ns.popup_claude, "index_locator", _index_locator)
+        monkeypatch.setattr(ns.popup_claude, "stamp_container",
+                            lambda page, idx: container)
+        monkeypatch.setattr(ns, "detect_success",
+                            lambda page, c, **k: (success, code))
+        monkeypatch.setattr(ns, "check_consent_if_present", lambda c, **k: False)
+        monkeypatch.setattr(ns, "_visible_text", lambda page, c: visible_text)
+        monkeypatch.setattr(ns, "_screenshot", lambda page, path: None)
+
+    def _call(self, channels, *, dry_run=False):
+        return ns._signup_via_claude(
+            page=object(), email="user@gmail.com", phone="+15555550100",
+            channels=channels, dry_run=dry_run, now_iso=_ISO,
+            shop="https://s.com", claude=self._fb(),
+        )
+
+    def test_returns_none_when_claude_finds_nothing(self, monkeypatch):
+        self._patch(monkeypatch, form=None)
+        assert self._call(["email", "phone"]) is None
+
+    def test_single_form_both_fields_success(self, monkeypatch):
+        ef, pf, sb, cont = FakeField(), FakeField(), FakeField(), object()
+        form = _pc.ClaudeForm(submit_index=2, email_index=0, phone_index=1,
+                              confidence="high")
+        self._patch(monkeypatch, form=form, email_field=ef, phone_field=pf,
+                    submit=sb, container=cont, code="WELCOME15")
+        out = self._call(["email", "phone"])
+        pairs = {(r["channel"], r["result"]) for r in out}
+        assert pairs == {("email", "success"), ("phone", "success")}
+        assert all(r["vendor"] == "claude" for r in out)
+        assert sb.clicks == 1 and ef.fills == ["user@gmail.com"]
+
+    def test_email_only_form_marks_phone_unavailable(self, monkeypatch):
+        # Claude located email + submit but no phone field; under `both` the
+        # phone channel must be marked no_phone_field so reruns terminate.
+        ef, sb = FakeField(), FakeField()
+        form = _pc.ClaudeForm(submit_index=2, email_index=0, phone_index=None,
+                              confidence="high")
+        self._patch(monkeypatch, form=form, email_field=ef, submit=sb)
+        out = self._call(["email", "phone"])
+        pairs = {(r["channel"], r["result"]) for r in out}
+        assert ("email", "success") in pairs
+        assert ("phone", "no_phone_field") in pairs
+
+    def test_unresolvable_indices_recorded_as_failure(self, monkeypatch):
+        # Claude claimed a form but the submit index doesn't resolve.
+        form = _pc.ClaudeForm(submit_index=9, email_index=0, phone_index=None,
+                              confidence="high")
+        self._patch(monkeypatch, form=form, email_field=FakeField(), submit=None)
+        out = self._call(["email"])
+        assert [(r["channel"], r["result"]) for r in out] == [
+            ("email", "form_fill_failed"),
+        ]
+
+    def test_dry_run_reports_without_submitting(self, monkeypatch):
+        ef, pf, sb = FakeField(), FakeField(), FakeField()
+        form = _pc.ClaudeForm(submit_index=2, email_index=0, phone_index=1,
+                              confidence="high")
+        self._patch(monkeypatch, form=form, email_field=ef, phone_field=pf,
+                    submit=sb)
+        out = self._call(["email", "phone"], dry_run=True)
+        pairs = {(r["channel"], r["result"]) for r in out}
+        assert pairs == {("email", "success"), ("phone", "success")}
+        assert all(r["dry_run"] is True for r in out)
+        assert ef.fills == [] and pf.fills == [] and sb.clicks == 0
+
+    def test_phone_otp_recorded(self, monkeypatch):
+        pf, sb = FakeField(), FakeField()
+        form = _pc.ClaudeForm(submit_index=2, email_index=None, phone_index=1,
+                              confidence="high")
+        self._patch(monkeypatch, form=form, phone_field=pf, submit=sb,
+                    visible_text="Enter the verification code we texted you")
+        out = self._call(["phone"])
+        assert [(r["channel"], r["result"]) for r in out] == [
+            ("phone", "requires_otp"),
+        ]

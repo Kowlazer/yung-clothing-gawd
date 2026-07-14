@@ -6,8 +6,8 @@ Two-pass approach when scanning a shop homepage:
 2. Fall back to generic dialog patterns (``<dialog>``, ``[role="dialog"]``,
    ``[aria-modal="true"]``) for custom-built popups.
 
-When neither finds a popup the caller falls through to the Claude vision/DOM
-fallback (Phase 4 — not yet wired in Phase 2).
+When neither finds a popup (or a matched popup has no fillable form) the caller
+falls through to the Claude vision/DOM fallback (Phase 4, ``src/popup_claude.py``).
 
 The module is deliberately Playwright-aware but exposes its CSS-string
 constants and Python helpers (``extract_code_from_text``) without importing
