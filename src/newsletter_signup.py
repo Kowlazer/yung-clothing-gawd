@@ -85,6 +85,7 @@ from src.popup_detect import (
     detect_bot_block,
     detect_popup,
     detect_success,
+    dismiss_cookie_banner,
     find_email_field,
     find_phone_field,
     find_submit_button,
@@ -113,11 +114,54 @@ _POPUP_WAIT_MS = 12_000
 # not visible on the first pass (entrance animation still running).
 _FORM_SETTLE_MS = 2_000
 _POST_SUBMIT_WAIT_MS = 4_000    # delay after clicking submit before success-detect
+# Settle wait after load, before dismissing a cookie banner — most consent
+# banners render within ~1s of load.
+_COOKIE_SETTLE_MS = 1_500
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+
+# Anti-fingerprint init script (Phase 5). Headless Chromium advertises itself
+# via ``navigator.webdriver`` and a few other tells that basic bot filters
+# check. Patched with a context init script (runs before any page JS) rather
+# than pulling in the ``playwright-stealth`` dependency — this covers the
+# common, cheap signals without a 3rd-party package in the tree. Not a
+# guarantee against sophisticated fingerprinting (Cloudflare/DataDome still
+# win — see ``detect_bot_block``), just table stakes for a wide live run.
+_STEALTH_INIT_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = window.chrome || {runtime: {}};
+"""
+
+# Marketplaces / platforms that either bot-wall newsletter signup or have no
+# single-brand newsletter to join — never worth a signup attempt, and every
+# visit is wasted bot-detection surface. Skipped up front (an explicit
+# ``--shop`` bypasses this). Matched on the registrable domain + subdomains.
+_IGNORED_SIGNUP_DOMAINS: frozenset[str] = frozenset({
+    "etsy.com",
+    "teepublic.com",
+    "redbubble.com",
+    "amazon.com",
+    "society6.com",
+    "ebay.com",
+    "aliexpress.com",
+    "walmart.com",
+    "gg",           # shop-t1-na.gg dev/marketplace hosts
+    "myshopify.com",  # raw Shopify backend hosts (not the storefront)
+})
+
+
+def _is_ignored_signup_domain(shop: str) -> bool:
+    """True iff ``shop``'s host is (a subdomain of) an ignored marketplace."""
+    domain = _shop_domain(shop) or ""
+    return any(
+        domain == d or domain.endswith("." + d)
+        for d in _IGNORED_SIGNUP_DOMAINS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +877,9 @@ def _visit(
             browser = p.chromium.launch(headless=True)
             try:
                 ctx = browser.new_context(user_agent=_USER_AGENT)
+                # Anti-fingerprint patches — must be registered on the context
+                # before the page navigates so they run before any page JS.
+                ctx.add_init_script(_STEALTH_INIT_JS)
                 page = ctx.new_page()
                 # ``wait_until="load"`` waits for the ``load`` event (all
                 # subresources fetched) rather than just ``DOMContentLoaded``.
@@ -840,6 +887,12 @@ def _visit(
                 # before any popup heuristics run; without it we get
                 # half-rendered pages.
                 page.goto(shop, timeout=page_timeout_ms, wait_until="load")
+                # Dismiss a cookie / consent banner first — it commonly matches
+                # the generic dialog selector and/or sits on top of (or gates)
+                # the real newsletter popup. Do it before the popup wait so the
+                # popup has time to fire once the banner is gone.
+                page.wait_for_timeout(_COOKIE_SETTLE_MS)
+                dismiss_cookie_banner(page)
                 # Settling wait — lets popups fire, lets JS-rendered bot-block
                 # interstitials (Etsy/Cloudflare) actually render their text
                 # so ``looks_like_captcha`` can see it.
@@ -1108,6 +1161,12 @@ def run(argv: list[str] | None = None, cfg: Config | None = None) -> int:
         if args.max_shops is not None and visited >= args.max_shops:
             log.info("--max-shops=%d reached, stopping", args.max_shops)
             break
+        # Marketplaces / bot-walled platforms are never worth a signup attempt.
+        # An explicit --shop bypasses the ignore list (user asked for it).
+        if not args.shop and _is_ignored_signup_domain(shop):
+            log.info("skip %s — marketplace / ignored signup domain", shop)
+            skipped += 1
+            continue
         # Explicit --shop bypasses the skip gate so you can re-target on demand.
         if not args.shop and _should_skip(
             shop, signup_state, channels_for_skip, retry_failed=args.retry_failed,

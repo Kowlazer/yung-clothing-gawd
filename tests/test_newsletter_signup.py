@@ -424,6 +424,25 @@ class TestRun:
         # Only the --shop URL (normalized to homepage) gets visited.
         assert list(captured["call"]["signup"].keys()) == ["https://one.com"]
 
+    def test_marketplace_domain_is_skipped(self, monkeypatch, fake_cfg):
+        # Phase 5: a watchlist marketplace (Etsy) is never visited; the normal
+        # shop still is.
+        captured = self._patch_everything(
+            monkeypatch, shops=["https://www.etsy.com/shop/x", "https://b.com"],
+        )
+        rc = ns.run(argv=[], cfg=fake_cfg)
+        assert rc == 0
+        visited = [v["shop"] for v in captured["visits"]]
+        assert visited == ["https://b.com"]
+
+    def test_ignored_domain_visited_with_explicit_shop(self, monkeypatch, fake_cfg):
+        # An explicit --shop bypasses the ignore list (user asked for it).
+        captured = self._patch_everything(monkeypatch, shops=["https://other.com"])
+        rc = ns.run(argv=["--shop", "https://www.etsy.com/shop/x"], cfg=fake_cfg)
+        assert rc == 0
+        visited = [v["shop"] for v in captured["visits"]]
+        assert visited == ["https://www.etsy.com"]
+
     def test_phone_channel_visits_with_phone(self, monkeypatch, fake_cfg):
         """Phase 3: --channel=phone visits and passes the phone number +
         phone-only channel set to _visit (no email inference)."""
@@ -1090,3 +1109,24 @@ class TestSignupViaClaude:
         assert [(r["channel"], r["result"]) for r in out] == [
             ("phone", "requires_otp"),
         ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — marketplace / ignored signup domains
+# ---------------------------------------------------------------------------
+
+class TestIgnoredSignupDomain:
+    def test_marketplace_ignored(self):
+        assert ns._is_ignored_signup_domain("https://www.etsy.com/shop/x") is True
+        assert ns._is_ignored_signup_domain("https://teepublic.com") is True
+        assert ns._is_ignored_signup_domain("https://redbubble.com/") is True
+
+    def test_subdomain_ignored(self):
+        assert ns._is_ignored_signup_domain("https://foo.myshopify.com") is True
+
+    def test_normal_shop_not_ignored(self):
+        assert ns._is_ignored_signup_domain("https://aniqi.com") is False
+
+    def test_lookalike_not_ignored(self):
+        # A dot boundary guards against notetsy.com matching etsy.com.
+        assert ns._is_ignored_signup_domain("https://notetsy.com") is False

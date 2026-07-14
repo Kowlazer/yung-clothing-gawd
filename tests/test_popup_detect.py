@@ -88,7 +88,7 @@ class FakeLocator:
     def fill(self, text: str) -> None:
         self.fill_calls.append(text)
 
-    def click(self) -> None:
+    def click(self, timeout: int | None = None) -> None:  # noqa: ARG002
         self.click_count += 1
 
     def check(self, timeout: int | None = None) -> None:  # noqa: ARG002
@@ -534,3 +534,52 @@ class TestDetectSuccess:
         success, code = pd.detect_success(page, popup, original_url="https://shop.com")
         assert success is False
         assert code is None
+
+
+# ---------------------------------------------------------------------------
+# Cookie / consent banner dismissal (Phase 5)
+# ---------------------------------------------------------------------------
+
+class TestDismissCookieBanner:
+    def test_none_when_no_banner(self):
+        assert pd.dismiss_cookie_banner(FakePage()) is None
+
+    def test_prefers_reject_over_accept(self):
+        reject = FakeLocator(visible=True)
+        accept = FakeLocator(visible=True)
+        page = FakePage(selectors={
+            "#onetrust-reject-all-handler": reject,
+            "#onetrust-accept-btn-handler": accept,
+        })
+        assert pd.dismiss_cookie_banner(page) == "reject"
+        assert reject.click_count == 1
+        assert accept.click_count == 0
+
+    def test_falls_back_to_accept(self):
+        accept = FakeLocator(visible=True)
+        page = FakePage(selectors={"#onetrust-accept-btn-handler": accept})
+        assert pd.dismiss_cookie_banner(page) == "accept"
+        assert accept.click_count == 1
+
+    def test_invisible_control_is_skipped(self):
+        page = FakePage(selectors={
+            "#onetrust-reject-all-handler": FakeLocator(visible=False),
+        })
+        assert pd.dismiss_cookie_banner(page) is None
+
+    def test_click_failure_is_isolated(self):
+        class _Boom(FakeLocator):
+            def click(self, timeout=None):
+                raise RuntimeError("intercepted by overlay")
+        page = FakePage(selectors={
+            "#onetrust-reject-all-handler": _Boom(visible=True),
+        })
+        assert pd.dismiss_cookie_banner(page) is None
+
+    def test_reject_selectors_are_privacy_first(self):
+        # Every reject selector must be tried before any accept selector so the
+        # privacy-preserving option wins when both are present.
+        assert pd.COOKIE_REJECT_SELECTORS
+        assert pd.COOKIE_ACCEPT_SELECTORS
+        assert not (set(pd.COOKIE_REJECT_SELECTORS)
+                    & set(pd.COOKIE_ACCEPT_SELECTORS))

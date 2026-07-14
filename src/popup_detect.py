@@ -385,6 +385,78 @@ def check_consent_if_present(popup: Any, *, timeout_ms: int = 300) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Cookie / consent banner dismissal (Phase 5)
+# ---------------------------------------------------------------------------
+
+# A cookie / consent banner frequently (a) matches our generic
+# ``[role="dialog"]`` popup selector and (b) sits on top of the real newsletter
+# popup — blocking both detection and, often, the popup from firing at all
+# (observed across the 2026-06 smoke tests). We dismiss it before popup
+# detection.
+#
+# Privacy-first ordering: prefer a **reject / necessary-only** control over
+# "accept all"; accept is only a fallback to unblock a page that offers no
+# decline option. The vendor-specific id selectors (OneTrust, Cookiebot) are
+# listed before the text selectors so the exact button wins when present.
+COOKIE_REJECT_SELECTORS: tuple[str, ...] = (
+    "#onetrust-reject-all-handler",
+    ".ot-pc-refuse-all-handler",
+    "#CybotCookiebotDialogBodyButtonDecline",
+    "#CybotCookiebotDialogBodyLevelButtonLevelOptinDeclineAll",
+    "[aria-label*='reject' i]",
+    "[aria-label*='decline' i]",
+    "button:has-text('Reject all')",
+    "button:has-text('Reject All')",
+    "button:has-text('Necessary only')",
+    "button:has-text('Only necessary')",
+    "button:has-text('Decline')",
+    "button:has-text('Reject')",
+)
+COOKIE_ACCEPT_SELECTORS: tuple[str, ...] = (
+    "#onetrust-accept-btn-handler",
+    "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+    "#CybotCookiebotDialogBodyButtonAccept",
+    ".cc-allow",
+    ".cc-dismiss",
+    "[aria-label*='accept cookies' i]",
+    "button:has-text('Accept all')",
+    "button:has-text('Accept All')",
+    "button:has-text('Accept')",
+    "button:has-text('I agree')",
+    "button:has-text('Agree')",
+    "button:has-text('Got it')",
+    "button:has-text('Allow all')",
+)
+
+
+def dismiss_cookie_banner(page: Any, *, timeout_ms: int = 600) -> str | None:
+    """Best-effort dismiss a cookie / consent banner blocking popup detection.
+
+    Clicks the first visible reject-flavoured control (privacy-preserving),
+    falling back to an accept control only to unblock a page that offers no
+    decline. Returns ``"reject"`` / ``"accept"`` for the action taken, or None
+    when no consent control was found. Never raises — a stale handle or a
+    missing banner just yields None so the visit proceeds.
+    """
+    for kind, selectors in (("reject", COOKIE_REJECT_SELECTORS),
+                            ("accept", COOKIE_ACCEPT_SELECTORS)):
+        for selector in selectors:
+            try:
+                loc = page.locator(selector).first
+            except Exception:  # noqa: BLE001 — bad selector / detached
+                continue
+            if not _try_visible(loc, 200):
+                continue
+            try:
+                loc.click(timeout=timeout_ms)
+            except Exception:  # noqa: BLE001 — click raced / intercepted
+                continue
+            log.info("dismissed cookie banner via %s (%s)", kind, selector)
+            return kind
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Result detection
 # ---------------------------------------------------------------------------
 
