@@ -857,19 +857,38 @@ class TestShouldSkipPhase3:
 class TestSignupInPopup:
     def _patch(self, monkeypatch, *, email_field=None, phone_field=None,
               submit=None, success=True, code=None, visible_text="",
-              bot_blocked=False):
+              bot_blocked=False, alt_phone_popup=None):
         """Patch the popup_detect helpers _signup_in_popup calls so we can drive
         its branching with simple fakes. ``phone_field`` may be a list to script
-        successive find_phone_field() return values (step 1 then step 2)."""
+        successive find_phone_field() return values (step 1 then step 2).
+        ``alt_phone_popup`` is (container, phone_field, submit) to script the
+        stacked-popup find_field_popup fallback."""
         monkeypatch.setattr(ns, "find_email_field", lambda popup, **k: email_field)
         if isinstance(phone_field, list):
             seq = iter(phone_field)
             monkeypatch.setattr(
                 ns, "find_phone_field", lambda popup, **k: next(seq, None),
             )
+        elif alt_phone_popup is not None:
+            alt_container, alt_field, alt_submit = alt_phone_popup
+            # Phone field is present only in the alt popup, not the primary.
+            monkeypatch.setattr(
+                ns, "find_phone_field",
+                lambda popup, **k: alt_field if popup is alt_container else None,
+            )
+            monkeypatch.setattr(
+                ns, "find_field_popup",
+                lambda page, kind, **k: (alt_container, "klaviyo"),
+            )
+            monkeypatch.setattr(
+                ns, "find_submit_button",
+                lambda popup, **k: alt_submit if popup is alt_container else submit,
+            )
         else:
             monkeypatch.setattr(ns, "find_phone_field", lambda popup, **k: phone_field)
-        monkeypatch.setattr(ns, "find_submit_button", lambda popup, **k: submit)
+        if alt_phone_popup is None:
+            monkeypatch.setattr(ns, "find_submit_button", lambda popup, **k: submit)
+            monkeypatch.setattr(ns, "find_field_popup", lambda page, kind, **k: (None, None))
         monkeypatch.setattr(ns, "detect_success", lambda page, popup, **k: (success, code))
         monkeypatch.setattr(ns, "detect_bot_block", lambda page: bot_blocked)
         monkeypatch.setattr(ns, "check_consent_if_present", lambda popup, **k: False)
@@ -928,6 +947,25 @@ class TestSignupInPopup:
             "at": _ISO, "channel": "phone", "result": "requires_otp",
             "vendor": "klaviyo", "code_received": None, "dry_run": None,
         }]
+
+    def test_stacked_phone_popup_recovered(self, monkeypatch):
+        # phone-only run, primary popup is the email popup (no phone field);
+        # a separate phone popup exists and is recovered via find_field_popup.
+        alt_container = object()
+        pf, sb = FakeField(), FakeField()
+        self._patch(monkeypatch, alt_phone_popup=(alt_container, pf, sb))
+        out = self._call(["phone"])
+        assert [(r["channel"], r["result"]) for r in out] == [("phone", "success")]
+        assert pf.fills == ["+15555550100"] and sb.clicks == 1
+
+    def test_no_stacked_popup_still_marks_unavailable(self, monkeypatch):
+        # phone-only run, no phone field anywhere → find_field_popup returns
+        # nothing → the channel is still marked no_phone_field.
+        self._patch(monkeypatch)  # find_field_popup defaults to (None, None)
+        out = self._call(["phone"])
+        assert [(r["channel"], r["result"]) for r in out] == [
+            ("phone", "no_phone_field"),
+        ]
 
     def test_post_submit_bot_challenge_records_captcha_blocked(self, monkeypatch):
         # A full-page challenge after the submit click reads as "success" to

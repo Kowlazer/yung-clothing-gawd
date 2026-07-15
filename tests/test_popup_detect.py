@@ -453,6 +453,39 @@ class _ButtonList:
         return self._buttons[idx]
 
 
+class TestFindFieldPopup:
+    """find_field_popup scans EVERY vendor/dialog match (not just .first) for a
+    container with a wanted field — the stacked email+phone popup case (#14)."""
+
+    def test_single_container_with_phone(self):
+        phone = FakeLocator(visible=True)
+        container = FakeLocator(
+            visible=True, children={pd.PHONE_INPUT_SELECTOR: phone},
+        )
+        page = FakePage(selectors={pd.VENDOR_SELECTORS["klaviyo"]: container})
+        found, vendor = pd.find_field_popup(page, "phone")
+        assert found is container and vendor == "klaviyo"
+
+    def test_stacked_second_container_has_phone(self):
+        # First klaviyo container has no phone field; the second does.
+        email_only = FakeLocator(visible=True)
+        phone = FakeLocator(visible=True)
+        phone_popup = FakeLocator(
+            visible=True, children={pd.PHONE_INPUT_SELECTOR: phone},
+        )
+        page = FakePage(selectors={
+            pd.VENDOR_SELECTORS["klaviyo"]: _ButtonList([email_only, phone_popup]),
+        })
+        found, vendor = pd.find_field_popup(page, "phone")
+        assert found is phone_popup and vendor == "klaviyo"
+
+    def test_none_when_no_container_has_field(self):
+        container = FakeLocator(visible=True)  # no phone field inside
+        page = FakePage(selectors={pd.VENDOR_SELECTORS["klaviyo"]: container})
+        found, vendor = pd.find_field_popup(page, "phone")
+        assert found is None and vendor is None
+
+
 class TestSoleActionableButtonFallback:
     """find_submit_button's last tier: vendor buttons with campaign-specific
     text ('Get 10% Off') that the enumerated selectors can't cover."""

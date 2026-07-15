@@ -405,6 +405,42 @@ def find_submit_button(popup: Any, *, timeout_ms: int = 500) -> Any | None:
     return _sole_actionable_button(popup, timeout_ms)
 
 
+_FIELD_SELECTORS = {"email": EMAIL_INPUT_SELECTOR, "phone": PHONE_INPUT_SELECTOR}
+
+
+def find_field_popup(
+    page: Any, kind: str, *, per_selector_timeout_ms: int = 500,
+) -> tuple[Any, str | None]:
+    """Find a *visible* popup container that holds a field of ``kind``.
+
+    Unlike ``detect_popup`` (which returns ``.first`` among matching
+    containers), this scans EVERY vendor + generic-dialog match and returns the
+    first whose subtree exposes a visible ``kind`` (``"email"``/``"phone"``)
+    field, as ``(container, vendor)`` or ``(None, None)``.
+
+    Handles stacked popups: a shop that shows a separate email popup and phone
+    (SMS opt-in) popup, where ``detect_popup``'s ``.first`` grabs the email one
+    and the phone field is never found (observed live, tooluckymerch, #14). Used
+    as a targeted fallback only when the primary popup lacks the wanted field.
+    """
+    field_sel = _FIELD_SELECTORS[kind]
+    candidates = [*VENDOR_SELECTORS.items(), (None, GENERIC_DIALOG_SELECTOR)]
+    for vendor, selector in candidates:
+        loc = page.locator(selector)
+        try:
+            n = loc.count()
+        except Exception:  # noqa: BLE001
+            continue
+        for i in range(min(n, 6)):
+            container = loc.nth(i)
+            if not _try_visible(container, per_selector_timeout_ms):
+                continue
+            field = container.locator(field_sel).first
+            if _try_visible(field, per_selector_timeout_ms):
+                return container, (vendor or "generic")
+    return None, None
+
+
 # Reveal / teaser triggers ---------------------------------------------------
 # Not every shop shows the signup form outright. Two live patterns (issue #14)
 # hide the email field behind a click:

@@ -87,6 +87,7 @@ from src.popup_detect import (
     detect_success,
     dismiss_cookie_banner,
     find_email_field,
+    find_field_popup,
     find_phone_field,
     find_reveal_trigger,
     find_submit_button,
@@ -667,6 +668,22 @@ def _signup_in_popup(
                 log.info("reveal click failed at %s: %s", shop, exc)
             email_field = find_email_field(popup) if want_email else None
             phone_field = find_phone_field(popup) if want_phone else None
+            submit_btn = find_submit_button(popup)
+
+    # Stacked popups: a shop can show a separate email popup and phone (SMS
+    # opt-in) popup. When phone is the only wanted channel and the detected
+    # popup (detect_popup's ``.first``) has no phone field, look for a *different*
+    # visible popup that does before giving up (observed live, tooluckymerch,
+    # #14). Guarded on ``email_field is None`` so we never abandon a primary
+    # popup we're about to fill an email into — this only fires when nothing in
+    # the current popup is being used.
+    if want_phone and phone_field is None and email_field is None:
+        alt_popup, alt_vendor = find_field_popup(page, "phone")
+        if alt_popup is not None:
+            log.info("using separate phone popup at %s (vendor=%s)", shop, alt_vendor)
+            popup = alt_popup
+            vendor = alt_vendor
+            phone_field = find_phone_field(popup)
             submit_btn = find_submit_button(popup)
 
     # Not a usable form: no submit button, or none of our target fields.
