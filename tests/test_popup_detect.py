@@ -109,14 +109,37 @@ class FakeMouse:
 
 
 class FakeFrame:
-    def __init__(self, url: str) -> None:
+    """Stand-in for a Playwright Frame. Supports ``.locator()`` (scoped like a
+    popup) so child-iframe popup scanning can be exercised. ``body_text`` backs
+    the ``body`` selector used by the signup-context check."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        selectors: dict[str, FakeLocator] | None = None,
+        body_text: str = "",
+    ) -> None:
         self.url = url
+        self._selectors = dict(selectors or {})
+        self._body_text = body_text
+
+    def locator(self, selector: str) -> FakeLocator:
+        if selector in self._selectors:
+            return self._selectors[selector]
+        if selector == "body":
+            return FakeLocator(selector="body", text=self._body_text)
+        return FakeLocator(selector=selector, visible=False)
 
 
 class FakePage:
     """Maps selector strings → ``FakeLocator``. Anything unmapped resolves
     to a not-visible empty locator. ``frames`` and ``evaluate`` are also
     stubbed for bot-block detection tests.
+
+    ``main_frame`` is a dedicated frame excluded from child-iframe scanning.
+    ``child_frames`` supplies ``FakeFrame`` popups to scan; ``frame_urls`` (the
+    older bot-block knob) supplies URL-only child frames.
     """
 
     def __init__(
@@ -126,12 +149,19 @@ class FakePage:
         body_text: str = "",
         selectors: dict[str, FakeLocator] | None = None,
         frame_urls: list[str] | None = None,
+        child_frames: list[FakeFrame] | None = None,
         eval_text: str | None = None,
     ) -> None:
         self.url = url
         self._body_text = body_text
         self._selectors = dict(selectors or {})
-        self.frames = [FakeFrame(u) for u in (frame_urls or [url])]
+        self.main_frame = FakeFrame(url)
+        if child_frames is not None:
+            self.frames = [self.main_frame, *child_frames]
+        elif frame_urls is not None:
+            self.frames = [FakeFrame(u) for u in frame_urls]
+        else:
+            self.frames = [self.main_frame]
         self._eval_text = eval_text if eval_text is not None else body_text
         self.mouse = FakeMouse()
         self.waits: list[int] = []
@@ -280,6 +310,101 @@ class TestDetectPopup:
             page, initial_wait_ms=10, trigger_reveal=False,
         )
         assert popup is None and vendor is None
+
+
+class TestDetectPopupInIframe:
+    """Child-iframe popups (TYDAL etc.) — invisible to main-document selectors
+    but reachable via a frame-scoped locator (issue #14)."""
+
+    def test_vendor_selector_inside_frame(self):
+        klaviyo = FakeLocator(selector="klaviyo", visible=True)
+        frame = FakeFrame(
+            "https://cdn.shop.com/popup",
+            selectors={pd.VENDOR_SELECTORS["klaviyo"]: klaviyo},
+        )
+        page = FakePage(child_frames=[frame])
+        popup, vendor = pd.detect_popup(page, initial_wait_ms=10)
+        assert vendor == "klaviyo"
+        assert popup is klaviyo
+
+    def test_bare_iframe_email_plus_signup_context(self):
+        email = FakeLocator(selector="email", visible=True)
+        body = FakeLocator(selector="body", text="Subscribe and get 10% off!")
+        frame = FakeFrame(
+            "https://popups.tydal.app/form",
+            selectors={pd.EMAIL_INPUT_SELECTOR: email, "body": body},
+            body_text="Subscribe and get 10% off!",
+        )
+        page = FakePage(child_frames=[frame])
+        popup, vendor = pd.detect_popup(page, initial_wait_ms=10)
+        assert vendor == "iframe"
+        # Container is the frame body, so field-finding is scoped to the frame.
+        assert popup is body
+
+    def test_injected_about_blank_frame_is_scanned(self):
+        # TYDAL injects its form into a src-less about:blank iframe (the real
+        # chyari.com case, #14) — these must NOT be skipped by URL.
+        email = FakeLocator(selector="email", visible=True)
+        frame = FakeFrame(
+            "about:blank",
+            selectors={pd.EMAIL_INPUT_SELECTOR: email},
+            body_text="Sign up for launch updates and never miss a drop.",
+        )
+        page = FakePage(child_frames=[frame])
+        popup, vendor = pd.detect_popup(page, initial_wait_ms=10)
+        assert vendor == "iframe"
+
+    def test_vendor_host_hint_without_context_text(self):
+        # A known popup-app host resolves even with no signup copy in body.
+        email = FakeLocator(selector="email", visible=True)
+        frame = FakeFrame(
+            "https://widget.tydal.app/f",
+            selectors={pd.EMAIL_INPUT_SELECTOR: email},
+            body_text="",
+        )
+        page = FakePage(child_frames=[frame])
+        popup, vendor = pd.detect_popup(page, initial_wait_ms=10)
+        assert vendor == "iframe"
+
+    def test_email_field_without_signup_context_ignored(self):
+        # A support/chat iframe with an email field but no signup intent must
+        # NOT be treated as a subscribe popup.
+        email = FakeLocator(selector="email", visible=True)
+        frame = FakeFrame(
+            "https://widget.intercom.io/chat",
+            selectors={pd.EMAIL_INPUT_SELECTOR: email},
+            body_text="How can we help you today?",
+        )
+        page = FakePage(child_frames=[frame])
+        popup, vendor = pd.detect_popup(page, initial_wait_ms=10)
+        assert popup is None and vendor is None
+
+    def test_bot_block_frame_never_scanned_as_popup(self):
+        email = FakeLocator(selector="email", visible=True)
+        frame = FakeFrame(
+            "https://geo.captcha-delivery.com/captcha",
+            selectors={pd.EMAIL_INPUT_SELECTOR: email},
+            body_text="Subscribe for 10% off",
+        )
+        page = FakePage(child_frames=[frame])
+        popup, vendor = pd.detect_popup(page, initial_wait_ms=10)
+        assert popup is None and vendor is None
+
+    def test_main_document_popup_wins_over_frame(self):
+        klaviyo = FakeLocator(selector="klaviyo", visible=True)
+        email = FakeLocator(selector="email", visible=True)
+        frame = FakeFrame(
+            "https://popups.tydal.app/form",
+            selectors={pd.EMAIL_INPUT_SELECTOR: email},
+            body_text="Subscribe for 10% off",
+        )
+        page = FakePage(
+            selectors={pd.VENDOR_SELECTORS["klaviyo"]: klaviyo},
+            child_frames=[frame],
+        )
+        popup, vendor = pd.detect_popup(page, initial_wait_ms=10)
+        assert vendor == "klaviyo"
+        assert popup is klaviyo
 
 
 # ---------------------------------------------------------------------------

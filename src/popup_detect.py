@@ -161,8 +161,109 @@ def _try_visible(locator: Any, timeout_ms: int) -> bool:
 _SCROLL_NUDGE_PX = 4_000
 
 
+# Signup-intent text that marks a child iframe as a newsletter popup rather
+# than an unrelated embed (a live-chat/support widget that also happens to have
+# an email field, a YouTube/ad frame, etc.). Required alongside a visible email
+# input before we treat a bare iframe as a fillable popup — conservative so a
+# support widget isn't mistaken for a subscribe form.
+_SIGNUP_CONTEXT_RE = re.compile(
+    r"subscrib|sign\s?up|newsletter|%\s*off|\bdiscount\b|\bunlock\b|"
+    r"join (?:our|the|us|now)|email list|first order|be the first|"
+    r"get \d{1,3}\s*%|\boff your\b|10%|15%|20%|welcome offer",
+    re.I,
+)
+
+# Popup-app iframe host substrings — vendors that render their whole signup
+# popup inside a child iframe (so it never matches a main-document selector or
+# Claude's top-document data-scc-idx map). A host hint is a *fast path*; the
+# email-input + signup-context heuristic is the real gate, so an unknown vendor
+# host still resolves. TYDAL is the motivating case (#14).
+POPUP_VENDOR_FRAME_HINTS: tuple[str, ...] = (
+    "tydal", "getsitecontrol", "wisepops", "optimonk", "sumo",
+    "spinwheel", "wheelio", "wheelofpopups", "privy", "justuno",
+)
+
+
+def _iter_child_frames(page: Any) -> list[Any]:
+    """Child frames worth scanning for a popup — never the main frame or a known
+    bot-detection challenge frame.
+
+    ``about:blank`` frames are deliberately kept: TYDAL (and other same-document
+    popup apps) inject their form into a src-less ``about:blank`` iframe, so the
+    motivating case (#14, chyari.com) *is* an about:blank frame. Empty/unrelated
+    frames are cheaply rejected by the content gate in ``_scan_frames_for_popup``
+    (no visible email input / no signup context).
+    """
+    try:
+        main = page.main_frame
+    except Exception:  # noqa: BLE001
+        main = None
+    try:
+        frames = list(page.frames or [])
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[Any] = []
+    for f in frames:
+        if main is not None and f is main:
+            continue
+        url = (getattr(f, "url", "") or "").lower()
+        if url and any(d in url for d in BOT_BLOCK_FRAME_DOMAINS):
+            continue
+        out.append(f)
+    return out
+
+
+def _frame_is_signup(frame: Any, timeout_ms: int) -> bool:
+    """True iff ``frame`` reads as a newsletter popup: its host matches a known
+    popup-app hint, or its visible text carries signup-intent copy."""
+    url = (getattr(frame, "url", "") or "").lower()
+    if any(hint in url for hint in POPUP_VENDOR_FRAME_HINTS):
+        return True
+    try:
+        text = frame.locator("body").first.inner_text(timeout=timeout_ms) or ""
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(_SIGNUP_CONTEXT_RE.search(text))
+
+
+def _scan_frames_for_popup(
+    page: Any, per_selector_timeout_ms: int,
+) -> tuple[Any, str | None]:
+    """Scan child iframes for a popup the main-document selectors can't see.
+
+    A popup app (TYDAL etc.) renders its form inside a same-shop / app iframe,
+    so ``page.locator(...)`` — rooted in the top document — never reaches it,
+    and Claude's ``data-scc-idx`` stamping (top document only) misses it too.
+    A frame-scoped locator, by contrast, flows unchanged through the whole
+    fill path (``find_email_field`` / ``find_submit_button`` / ``detect_success``
+    all take an arbitrary scope), so returning one is all that's needed.
+
+    Order per frame: vendor selectors, generic dialog, then a bare-iframe form
+    (a visible email input gated on ``_frame_is_signup`` so a support/chat
+    widget isn't mistaken for a subscribe form).
+    """
+    for frame in _iter_child_frames(page):
+        try:
+            for vendor, selector in VENDOR_SELECTORS.items():
+                loc = frame.locator(selector).first
+                if _try_visible(loc, per_selector_timeout_ms):
+                    return loc, vendor
+            dlg = frame.locator(GENERIC_DIALOG_SELECTOR).first
+            if _try_visible(dlg, per_selector_timeout_ms):
+                return dlg, "iframe"
+            email = frame.locator(EMAIL_INPUT_SELECTOR).first
+            if _try_visible(email, per_selector_timeout_ms) and _frame_is_signup(
+                frame, per_selector_timeout_ms,
+            ):
+                return frame.locator("body").first, "iframe"
+        except Exception:  # noqa: BLE001 — a detached / restricted frame mid-scan
+            continue
+    return None, None
+
+
 def _scan_for_popup(page: Any, per_selector_timeout_ms: int) -> tuple[Any, str | None]:
-    """One pass over the vendor selectors, then the generic-dialog fallback."""
+    """One pass over the vendor selectors, then the generic-dialog fallback,
+    then any child iframe (TYDAL-style popups the main document can't see)."""
     for vendor, selector in VENDOR_SELECTORS.items():
         loc = page.locator(selector).first
         if _try_visible(loc, per_selector_timeout_ms):
@@ -172,7 +273,7 @@ def _scan_for_popup(page: Any, per_selector_timeout_ms: int) -> tuple[Any, str |
     if _try_visible(loc, per_selector_timeout_ms):
         return loc, "generic"
 
-    return None, None
+    return _scan_frames_for_popup(page, per_selector_timeout_ms)
 
 
 def detect_popup(
