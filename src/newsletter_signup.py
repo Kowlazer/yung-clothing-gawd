@@ -135,7 +135,35 @@ _STEALTH_INIT_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
 Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
 window.chrome = window.chrome || {runtime: {}};
+// WebGL vendor/renderer are a top headless tell: real Chrome reports the GPU,
+// headless software-renders and reports SwiftShader / bare ANGLE. Spoof the
+// two UNMASKED_* params to a plausible discrete-GPU string.
+(() => {
+  const spoof = {37445: 'Intel Inc.', 37446: 'Intel Iris OpenGL Engine'};
+  for (const proto of [
+    window.WebGLRenderingContext && WebGLRenderingContext.prototype,
+    window.WebGL2RenderingContext && WebGL2RenderingContext.prototype,
+  ]) {
+    if (!proto) continue;
+    const orig = proto.getParameter;
+    proto.getParameter = function (p) {
+      return p in spoof ? spoof[p] : orig.call(this, p);
+    };
+  }
+})();
+// Notification permission on headless reads 'denied' before any prompt; real
+// Chrome reports 'default'. A mismatch with Notification.permission is a tell.
+(() => {
+  const orig = navigator.permissions && navigator.permissions.query;
+  if (!orig) return;
+  navigator.permissions.query = (params) =>
+    params && params.name === 'notifications'
+      ? Promise.resolve({state: Notification.permission})
+      : orig.call(navigator.permissions, params);
+})();
 """
 
 # Marketplaces / platforms that either bot-wall newsletter signup or have no
@@ -688,6 +716,48 @@ def _signup_in_popup(
     )
 
 
+# Human pacing for the real fill+submit (Phase 5 hardening, added after the
+# first real submits, #14): both live Klaviyo attempts were rejected — one
+# with a post-submit challenge page, one with an in-popup "An error occurred
+# when submitting" — and the likely tell was the robotic interaction stream
+# (instant value-set + a submit click milliseconds later; Klaviyo's client
+# JS collects interaction telemetry). Type the address key-by-key and pause
+# like a reader before typing and before clicking submit.
+_TYPE_DELAY_MS = (60, 140)          # per-keystroke delay range
+_PRE_FILL_PAUSE_MS = (600, 1_400)   # popup in view → start typing
+_PRE_SUBMIT_PAUSE_MS = (700, 1_600)  # typed → click submit
+
+
+def _pause(page: object, lo_hi: tuple[float, float]) -> None:
+    """Wait a random human-ish interval; never let the wait itself fail."""
+    try:
+        page.wait_for_timeout(random.uniform(*lo_hi))  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _human_type(field: object, value: str) -> None:
+    """Enter ``value`` key-by-key, falling back to an instant fill.
+
+    Focuses the field with a click first (a human clicks into the input),
+    then types with a per-keystroke delay. Any failure of the human-styled
+    path falls back to plain ``fill`` — whose exceptions propagate so the
+    caller records ``form_fill_failed`` exactly as before.
+    """
+    try:
+        field.click()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        field.press_sequentially(  # type: ignore[attr-defined]
+            value, delay=random.uniform(*_TYPE_DELAY_MS),
+        )
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    field.fill(value)  # type: ignore[attr-defined]
+
+
 def _fill_and_submit(
     page: object,
     container: object,
@@ -729,8 +799,9 @@ def _fill_and_submit(
 
     email_filled = False
     if email_field is not None:
+        _pause(page, _PRE_FILL_PAUSE_MS)
         try:
-            email_field.fill(email)  # type: ignore[attr-defined]
+            _human_type(email_field, email)
             email_filled = True
         except Exception as exc:  # noqa: BLE001
             log.warning("email fill failed at %s: %s", shop, exc)
@@ -751,6 +822,7 @@ def _fill_and_submit(
     if not (email_filled or phone_filled):
         return results
 
+    _pause(page, _PRE_SUBMIT_PAUSE_MS)
     try:
         submit_btn.click()  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
@@ -766,6 +838,20 @@ def _fill_and_submit(
     )
     if post_path:
         _screenshot(page, post_path)
+
+    # A bot challenge served *after* the submit click reads as success to
+    # detect_success — the popup is gone and the URL may have changed — but
+    # the subscription never reached the vendor. Observed live on the first
+    # real submit (#14): a full-page "unusual activity / captcha" interstitial
+    # replaced the document and the run recorded a false success.
+    if detect_bot_block(page):
+        log.warning("post-submit bot challenge at %s — recording captcha_blocked",
+                    shop)
+        if email_filled:
+            results.append(rec("email", "captcha_blocked"))
+        if phone_filled:
+            results.append(rec("phone", "captcha_blocked"))
+        return results
 
     if email_filled:
         if success:

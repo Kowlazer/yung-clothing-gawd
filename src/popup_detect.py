@@ -86,6 +86,20 @@ SUCCESS_MESSAGE_RE = re.compile(
     re.I,
 )
 
+# Submission-error message — overrides the softer success signals. An error
+# toast/dialog after the submit click means THIS submit did not subscribe,
+# even when the original popup element detached (reads as "popup closed") or
+# the page navigated. Observed live (#14): Klaviyo re-rendered its popup into
+# "An error occurred when submitting. Please try again later." — the stale
+# original locator read as closed, producing a false success plus a junk
+# "code" harvested from the homepage body text.
+ERROR_MESSAGE_RE = re.compile(
+    r"error occurred|something went wrong|try again later|please try again|"
+    r"invalid email|enter a valid email|too many (?:attempts|requests|signups)|"
+    r"unable to (?:subscribe|process|submit)",
+    re.I,
+)
+
 # Captcha / bot-block indicators — used to short-circuit submission attempts.
 CAPTCHA_INDICATORS_RE = re.compile(
     r"captcha|cloudflare|verify you are human|access (?:is )?temporarily restricted|"
@@ -608,9 +622,17 @@ def detect_success(
       * Popup container disappeared (no error toast visible).
       * Visible text on the page or popup matches ``SUCCESS_MESSAGE_RE``.
 
+    A visible submission-error message (``ERROR_MESSAGE_RE``) overrides all
+    of those: a vendor that re-renders its popup into an error dialog
+    detaches the original locator, which would otherwise read as "popup
+    closed" → success (observed live, #14).
+
     Code extraction reuses the watchlist code-token regex from ``codes.py``,
     so anything that looks like a promo code (``SPRING30``, ``WELCOME15``,
-    hyphenated multi-segment, etc.) is picked up.
+    hyphenated multi-segment, etc.) is picked up — but only when an actual
+    success message matched: the popup-closed / URL-changed signals fall back
+    to the full page body for text, and mining promo codes out of homepage
+    marketing copy produces junk ("SHIPPING" from a free-shipping banner).
     """
     page.wait_for_timeout(post_submit_wait_ms)
 
@@ -636,13 +658,16 @@ def detect_success(
         except Exception:  # noqa: BLE001
             success_text = ""
 
+    if success_text and ERROR_MESSAGE_RE.search(success_text):
+        return False, None
+
     message_match = bool(success_text and SUCCESS_MESSAGE_RE.search(success_text))
 
     # Popup disappeared (no longer visible).
     popup_closed = not _try_visible(popup, 200)
 
     success = message_match or url_changed or popup_closed
-    code = extract_code_from_text(success_text) if success else None
+    code = extract_code_from_text(success_text) if message_match else None
     return success, code
 
 

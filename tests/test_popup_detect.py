@@ -620,6 +620,43 @@ class TestDetectSuccess:
         assert success is False
         assert code is None
 
+    def test_error_dialog_overrides_popup_closed(self):
+        # Live regression (#14, aniqi): Klaviyo re-rendered its popup into an
+        # error dialog, detaching the original locator — "popup closed" must
+        # not win over a visible submission-error message.
+        popup = FakeLocator(visible=False, text="")
+        page = FakePage(
+            url="https://shop.com",
+            body_text="An error occurred when submitting. Please try again later.",
+        )
+        success, code = pd.detect_success(page, popup, original_url="https://shop.com")
+        assert success is False
+        assert code is None
+
+    def test_error_dialog_overrides_success_text(self):
+        # If both an error and a stray success-ish word are visible, the
+        # error (specific to this submit) wins over the generic match.
+        popup = FakeLocator(
+            visible=True,
+            text="Welcome to our shop — something went wrong, try again later",
+        )
+        page = FakePage(url="https://shop.com")
+        success, code = pd.detect_success(page, popup, original_url="https://shop.com")
+        assert success is False
+
+    def test_no_code_mined_from_body_without_success_message(self):
+        # Live regression (#14, aniqi): popup-closed success fell back to the
+        # full homepage body for text and mined "SHIPPING" out of a
+        # free-shipping banner. No success message → no code extraction.
+        popup = FakeLocator(visible=False, text="")
+        page = FakePage(
+            url="https://shop.com",
+            body_text="FREE SHIPPING ON ALL ORDERS OVER $50",
+        )
+        success, code = pd.detect_success(page, popup, original_url="https://shop.com")
+        assert success is True   # popup closed, no error visible
+        assert code is None
+
 
 # ---------------------------------------------------------------------------
 # Cookie / consent banner dismissal (Phase 5)

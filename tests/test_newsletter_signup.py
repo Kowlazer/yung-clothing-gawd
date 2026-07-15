@@ -707,6 +707,35 @@ class FakeField:
         self.clicks += 1
 
 
+class TestHumanType:
+    def test_prefers_key_by_key_typing(self):
+        class F(FakeField):
+            def __init__(self):
+                super().__init__()
+                self.typed: list[tuple[str, float]] = []
+
+            def press_sequentially(self, value, delay=None):
+                self.typed.append((value, delay))
+
+        f = F()
+        ns._human_type(f, "a@b.com")
+        assert [v for v, _ in f.typed] == ["a@b.com"]
+        assert f.fills == []          # no instant fill when typing works
+        assert f.clicks == 1          # focused the field first
+
+    def test_falls_back_to_fill(self):
+        # FakeField has no press_sequentially — the plain fill must run.
+        f = FakeField()
+        ns._human_type(f, "a@b.com")
+        assert f.fills == ["a@b.com"]
+
+    def test_fill_failure_propagates(self):
+        import pytest
+        f = FakeField(fill_raises=True)
+        with pytest.raises(RuntimeError):
+            ns._human_type(f, "a@b.com")
+
+
 class TestFillPhone:
     def test_fills_e164_first_when_valid(self):
         field = FakeField(valid=True)
@@ -827,7 +856,8 @@ class TestShouldSkipPhase3:
 
 class TestSignupInPopup:
     def _patch(self, monkeypatch, *, email_field=None, phone_field=None,
-              submit=None, success=True, code=None, visible_text=""):
+              submit=None, success=True, code=None, visible_text="",
+              bot_blocked=False):
         """Patch the popup_detect helpers _signup_in_popup calls so we can drive
         its branching with simple fakes. ``phone_field`` may be a list to script
         successive find_phone_field() return values (step 1 then step 2)."""
@@ -841,6 +871,7 @@ class TestSignupInPopup:
             monkeypatch.setattr(ns, "find_phone_field", lambda popup, **k: phone_field)
         monkeypatch.setattr(ns, "find_submit_button", lambda popup, **k: submit)
         monkeypatch.setattr(ns, "detect_success", lambda page, popup, **k: (success, code))
+        monkeypatch.setattr(ns, "detect_bot_block", lambda page: bot_blocked)
         monkeypatch.setattr(ns, "check_consent_if_present", lambda popup, **k: False)
         monkeypatch.setattr(ns, "_visible_text", lambda page, popup: visible_text)
         monkeypatch.setattr(ns, "_screenshot", lambda page, path: None)
@@ -897,6 +928,27 @@ class TestSignupInPopup:
             "at": _ISO, "channel": "phone", "result": "requires_otp",
             "vendor": "klaviyo", "code_received": None, "dry_run": None,
         }]
+
+    def test_post_submit_bot_challenge_records_captcha_blocked(self, monkeypatch):
+        # A full-page challenge after the submit click reads as "success" to
+        # detect_success (popup gone / URL changed) — the bot-block check must
+        # override it so no signed_up_at is ever stamped (observed live, #14).
+        ef, sb = FakeField(), FakeField()
+        self._patch(monkeypatch, email_field=ef, submit=sb,
+                    success=True, code=None, bot_blocked=True)
+        out = self._call(["email"])
+        assert [(r["channel"], r["result"]) for r in out] == [
+            ("email", "captcha_blocked"),
+        ]
+
+    def test_post_submit_bot_challenge_covers_both_channels(self, monkeypatch):
+        ef, pf, sb = FakeField(), FakeField(), FakeField()
+        self._patch(monkeypatch, email_field=ef, phone_field=pf, submit=sb,
+                    bot_blocked=True)
+        out = self._call(["email", "phone"])
+        assert {(r["channel"], r["result"]) for r in out} == {
+            ("email", "captcha_blocked"), ("phone", "captcha_blocked"),
+        }
 
     def test_email_only_shop_marks_phone_unavailable(self, monkeypatch):
         # Popup has email + submit but no phone field, even after submit (step 2
