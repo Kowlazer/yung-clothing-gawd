@@ -23,10 +23,20 @@ log = logging.getLogger(__name__)
 # Retry policy for rate-limit / transient-unavailable responses. We honor the
 # server's Retry-After header when present (adaptive — no guessing at the
 # threshold), falling back to exponential backoff otherwise.
+#
+# Tuned down 3->2 retries / 20s->15s cap after 2026-07-15, when a wide 429 storm
+# (dozens of shops rate-limiting at once) made the per-shop backoff cost — up to
+# 3 x 20s = 60s each, serialised per-domain — blow the workflow's 45-min cap, so
+# the run was cancelled before it could send the email. The worst case is now
+# 2 x 15s = 30s/shop. Trade-off: on a heavy-storm day a few shops may end up
+# `rate_limited` (stale price, recovered next run) rather than getting a third
+# attempt — an acceptable price for the run actually finishing and the digest
+# going out. Retry-After is still honored (up to the 15s cap), so a well-behaved
+# limiter that asks for a short wait is unaffected.
 _RETRY_STATUSES = frozenset({429, 503})
-DEFAULT_MAX_RETRIES = 3   # extra attempts after the first GET (up to 4 total)
+DEFAULT_MAX_RETRIES = 2   # extra attempts after the first GET (up to 3 total)
 _BACKOFF_BASE = 1.0       # seconds; doubles each attempt: 1, 2, 4 ...
-MAX_BACKOFF = 20.0        # cap on any single wait (also caps a huge Retry-After)
+MAX_BACKOFF = 15.0        # cap on any single wait (also caps a huge Retry-After)
 
 
 class RateLimiter:
