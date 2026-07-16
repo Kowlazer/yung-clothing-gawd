@@ -662,6 +662,30 @@ class TestUntrackedAmazon:
         url = next(e for e in entries if e.category == "UNTRACKED_URL")
         assert url.value == "https://www.amazon.com/dp/B07YF5CR5Z"
 
+    def test_scheme_less_www_amazon_line_is_surfaced(self):
+        # The user often pastes Amazon links straight from the address bar with no
+        # scheme ("www.amazon.com/dp/…"). Previously _URL_RE required https:// so
+        # the line was invisible to the whole pipeline; now it's normalised and
+        # surfaced in the untracked-Amazon block with a fetchable https:// value.
+        text = (
+            "Amazon:\n"
+            "www.amazon.com/Amazon-Essentials-Pullover/dp/B07YF5CR5Z\n"
+            "www.amazon.com/32-DEGREES-Heather/dp/B08NY1QFQR\n"
+        )
+        entries = classify(text)
+        untracked = [e for e in entries if e.category == "UNTRACKED_URL"]
+        assert len(untracked) == 2
+        assert all(e.value.startswith("https://www.amazon.com/") for e in untracked)
+        assert all(e.context == "Amazon" for e in untracked)
+
+    def test_scheme_less_www_product_url_is_crawlable_product(self):
+        # A bare-www NON-Amazon product line is likewise recovered — normalised
+        # to https:// and classified as a (crawlable) PRODUCT_URL, not dropped.
+        text = "Peakwear:\nwww.peakwear.com/products/joggers\n"
+        entries = classify(text)
+        prod = next(e for e in entries if e.category == "PRODUCT_URL")
+        assert prod.value == "https://www.peakwear.com/products/joggers"
+
 
 # ---------------------------------------------------------------------------
 # "Shops to track sales for:" section (SMS/email sale allowlist in the Doc)

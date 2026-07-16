@@ -21,7 +21,7 @@ class Entry(NamedTuple):
 # URL helpers
 # ---------------------------------------------------------------------------
 
-_URL_RE = re.compile(r'https?://\S+')
+_URL_RE = re.compile(r'https?://\S+|www\.\S+', re.I)
 
 # Inline "watch this closely" marker. The user stars a product-URL line in the
 # watchlist Doc and that URL gets pinned to a "Watching now" block at the top of
@@ -72,6 +72,22 @@ def _classify_url(url: str) -> Category:
     if _PRODUCT_PATH_RE.search(path):
         return "PRODUCT_URL"
     return "SHOP_URL"
+
+
+def _normalise_url(url: str) -> str:
+    """Give a scheme-less ``www.``-prefixed URL an ``https://`` scheme.
+
+    The user often pastes Amazon links straight from the browser address bar as
+    bare ``www.amazon.com/dp/…`` (no scheme). ``_URL_RE`` now matches those, but
+    every downstream consumer — ``_classify_url``'s Amazon matcher + path split,
+    and the fetcher in ``extract.py`` — assumes a scheme, so we normalise at the
+    point of extraction. Without this such a line was invisible to the whole
+    pipeline (not even surfaced in the untracked-Amazon digest block). A URL that
+    already carries a scheme passes through unchanged.
+    """
+    if url.lower().startswith("www."):
+        return "https://" + url
+    return url
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +310,9 @@ def _split_priority_section(text: str) -> tuple[str, list[str]]:
                 continue
             if not _is_known_section_header(line):
                 for url in _URL_RE.findall(line):
-                    clean = _PRIORITY_MARKER_RE.sub('', url).rstrip('.,;)')
+                    clean = _PRIORITY_MARKER_RE.sub(
+                        '', _normalise_url(url)
+                    ).rstrip('.,;)')
                     if clean:
                         urls.append(clean)
                 continue
@@ -381,6 +399,9 @@ def classify(text: str) -> list[Entry]:
         if urls:
             priority = bool(_PRIORITY_MARKER_RE.search(line))
             for url in urls:
+                # A scheme-less "www.amazon.com/…" line is normalised to https://
+                # so it classifies + stores like any other URL (was invisible).
+                url = _normalise_url(url)
                 cat = _classify_url(url)
                 if cat != "IGNORE":
                     # Drop a marker that was typed flush against the URL (no
