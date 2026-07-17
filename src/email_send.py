@@ -26,15 +26,102 @@ _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 # into a real [text](url) later on the same line.
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
+# --- Visual-emphasis layer ("make drops / restocks pop") -------------------
+# A change-section line arrives from digest.py prefixed with a leading state
+# marker emoji; we turn it into a colored badge pill + a tinted callout card so
+# the good news reads at a glance, and we recolor the high-signal section
+# headers. Marker constants are imported from digest so the two can't drift.
+# EVERYTHING is inlined on the elements (not just the <style> block) so it still
+# renders if a client strips <style>, and the colours are tuned for the white
+# background Gmail draws the message on.
+from src.digest import _MARK_DROP, _MARK_STOCK, _MARK_LOW, _MARK_OOS, _MARK_FLAT
+
+# marker → (kind, badge label)
+_BADGE_BY_MARKER = {
+    _MARK_DROP: ("drop", "Price drop"),
+    _MARK_STOCK: ("stock", "Back in stock"),
+    _MARK_LOW: ("low", "Low stock"),
+    _MARK_OOS: ("oos", "Sold out"),
+    _MARK_FLAT: ("flat", "Marked down"),
+}
+
+# kind → (badge text colour, badge tint background)
+_PILL_COLORS = {
+    "drop": ("#b23b30", "#fbeae7"),
+    "stock": ("#1c7a4f", "#e4f3ea"),
+    "low": ("#9a6a12", "#f8efd8"),
+    "oos": ("#7a7269", "#efece8"),
+    "flat": ("#6c655d", "#efece8"),
+    "watch": ("#8a6d0f", "#fcf6e2"),
+}
+
+# kind → (card left-border colour, card row tint) — a lighter wash than the pill
+# so a whole row of it stays readable.
+_CARD_COLORS = {
+    "drop": ("#d9695c", "#fdf3f1"),
+    "stock": ("#5aa982", "#eff8f2"),
+    "low": ("#cfa24e", "#fbf5e6"),
+    "oos": ("#b7afa4", "#f5f3f0"),
+    "flat": ("#b7afa4", "#f5f3f0"),
+}
+
+# Known section headers → semantic colour. Prefix match, so the "(specific
+# URLs)" / "(non-clothing)" suffixes and the ⭐ prefix all still resolve. Only
+# the item-level change sections are coloured; shop-level sections stay neutral.
+_SECTION_KIND = (
+    ("⭐ watching now", "watch"),
+    ("items on sale", "drop"),
+    ("back in stock", "stock"),
+    ("newly out of stock", "oos"),
+    ("now low stock", "low"),
+    ("standing discounts", "flat"),
+)
+
+_PILL_BASE = (
+    "display:inline-block;font-size:11px;font-weight:800;letter-spacing:.04em;"
+    "text-transform:uppercase;padding:2px 7px;border-radius:4px;margin-right:6px;"
+    "white-space:nowrap;"
+)
+
 
 class EmailSendError(Exception):
     """Raised when Resend rejects the message or the request fails."""
+
+
+def _pill(kind: str, label: str) -> str:
+    color, bg = _PILL_COLORS[kind]
+    return f'<span style="{_PILL_BASE}color:{color};background:{bg};">{label}</span>'
+
+
+def _card_style(kind: str) -> str:
+    edge, bg = _CARD_COLORS[kind]
+    return (
+        f"list-style:none;border-left:3px solid {edge};background:{bg};"
+        f"padding:8px 12px;margin:6px 0;border-radius:0 6px 6px 0;"
+    )
+
+
+def _section_kind(header: str) -> str | None:
+    h = header.strip().lower()
+    for prefix, kind in _SECTION_KIND:
+        if h.startswith(prefix):
+            return kind
+    return None
+
+
+def _h2_style(kind: str) -> str:
+    color = _PILL_COLORS[kind][0]
+    edge = _CARD_COLORS.get(kind, ("#e0d9cf",))[0]
+    return f"color:{color};border-bottom-color:{edge};"
 
 
 def markdown_to_html(md: str) -> str:
     """Tiny markdown-to-HTML converter for the digest format we control.
 
     Handles headers (##), bold (**x**), links ([text](url)), and bullet lists.
+    A change-section bullet that starts with a state marker emoji (from
+    digest.py) becomes a colored badge pill + a tinted callout card, and the
+    high-signal section headers get a semantic colour.
     """
     lines = md.splitlines()
     html_lines: list[str] = []
@@ -60,7 +147,10 @@ def markdown_to_html(md: str) -> str:
             html_lines.append(f"<h3>{_inline(stripped[4:])}</h3>")
             continue
         if stripped.startswith("## "):
-            html_lines.append(f"<h2>{_inline(stripped[3:])}</h2>")
+            text = stripped[3:]
+            kind = _section_kind(text)
+            attr = f' style="{_h2_style(kind)}"' if kind else ""
+            html_lines.append(f"<h2{attr}>{_inline(text)}</h2>")
             continue
         if stripped.startswith("# "):
             html_lines.append(f"<h1>{_inline(stripped[2:])}</h1>")
@@ -70,7 +160,16 @@ def markdown_to_html(md: str) -> str:
             if not in_list:
                 html_lines.append("<ul>")
                 in_list = True
-            html_lines.append(f"  <li>{_inline(stripped[2:])}</li>")
+            content = stripped[2:]
+            attr = ""
+            prefix = ""
+            for marker, (kind, label) in _BADGE_BY_MARKER.items():
+                if content.startswith(marker):
+                    content = content[len(marker):].lstrip()
+                    attr = f' style="{_card_style(kind)}"'
+                    prefix = _pill(kind, label)
+                    break
+            html_lines.append(f"  <li{attr}>{prefix}{_inline(content)}</li>")
             continue
 
         html_lines.append(f"<p>{_inline(stripped)}</p>")

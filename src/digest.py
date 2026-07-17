@@ -120,6 +120,43 @@ def _fmt_price(
     return f"{_fmt_amount(usd)} USD [{currency} {_fmt_amount(price)}]"
 
 
+# ---------------------------------------------------------------------------
+# State markers + savings — the visual-emphasis layer (issue: "make drops /
+# restocks pop"). Each change-section line is prefixed with a leading marker
+# emoji; the email HTML converter (email_send._BADGE_BY_MARKER) turns it into a
+# colored badge pill + tinted callout card, while the plain-text copy reads the
+# emoji as-is. The two mappings MUST stay in sync — a cross-check test guards it.
+# ---------------------------------------------------------------------------
+
+_MARK_DROP = "\U0001F53B"   # 🔻 price drop / on sale
+_MARK_STOCK = "✅"      # ✅ back in stock
+_MARK_LOW = "⚠️"  # ⚠️ low stock
+_MARK_OOS = "⛔"        # ⛔ newly out of stock
+_MARK_FLAT = "\U0001F3F7️"  # 🏷️ standing discount (marked down, no real drop)
+
+
+def _save_pct(current: float | int | None, reference: float | int | None) -> int | None:
+    """Whole-percent savings of ``current`` off ``reference`` (e.g. 44), or None.
+
+    None when either value is missing/unparseable, the reference is ≤ 0, or the
+    current price isn't actually below the reference (no saving to advertise).
+    """
+    try:
+        cur = float(current)
+        ref = float(reference)
+    except (TypeError, ValueError):
+        return None
+    if ref <= 0 or cur >= ref:
+        return None
+    return round((1 - cur / ref) * 100)
+
+
+def _save_suffix(current: float | int | None, reference: float | int | None) -> str:
+    """`` — save 44%`` appended after a "was $X" phrase; "" when there's no drop."""
+    pct = _save_pct(current, reference)
+    return f" — save {pct}%" if pct else ""
+
+
 def _label(item: dict) -> str:
     r = item["result"]
     updated = r.get("updated_entry") or {}
@@ -371,7 +408,7 @@ def _suppress_could_not_check(item: dict) -> bool:
 # Item line renderers (one per primary bucket)
 # ---------------------------------------------------------------------------
 
-def _on_sale_line(item: dict, fx_rates: dict | None = None) -> str:
+def _on_sale_line(item: dict, fx_rates: dict | None = None, marker: str = "") -> str:
     r = item["result"]
     updated = r.get("updated_entry") or {}
     cur = updated.get("current_price")
@@ -379,7 +416,10 @@ def _on_sale_line(item: dict, fx_rates: dict | None = None) -> str:
     orig = updated.get("original_price")
     price_part = _fmt_price(cur, currency, fx_rates) or ""
     if r.get("sale_signal") == "on_sale_per_page" and orig:
-        price_part = f"{price_part} (was {_fmt_price(orig, currency, fx_rates)} listed)"
+        price_part = (
+            f"{price_part} (was {_fmt_price(orig, currency, fx_rates)} "
+            f"listed{_save_suffix(cur, orig)})"
+        )
 
     pieces = [f"**{_label(item)}**"]
     if price_part:
@@ -404,10 +444,12 @@ def _on_sale_line(item: dict, fx_rates: dict | None = None) -> str:
         pieces.append(size_note)
     pieces.extend(_variant_extra_pieces(item))
     pieces.append(_link(item))
-    return "- " + " — ".join(pieces)
+    return "- " + marker + " — ".join(pieces)
 
 
-def _standing_discount_line(item: dict, fx_rates: dict | None = None) -> str:
+def _standing_discount_line(
+    item: dict, fx_rates: dict | None = None, marker: str = "",
+) -> str:
     """Render a year-round "always marked down" item.
 
     The page advertises a markdown, but our observed price history shows the
@@ -460,10 +502,10 @@ def _standing_discount_line(item: dict, fx_rates: dict | None = None) -> str:
         pieces.append(size_note)
     pieces.extend(_variant_extra_pieces(item))
     pieces.append(_link(item))
-    return "- " + " — ".join(pieces)
+    return "- " + marker + " — ".join(pieces)
 
 
-def _newly_oos_line(item: dict, fx_rates: dict | None = None) -> str:
+def _newly_oos_line(item: dict, fx_rates: dict | None = None, marker: str = "") -> str:
     r = item["result"]
     updated = r.get("updated_entry") or {}
     cur = updated.get("current_price")
@@ -485,10 +527,10 @@ def _newly_oos_line(item: dict, fx_rates: dict | None = None) -> str:
         pieces.append(size_note)
     pieces.extend(_variant_extra_pieces(item))
     pieces.append(_link(item))
-    return "- " + " — ".join(pieces)
+    return "- " + marker + " — ".join(pieces)
 
 
-def _back_in_stock_line(item: dict, fx_rates: dict | None = None) -> str:
+def _back_in_stock_line(item: dict, fx_rates: dict | None = None, marker: str = "") -> str:
     updated = item["result"].get("updated_entry") or {}
     price = _fmt_price(updated.get("current_price"), updated.get("currency"), fx_rates)
     pieces = [f"**{_label(item)}**"]
@@ -499,10 +541,10 @@ def _back_in_stock_line(item: dict, fx_rates: dict | None = None) -> str:
         pieces.append(size_note)
     pieces.extend(_variant_extra_pieces(item))
     pieces.append(_link(item))
-    return "- " + " — ".join(pieces)
+    return "- " + marker + " — ".join(pieces)
 
 
-def _now_low_stock_line(item: dict, fx_rates: dict | None = None) -> str:
+def _now_low_stock_line(item: dict, fx_rates: dict | None = None, marker: str = "") -> str:
     updated = item["result"].get("updated_entry") or {}
     price = _fmt_price(updated.get("current_price"), updated.get("currency"), fx_rates)
     pieces = [f"**{_label(item)}**"]
@@ -513,7 +555,7 @@ def _now_low_stock_line(item: dict, fx_rates: dict | None = None) -> str:
         pieces.append(size_note)
     pieces.extend(_variant_extra_pieces(item))
     pieces.append(_link(item))
-    return "- " + " — ".join(pieces)
+    return "- " + marker + " — ".join(pieces)
 
 
 def _could_not_check_line(item: dict, fx_rates: dict | None = None) -> str:
@@ -685,7 +727,8 @@ def _priority_line(item: dict, fx_rates: dict | None = None) -> str:
     sale_signal = r.get("sale_signal")
     if sale_signal == "on_sale_per_page":
         pieces.append(
-            f"on sale, was {_fmt_price(orig, currency, fx_rates)}" if orig else "on sale"
+            f"on sale, was {_fmt_price(orig, currency, fx_rates)}{_save_suffix(cur, orig)}"
+            if orig else "on sale"
         )
     elif sale_signal == "standing_discount":
         pieces.append("marked down (no real drop)")
@@ -721,7 +764,28 @@ def _priority_line(item: dict, fx_rates: dict | None = None) -> str:
         pieces.append(size_note)
     pieces.extend(_variant_extra_pieces(item))
     pieces.append(_link(item))
-    return "- " + " — ".join(pieces)
+    return "- " + _priority_marker(sale_signal, stock) + " — ".join(pieces)
+
+
+def _priority_marker(sale_signal: str | None, stock_signal: str | None) -> str:
+    """Leading state marker for a "Watching now" line, most-actionable first.
+
+    A watch line spells out both a sale and a stock verdict; the badge shows the
+    one worth reacting to — a price move outranks a stock move, which outranks a
+    year-round markdown. An unchanged in-stock item gets no marker so it stays
+    visually quiet next to the items that actually changed.
+    """
+    if sale_signal in ("on_sale_per_page", "price_dropped"):
+        return f"{_MARK_DROP} "
+    if sale_signal == "standing_discount":
+        return f"{_MARK_FLAT} "
+    if stock_signal == "back_in_stock":
+        return f"{_MARK_STOCK} "
+    if stock_signal == "newly_out_of_stock":
+        return f"{_MARK_OOS} "
+    if stock_signal == "newly_low_stock":
+        return f"{_MARK_LOW} "
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1192,7 +1256,7 @@ def _email_restock_line(r: dict) -> str:
     url = r.get("url")
     if url:
         pieces.append(f"[open email]({url})")
-    return "- " + " — ".join(pieces)
+    return "- " + f"{_MARK_STOCK} " + " — ".join(pieces)
 
 
 def _email_restock_lines(
@@ -1292,14 +1356,27 @@ def _render_item_buckets(
     buckets["still_oos"].sort(key=lambda i: _label(i).lower())
 
     return {
-        "on_sale": [_on_sale_line(i, fx_rates) for i in buckets["on_sale"]],
-        "standing_discount": [
-            _standing_discount_line(i, fx_rates) for i in buckets["standing_discount"]
+        "on_sale": [
+            _on_sale_line(i, fx_rates, marker=f"{_MARK_DROP} ") for i in buckets["on_sale"]
         ],
+        "standing_discount": [
+            _standing_discount_line(i, fx_rates, marker=f"{_MARK_FLAT} ")
+            for i in buckets["standing_discount"]
+        ],
+        # Loose mentions stay unmarked — a "verify link" match shouldn't wear a
+        # confident PRICE DROP badge until the user confirms it.
         "uncertain": [_on_sale_line(i, fx_rates) for i in buckets["uncertain"]],
-        "newly_oos": [_newly_oos_line(i, fx_rates) for i in buckets["newly_oos"]],
-        "back_in_stock": [_back_in_stock_line(i, fx_rates) for i in buckets["back_in_stock"]],
-        "now_low_stock": [_now_low_stock_line(i, fx_rates) for i in buckets["now_low_stock"]],
+        "newly_oos": [
+            _newly_oos_line(i, fx_rates, marker=f"{_MARK_OOS} ") for i in buckets["newly_oos"]
+        ],
+        "back_in_stock": [
+            _back_in_stock_line(i, fx_rates, marker=f"{_MARK_STOCK} ")
+            for i in buckets["back_in_stock"]
+        ],
+        "now_low_stock": [
+            _now_low_stock_line(i, fx_rates, marker=f"{_MARK_LOW} ")
+            for i in buckets["now_low_stock"]
+        ],
         "could_not_check": [_could_not_check_line(i, fx_rates) for i in buckets["could_not_check"]],
         "removed_from_shop": [_removed_line(i, fx_rates) for i in buckets["removed_from_shop"]],
         "still_oos": [_still_oos_line(i) for i in buckets["still_oos"]],

@@ -11,8 +11,15 @@ from datetime import date
 from src.digest import (
     _DAILY_FIT_PENDING_CAP,
     _DAILY_REMOVAL_CAP,
+    _MARK_DROP,
+    _MARK_FLAT,
+    _MARK_LOW,
+    _MARK_OOS,
+    _MARK_STOCK,
     _review_age,
     _review_requests_section,
+    _save_pct,
+    _save_suffix,
     _untracked_label,
     _untracked_sms_section,
     build_digest,
@@ -1861,3 +1868,96 @@ class TestUntrackedSmsSection:
         out = build_digest({"items": [], "untracked_sms": [self._s("Junewave")]})
         assert "## Untracked SMS senders" in out
         assert "**Junewave** (1 text)" in out
+
+
+# ---------------------------------------------------------------------------
+# State markers + savings (the "make drops / restocks pop" visual layer)
+# ---------------------------------------------------------------------------
+
+class TestSavePct:
+    def test_whole_percent_rounds(self):
+        assert _save_pct(18.0, 32.0) == 44   # 43.75 → 44
+        assert _save_pct(84.0, 120.0) == 30
+
+    def test_no_saving_when_not_below_reference(self):
+        assert _save_pct(40.0, 40.0) is None
+        assert _save_pct(50.0, 40.0) is None
+
+    def test_none_on_missing_or_bad_input(self):
+        assert _save_pct(None, 40.0) is None
+        assert _save_pct(20.0, None) is None
+        assert _save_pct(20.0, 0) is None
+
+    def test_suffix_wording(self):
+        assert _save_suffix(18.0, 32.0) == " — save 44%"
+        assert _save_suffix(40.0, 40.0) == ""
+
+
+class TestStateMarkers:
+    """Change-section lines carry a leading state marker (turned into a badge
+    pill in the email HTML); the roster + shop-level sections stay unmarked."""
+
+    def _on_sale(self, cur=18.0, orig=32.0):
+        item = _item(sale_signal="on_sale_per_page")
+        item["result"]["updated_entry"]["current_price"] = cur
+        item["result"]["updated_entry"]["original_price"] = orig
+        return item
+
+    def _lines(self, out, prefix):
+        return [l for l in out.splitlines() if l.startswith(prefix)]
+
+    def test_on_sale_line_has_drop_marker(self):
+        out = build_digest({"items": [self._on_sale()]})
+        assert self._lines(out, f"- {_MARK_DROP} ")
+
+    def test_on_sale_line_shows_save_percent(self):
+        out = build_digest({"items": [self._on_sale(18.0, 32.0)]})
+        assert "save 44%" in out
+        assert "was $32 listed" in out  # existing wording preserved (save % appended)
+
+    def test_back_in_stock_marker(self):
+        out = build_digest({"items": [_item(stock_signal="back_in_stock")]})
+        assert self._lines(out, f"- {_MARK_STOCK} ")
+
+    def test_newly_oos_marker(self):
+        item = _item(stock_signal="newly_out_of_stock")
+        item["result"]["updated_entry"]["in_stock"] = False
+        out = build_digest({"items": [item]})
+        assert self._lines(out, f"- {_MARK_OOS} ")
+
+    def test_now_low_stock_marker(self):
+        out = build_digest({"items": [_item(stock_signal="newly_low_stock")]})
+        assert self._lines(out, f"- {_MARK_LOW} ")
+
+    def test_standing_discount_marker(self):
+        out = build_digest({"items": [_standing_item()]})
+        assert self._lines(out, f"- {_MARK_FLAT} ")
+
+    def test_uncertain_line_is_unmarked(self):
+        # A loose "verify link" match must NOT wear a confident PRICE DROP badge.
+        item = self._on_sale()
+        item["is_uncertain"] = True
+        out = build_digest({"items": [item]})
+        assert "## Uncertain matches" in out
+        assert not self._lines(out, f"- {_MARK_DROP} ")
+
+    def test_roster_lines_are_unmarked(self):
+        # The exhaustive roster stays visually quiet — no markers there.
+        out = build_digest({"items": [self._on_sale()]})
+        roster = out.split("## All items by shop", 1)[1]
+        assert _MARK_DROP not in roster
+
+    def test_priority_on_sale_line_marked(self):
+        item = self._on_sale()
+        item["priority"] = True
+        out = build_digest({"items": [item]})
+        assert self._lines(out, f"- {_MARK_DROP} ")
+
+    def test_priority_unchanged_line_unmarked(self):
+        item = _item()
+        item["priority"] = True
+        out = build_digest({"items": [item]})
+        # The watching-now line for a no-change item keeps its plain bullet.
+        assert any(
+            l.startswith("- **Cool Shirt**") for l in out.splitlines()
+        )

@@ -9,7 +9,13 @@ from __future__ import annotations
 
 import pytest
 
-from src.email_send import EmailSendError, markdown_to_html, send_email
+from src import digest
+from src.email_send import (
+    _BADGE_BY_MARKER,
+    EmailSendError,
+    markdown_to_html,
+    send_email,
+)
 
 
 class TestMarkdownToHtml:
@@ -71,6 +77,57 @@ class TestMarkdownToHtml:
         )
         assert '<a href="https://shop.com/x">link</a>' in html
         assert "[CAD $45]" in html  # bracketed text stays as literal text
+
+
+class TestBadgesAndCallouts:
+    def test_drop_marker_becomes_price_drop_badge(self):
+        html = markdown_to_html(f"- {digest._MARK_DROP} **Retro Ringer Tee** — $18")
+        assert ">Price drop</span>" in html
+        # The li carries the callout-card styling (left border + tint).
+        assert "border-left:3px solid" in html
+        # The marker emoji itself is consumed, not left dangling before the name.
+        assert f"{digest._MARK_DROP} <strong>" not in html
+        assert "<strong>Retro Ringer Tee</strong>" in html
+
+    def test_each_marker_maps_to_its_badge(self):
+        cases = {
+            digest._MARK_DROP: "Price drop",
+            digest._MARK_STOCK: "Back in stock",
+            digest._MARK_LOW: "Low stock",
+            digest._MARK_OOS: "Sold out",
+            digest._MARK_FLAT: "Marked down",
+        }
+        for marker, label in cases.items():
+            html = markdown_to_html(f"- {marker} **Item** — $10")
+            assert f">{label}</span>" in html
+
+    def test_unmarked_bullet_stays_plain(self):
+        html = markdown_to_html("- **Plain Item** — $10")
+        assert "<li><strong>Plain Item</strong>" in html
+        assert "border-left" not in html
+        assert "</span>" not in html  # no badge pill
+
+    def test_known_section_header_is_colored(self):
+        html = markdown_to_html("## Back in stock")
+        assert "<h2 style=" in html
+        assert "color:#1c7a4f" in html  # the green "stock" hue
+
+    def test_watching_now_header_colored(self):
+        html = markdown_to_html("## ⭐ Watching now")
+        assert "<h2 style=" in html
+
+    def test_unknown_section_header_stays_plain(self):
+        # "Shops on sale" is deliberately NOT recolored (shop-level, not item).
+        assert "<h2>Shops on sale</h2>" in markdown_to_html("## Shops on sale")
+        assert "<h2>All items by shop</h2>" in markdown_to_html("## All items by shop")
+
+    def test_badge_markers_match_digest_constants(self):
+        """Anti-drift: every marker digest emits must be recognized here."""
+        digest_markers = {
+            digest._MARK_DROP, digest._MARK_STOCK, digest._MARK_LOW,
+            digest._MARK_OOS, digest._MARK_FLAT,
+        }
+        assert digest_markers == set(_BADGE_BY_MARKER)
 
 
 class TestSendEmailValidation:
