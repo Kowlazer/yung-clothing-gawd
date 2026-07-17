@@ -66,8 +66,10 @@ _CARD_COLORS = {
 }
 
 # Known section headers → semantic colour. Prefix match, so the "(specific
-# URLs)" / "(non-clothing)" suffixes and the ⭐ prefix all still resolve. Only
-# the item-level change sections are coloured; shop-level sections stay neutral.
+# URLs)" / "(non-clothing)" suffixes and the ⭐ prefix all still resolve. Covers
+# the item-level change sections plus the shop-level sale-announcement headers
+# ("Shops on sale" / "Sales announced by email" — sale = rose, like a price
+# drop). Everything else (roster, no-sale, codes, …) stays neutral.
 _SECTION_KIND = (
     ("⭐ watching now", "watch"),
     ("items on sale", "drop"),
@@ -75,6 +77,9 @@ _SECTION_KIND = (
     ("newly out of stock", "oos"),
     ("now low stock", "low"),
     ("standing discounts", "flat"),
+    ("shops on sale", "drop"),
+    ("non-clothing shops on sale", "drop"),
+    ("sales announced by email", "drop"),
 )
 
 _PILL_BASE = (

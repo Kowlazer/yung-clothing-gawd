@@ -20,7 +20,8 @@ from src.email_send import (
 
 class TestMarkdownToHtml:
     def test_h2_rendered(self):
-        assert "<h2>Shops on sale</h2>" in markdown_to_html("## Shops on sale")
+        # A neutral (non-high-signal) header renders as a plain h2.
+        assert "<h2>Could not check</h2>" in markdown_to_html("## Could not check")
 
     def test_h3_rendered(self):
         assert "<h3>Aniqi</h3>" in markdown_to_html("### Aniqi")
@@ -116,10 +117,19 @@ class TestBadgesAndCallouts:
         html = markdown_to_html("## ⭐ Watching now")
         assert "<h2 style=" in html
 
+    def test_shop_level_sale_headers_colored(self):
+        # The shop-level good-news headers get the rose "sale" hue (header only —
+        # their lines have no per-item state, so no badges/cards).
+        for header in ("## Shops on sale", "## Non-clothing shops on sale",
+                       "## Sales announced by email"):
+            html = markdown_to_html(header)
+            assert "<h2 style=" in html
+            assert "color:#b23b30" in html  # the rose "drop"/sale hue
+
     def test_unknown_section_header_stays_plain(self):
-        # "Shops on sale" is deliberately NOT recolored (shop-level, not item).
-        assert "<h2>Shops on sale</h2>" in markdown_to_html("## Shops on sale")
+        # The exhaustive roster + no-sale sections are deliberately NOT recolored.
         assert "<h2>All items by shop</h2>" in markdown_to_html("## All items by shop")
+        assert "<h2>Shops with no sale</h2>" in markdown_to_html("## Shops with no sale")
 
     def test_badge_markers_match_digest_constants(self):
         """Anti-drift: every marker digest emits must be recognized here."""
