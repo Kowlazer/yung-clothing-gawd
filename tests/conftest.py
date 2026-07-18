@@ -21,6 +21,19 @@ def _fast_rate_limiters():
 
 
 @pytest.fixture(autouse=True)
+def _reset_circuit_breaker():
+    """Clear the process-global host circuit breaker between tests.
+
+    ``http_util._BREAKER`` accumulates per-host throttle counts across a run;
+    without a reset, a test that trips it (two persistent 429s to one host)
+    would silently short-circuit a later test's fetch to that same host.
+    """
+    from src import http_util
+    http_util._BREAKER.reset()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_browser_fallback(monkeypatch):
     """Keep the browser-render fallback out of every test by default.
 

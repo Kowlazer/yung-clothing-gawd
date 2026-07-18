@@ -15,6 +15,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import httpx
 
@@ -37,6 +38,78 @@ _RETRY_STATUSES = frozenset({429, 503})
 DEFAULT_MAX_RETRIES = 2   # extra attempts after the first GET (up to 3 total)
 _BACKOFF_BASE = 1.0       # seconds; doubles each attempt: 1, 2, 4 ...
 MAX_BACKOFF = 15.0        # cap on any single wait (also caps a huge Retry-After)
+
+
+# ---------------------------------------------------------------------------
+# Per-host rate-limit circuit breaker
+# ---------------------------------------------------------------------------
+# On a wide 429 storm (observed 2026-07-15 and again 2026-07-17, when the runs
+# were cancelled at the workflow timeout before they could send the digest) the
+# runner IP gets throttled across dozens of shops at once. With items serialised
+# per domain, every item on a throttling host used to pay its own
+# initial-plus-backoff ladder — up to 2 x 15s = 30s, and ~60s for a Shopify
+# product that probes `.json` then the page — before giving up and being
+# recorded `rate_limited`. So a shop with N watched items cost ~N x 30s of pure
+# waiting; enough such shops blew the 70-min cap (07-17: 255 min of summed
+# backoff and 1530 429s in the item scan, with the worst single host pinning one
+# worker for ~27 min all by itself).
+#
+# The breaker stops the *waiting*, never the recording: once a host has
+# persistently throttled us `_BREAKER_THRESHOLD` times in a run, every further
+# request to it short-circuits to a synthetic 429 — no network call, no backoff
+# — which the caller classifies as `rate_limited` exactly as it would a real
+# one, so those items simply recover next run as they already did. State is
+# process-global (a fresh process per cron run resets it) and shared by every
+# `get_with_retry` caller, so it spans both the product scan and the homepage
+# scan: a host tripped while pricing items also short-circuits its homepage
+# check.
+_BREAKER_THRESHOLD = 2
+
+
+class HostCircuitBreaker:
+    """Thread-safe per-host throttle tracker (see the module note above).
+
+    Counts persistent 429/503s per host; once a host reaches ``threshold`` it is
+    "tripped" and `is_tripped` returns True so the caller can skip the fetch.
+    """
+
+    def __init__(self, threshold: int = _BREAKER_THRESHOLD) -> None:
+        self._lock = threading.Lock()
+        self._threshold = threshold
+        self._counts: dict[str, int] = {}
+        self._tripped: set[str] = set()
+
+    def is_tripped(self, host: str) -> bool:
+        if not host:
+            return False
+        with self._lock:
+            return host in self._tripped
+
+    def record_throttled(self, host: str) -> bool:
+        """Register one persistent throttle for ``host``.
+
+        Returns True the moment the host crosses the threshold (so the caller
+        logs the trip exactly once), False otherwise.
+        """
+        if not host:
+            return False
+        with self._lock:
+            n = self._counts.get(host, 0) + 1
+            self._counts[host] = n
+            if n >= self._threshold and host not in self._tripped:
+                self._tripped.add(host)
+                return True
+            return False
+
+    def reset(self) -> None:
+        """Clear all state — used between tests; prod gets a fresh process."""
+        with self._lock:
+            self._counts.clear()
+            self._tripped.clear()
+
+
+# Process-global breaker shared by every get_with_retry caller.
+_BREAKER = HostCircuitBreaker()
 
 
 class RateLimiter:
@@ -93,6 +166,7 @@ def get_with_retry(
     *,
     max_retries: int = DEFAULT_MAX_RETRIES,
     sleep=time.sleep,
+    breaker: HostCircuitBreaker | None = _BREAKER,
     **get_kwargs,
 ) -> httpx.Response:
     """GET ``url``, retrying on 429/503 while honoring ``Retry-After``.
@@ -105,7 +179,21 @@ def get_with_retry(
     caller owns the try/except), so this only adapts to a server that
     explicitly told us to slow down. ``get_kwargs`` are forwarded to every
     ``client.get`` (e.g. per-call ``headers`` / ``timeout`` / ``follow_redirects``).
+
+    A process-global per-host circuit ``breaker`` (see ``HostCircuitBreaker``)
+    short-circuits requests to a host that has already persistently throttled us
+    this run: instead of paying the ladder above again, it hands back a
+    synthetic 429 the caller records as ``rate_limited``. Pass ``breaker=None``
+    to disable (behaviour is then identical to before the breaker existed).
     """
+    host = urlparse(url).netloc
+    if breaker is not None and breaker.is_tripped(host):
+        # Host already known-throttled this run: skip the network + backoff and
+        # return a synthetic 429 the caller records as `rate_limited` (recovers
+        # next run), the same verdict it would have reached after 30s of waiting.
+        log.info("http_util: %s rate-limited earlier this run, short-circuiting", host)
+        return httpx.Response(429, request=httpx.Request("GET", url))
+
     resp = client.get(url, **get_kwargs)
     for attempt in range(max_retries):
         if resp.status_code not in _RETRY_STATUSES:
@@ -118,4 +206,13 @@ def get_with_retry(
                  url, resp.status_code, wait, attempt + 1, max_retries)
         sleep(wait)
         resp = client.get(url, **get_kwargs)
+
+    # Exhausted retries. If the host is still throttling us, register it with the
+    # breaker — enough persistent throttles and it trips, so the rest of the
+    # host's items skip the ladder above instead of each paying it in full.
+    if breaker is not None and resp.status_code in _RETRY_STATUSES:
+        if breaker.record_throttled(host):
+            log.info("http_util: %s tripped the rate-limit circuit breaker after "
+                     "%d persistent throttles; further requests to it this run "
+                     "will short-circuit to rate_limited", host, breaker._threshold)
     return resp

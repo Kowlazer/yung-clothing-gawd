@@ -12,16 +12,19 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    # Raised 15 -> 45 -> 70. The Shopify per-IP rate-limit fix serialises both
-    # product fetches and homepage fetches at a 5 s global gap (plus adaptive
-    # Retry-After backoff), so a normal run takes ~37 min. That left only ~8 min
-    # of headroom under 45, and on 2026-07-15 a wide 429 storm (dozens of shops
-    # rate-limiting at once, each backing off) pushed the run past 45 min — it
-    # was CANCELLED mid-fetch and the email (the very last step) never sent. 70
-    # gives a heavy-429 day room to finish and deliver; the per-shop retry cost
-    # was also cut (http_util: 3->2 retries, 20s->15s backoff cap) so the worst
-    # case is smaller too. An indefinite stall still trips the cap.
-    timeout-minutes: 70
+    # Raised 15 -> 45 -> 70 -> 90. The Shopify per-IP rate-limit fix serialises
+    # both product fetches and homepage fetches at a 5 s global gap (plus
+    # adaptive Retry-After backoff), so a normal run takes ~37 min. A wide 429
+    # storm (dozens of shops rate-limiting at once, each backing off) blew the
+    # cap twice — 2026-07-15 at 45 min and again 2026-07-17 at 70 min — and each
+    # run was CANCELLED mid-fetch so the email (the very last step) never sent.
+    # The real fix is the per-host circuit breaker (http_util.HostCircuitBreaker,
+    # added 2026-07-17): once a host has persistently throttled us, the rest of
+    # its items short-circuit to `rate_limited` instead of each paying the full
+    # 30s backoff ladder, which collapses a storm-day item scan from ~48 min to
+    # ~15 min. 90 is cheap belt-and-suspenders headroom on top of that; an
+    # indefinite stall still trips the cap.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
