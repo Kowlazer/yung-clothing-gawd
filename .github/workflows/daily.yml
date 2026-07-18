@@ -21,9 +21,12 @@ jobs:
     # The real fix is the per-host circuit breaker (http_util.HostCircuitBreaker,
     # added 2026-07-17): once a host has persistently throttled us, the rest of
     # its items short-circuit to `rate_limited` instead of each paying the full
-    # 30s backoff ladder, which collapses a storm-day item scan from ~48 min to
-    # ~15 min. 90 is cheap belt-and-suspenders headroom on top of that; an
-    # indefinite stall still trips the cap.
+    # 30s backoff ladder. Measured on the 07-18 prod run (same storm that
+    # cancelled 07-17): item scan 48 min -> 26 min, whole run ~39.5 min, digest
+    # delivered. The trip threshold was then softened 2 -> 4 (see http_util) for
+    # fresher prices, expected to add ~5-9 min on a storm day. 90 is cheap
+    # belt-and-suspenders headroom on top of that; an indefinite stall still
+    # trips the cap.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5

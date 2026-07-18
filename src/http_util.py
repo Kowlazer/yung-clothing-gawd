@@ -63,7 +63,20 @@ MAX_BACKOFF = 15.0        # cap on any single wait (also caps a huge Retry-After
 # `get_with_retry` caller, so it spans both the product scan and the homepage
 # scan: a host tripped while pricing items also short-circuits its homepage
 # check.
-_BREAKER_THRESHOLD = 2
+#
+# Threshold tuned 2 -> 4 on 2026-07-18. The first prod run (07-18, still inside
+# the same severe storm) delivered but short-circuited 217 items to
+# `rate_limited` at a threshold of 2 — the run finished, but with a lot of stale
+# prices. Raising it to 4 gives a shop more price attempts before it trips, so a
+# host that is only *softly* throttling (bursty 429s that recover on retry) keeps
+# getting priced instead of being written off after two unlucky items; a
+# genuinely hard-blocked host still trips well before its whole item list is
+# spent. The cost is a few extra ladders on the big multi-item hosts — measured
+# ~5-9 min added to a storm-day item scan, still far under the 90-min cap. On a
+# calm day almost nothing trips, so the knob barely matters. Raise further if
+# stale-price counts stay high on moderate days; lower it back toward 2 if a
+# future storm ever threatens the cap again.
+_BREAKER_THRESHOLD = 4
 
 
 class HostCircuitBreaker:
