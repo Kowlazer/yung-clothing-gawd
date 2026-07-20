@@ -76,6 +76,9 @@ def detect_sale(
         prior_price    float | None  — set when the price fell vs. the last check
         baseline_price float | None  — trailing-max over the baseline window (success path)
         baseline_days  int   | None  — the window width used (for digest wording)
+        price_standing dict  | None  — deal quality: is today the lowest we've
+                                       seen, and if not, what/when was lower
+                                       (price_history.price_standing)
         variant_changes dict          — per-dimension list of per-value in/low/out
                                         transitions seen this run (empty on errors)
         last_known     dict | None   — prior entry; set on error for digest rendering
@@ -152,10 +155,16 @@ def detect_sale(
     first_seen = prev_first_seen or now
     new_history: list[str] = list(history.get("price_history") or [])
     baseline: float | None = None
+    standing: dict | None = None
     if cur_price is not None:
         new_history = price_history.append_observation(new_history, cur_price, today)
         new_history = price_history.prune(new_history, today, rules.retention_days)
         baseline = price_history.baseline_max(new_history, today, rules.baseline_days)
+        # Deal *quality* (as opposed to "is the markdown real"): where today's
+        # price ranks against every price this URL has actually held. Read off
+        # the same series, so it costs nothing extra. None when the series is
+        # too shallow to make a claim — the digest then just omits the note.
+        standing = price_history.price_standing(new_history, today, cur_price)
 
     # Enough tracking history to trust the baseline? On a brand-new (or legacy,
     # pre-history) entry first_seen was just stamped, so we fall back to taking
@@ -241,6 +250,9 @@ def detect_sale(
         "prior_price": prior_price,
         "baseline_price": baseline,
         "baseline_days": rules.baseline_days,
+        # How today's price ranks against the item's own history — see
+        # price_history.price_standing. None when we can't say anything solid.
+        "price_standing": standing,
         # Per-variant transitions seen this run, grouped by dimension:
         # {"size": [{"value": "M", "from": "in", "to": "out"}, ...], "color": [...]}.
         "variant_changes": variant_changes,

@@ -144,3 +144,144 @@ class TestBaseline:
                ph.format_point(_d(5), 45.0)]    # back to $45
         # window sees 40 (carry-in), 60, 45 -> max 60
         assert ph.baseline_max(pts, TODAY, 90) == 60.0
+
+
+# ---------------------------------------------------------------------------
+# price_standing — deal quality
+# ---------------------------------------------------------------------------
+
+class TestPriceStanding:
+    def test_no_history_returns_none(self):
+        assert ph.price_standing([], TODAY, 50.0) is None
+        assert ph.price_standing(None, TODAY, 50.0) is None
+
+    def test_too_shallow_makes_no_claim(self):
+        """"Lowest in 9 days" reads like a fact and is nearly noise."""
+        pts = [ph.format_point(_d(9), 60.0), ph.format_point(TODAY, 50.0)]
+        assert ph.price_standing(pts, TODAY, 50.0) is None
+
+    def test_shallow_threshold_is_tunable(self):
+        pts = [ph.format_point(_d(9), 60.0), ph.format_point(TODAY, 50.0)]
+        out = ph.price_standing(pts, TODAY, 50.0, min_tracked_days=5)
+        assert out and out["is_lowest"] is True
+
+    def test_flat_price_makes_no_claim(self):
+        """A price that has never moved is trivially its own lowest — saying so
+        implies a deal that doesn't exist. (The 2026-07-19 verification digest
+        was full of "$48, not on sale, lowest in 40d" on never-moved items.)"""
+        pts = [ph.format_point(_d(40), 48.0)]
+        assert ph.price_standing(pts, TODAY, 48.0) is None
+
+    def test_a_wobble_sized_rise_is_not_movement(self):
+        pts = [ph.format_point(_d(40), 49.0), ph.format_point(TODAY, 48.0)]
+        assert ph.price_standing(pts, TODAY, 48.0) is None
+
+    def test_lowest_ever_seen(self):
+        pts = [ph.format_point(_d(120), 80.0), ph.format_point(_d(40), 60.0),
+               ph.format_point(TODAY, 50.0)]
+        out = ph.price_standing(pts, TODAY, 50.0)
+        assert out == {
+            "tracked_days": 120,
+            "is_lowest": True,
+            "days_since_lower": None,
+            "prior_low": None,
+            "prior_low_on": None,
+        }
+
+    def test_equal_to_the_old_low_still_counts_as_lowest(self):
+        """Matching the best price we've seen is not "worse than" it."""
+        pts = [ph.format_point(_d(90), 40.0), ph.format_point(_d(60), 80.0),
+               ph.format_point(TODAY, 40.0)]
+        out = ph.price_standing(pts, TODAY, 40.0)
+        assert out["is_lowest"] is True
+
+    def test_reports_the_lower_price_and_when_it_held(self):
+        pts = [ph.format_point(_d(100), 80.0),
+               ph.format_point(_d(60), 32.0),   # the low, held 60d..41d ago
+               ph.format_point(_d(40), 80.0),
+               ph.format_point(TODAY, 50.0)]
+        out = ph.price_standing(pts, TODAY, 50.0)
+        assert out["is_lowest"] is False
+        assert out["prior_low"] == 32.0
+        assert out["prior_low_on"] == _d(60).isoformat()
+        # The $32 run ended the day before the $80 point, i.e. 41 days ago.
+        assert out["days_since_lower"] == 41
+
+    def test_most_recent_occurrence_of_a_repeated_low_wins(self):
+        """"Back in April" should mean the last April, not the first."""
+        pts = [ph.format_point(_d(200), 30.0),
+               ph.format_point(_d(150), 90.0),
+               ph.format_point(_d(80), 30.0),   # same low, more recently
+               ph.format_point(_d(50), 90.0),
+               ph.format_point(TODAY, 60.0)]
+        out = ph.price_standing(pts, TODAY, 60.0)
+        assert out["prior_low"] == 30.0
+        assert out["prior_low_on"] == _d(80).isoformat()
+        assert out["days_since_lower"] == 51   # the $30 run ended _d(51)
+
+    def test_only_prices_below_today_count_as_lower(self):
+        pts = [ph.format_point(_d(90), 55.0), ph.format_point(TODAY, 50.0)]
+        out = ph.price_standing(pts, TODAY, 50.0)
+        assert out["is_lowest"] is True
+
+    def test_trivial_wobble_is_not_a_missed_deal(self):
+        """$87 today vs $86 in June is drift, not a deal worth reporting — a
+        probe of the real state showed these would have dominated the output."""
+        pts = [ph.format_point(_d(90), 86.0), ph.format_point(_d(60), 100.0),
+               ph.format_point(TODAY, 87.0)]
+        out = ph.price_standing(pts, TODAY, 87.0)
+        assert out["is_lowest"] is True
+
+    def test_fx_drift_band_is_excluded(self):
+        """Regression guard for carmico.ca: a CAD shop recomputing USD prices
+        daily drifts a few percent with no sale behind it ($87 today, $84 a
+        fortnight ago). That band must stay silent."""
+        pts = [ph.format_point(_d(40), 86.0), ph.format_point(_d(30), 84.0),
+               ph.format_point(_d(20), 100.0), ph.format_point(TODAY, 87.0)]
+        out = ph.price_standing(pts, TODAY, 87.0)
+        assert out["is_lowest"] is True      # the $84 drift is not a missed deal
+
+    def test_a_material_gap_still_reports(self):
+        pts = [ph.format_point(_d(90), 74.0), ph.format_point(_d(60), 100.0),
+               ph.format_point(TODAY, 88.0)]           # 16% above the old low
+        out = ph.price_standing(pts, TODAY, 88.0)
+        assert out["is_lowest"] is False
+        assert out["prior_low"] == 74.0
+
+    def test_gap_margin_is_tunable(self):
+        pts = [ph.format_point(_d(90), 86.0), ph.format_point(_d(60), 100.0),
+               ph.format_point(TODAY, 87.0)]
+        out = ph.price_standing(pts, TODAY, 87.0, min_gap_pct=0.0)
+        assert out["is_lowest"] is False       # every cent counts at 0%
+
+    def test_zero_price_does_not_blow_up(self):
+        pts = [ph.format_point(_d(90), 20.0), ph.format_point(TODAY, 0.0)]
+        out = ph.price_standing(pts, TODAY, 0.0)
+        assert out["is_lowest"] is True
+
+    def test_tracked_days_spans_the_whole_retained_series(self):
+        pts = [ph.format_point(_d(300), 80.0), ph.format_point(TODAY, 50.0)]
+        assert ph.price_standing(pts, TODAY, 50.0)["tracked_days"] == 300
+
+    def test_malformed_points_are_skipped_not_raised(self):
+        pts = ["garbage", ph.format_point(_d(60), 80.0), None,
+               ph.format_point(TODAY, 50.0)]
+        out = ph.price_standing(pts, TODAY, 50.0)
+        assert out["is_lowest"] is True and out["tracked_days"] == 60
+
+    def test_future_dated_point_does_not_produce_negative_days(self):
+        """Hand-edited / clock-skewed state must not yield nonsense output."""
+        pts = [ph.format_point(_d(90), 30.0), ph.format_point(_d(-5), 80.0),
+               ph.format_point(TODAY, 50.0)]
+        out = ph.price_standing(pts, TODAY, 50.0)
+        assert out["days_since_lower"] >= 0
+
+    def test_same_day_superseded_price_never_held(self):
+        """Two points on one date (legacy / hand-edited state): the first was
+        superseded the same day, so it never actually held for a day and must
+        not be reported as a price the item "was"."""
+        pts = [ph.format_point(_d(60), 30.0), ph.format_point(_d(60), 90.0),
+               ph.format_point(TODAY, 50.0)]
+        out = ph.price_standing(pts, TODAY, 50.0)
+        assert out["is_lowest"] is True
+        assert out["days_since_lower"] is None

@@ -583,3 +583,55 @@ class TestVariantTracking:
         series = r["updated_entry"]["variant_history"]["size"]["M"]
         # carry-in (the 400-day-ago 'in') + today's 'out'
         assert series == [vh.format_point(_ago(400), "in"), vh.format_point(TODAY, "out")]
+
+
+# ---------------------------------------------------------------------------
+# price_standing passthrough — deal quality rides on the same series
+# ---------------------------------------------------------------------------
+
+class TestPriceStandingPassthrough:
+    def test_new_low_is_reported_as_lowest(self):
+        hist = _tracked_history(
+            [(_ago(120), 80.0), (_ago(40), 60.0)],
+            first_seen_days_ago=120, current_price=60.0,
+        )
+        r = _detect(_extracted(current_price=45.0), hist)
+        st = r["price_standing"]
+        assert st["is_lowest"] is True
+        assert st["tracked_days"] == 120
+
+    def test_matching_an_older_low_is_not_the_lowest(self):
+        hist = _tracked_history(
+            [(_ago(120), 80.0), (_ago(90), 32.0), (_ago(60), 80.0)],
+            first_seen_days_ago=120, current_price=80.0,
+        )
+        r = _detect(_extracted(current_price=50.0), hist)
+        st = r["price_standing"]
+        assert st["is_lowest"] is False
+        assert st["prior_low"] == 32.0
+        assert st["prior_low_on"] == _ago(90).isoformat()
+
+    def test_shallow_history_makes_no_claim(self):
+        hist = _tracked_history(
+            [(_ago(3), 80.0)], first_seen_days_ago=3, current_price=80.0,
+        )
+        r = _detect(_extracted(current_price=50.0), hist)
+        assert r["price_standing"] is None
+
+    def test_error_path_carries_no_claim(self):
+        """A blocked fetch has no price to rank — the key must be absent, not stale."""
+        hist = _tracked_history(
+            [(_ago(120), 80.0)], first_seen_days_ago=120, current_price=80.0,
+        )
+        r = detect_sale(URL, {"error_kind": "blocked"}, hist, today=TODAY)
+        assert r.get("price_standing") is None
+
+    def test_it_is_ranked_against_today_not_yesterday(self):
+        """Today's observation is folded into the series before ranking, so a
+        fresh all-time low reads as the lowest rather than as beaten by itself."""
+        hist = _tracked_history(
+            [(_ago(120), 80.0), (_ago(2), 55.0)],
+            first_seen_days_ago=120, current_price=55.0,
+        )
+        r = _detect(_extracted(current_price=40.0), hist)
+        assert r["price_standing"]["is_lowest"] is True

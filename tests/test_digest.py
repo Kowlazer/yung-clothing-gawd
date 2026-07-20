@@ -1961,3 +1961,69 @@ class TestStateMarkers:
         assert any(
             l.startswith("- **Cool Shirt**") for l in out.splitlines()
         )
+
+
+# ---------------------------------------------------------------------------
+# Deal quality (price_standing note)
+# ---------------------------------------------------------------------------
+
+def _standing(**over):
+    base = {"tracked_days": 94, "is_lowest": True, "days_since_lower": None,
+            "prior_low": None, "prior_low_on": None}
+    base.update(over)
+    return base
+
+
+class TestPriceStandingNote:
+    def test_lowest_is_called_out_on_a_sale_line(self):
+        out = build_digest({"items": [_item(
+            sale_signal="on_sale_per_page", price_standing=_standing())]})
+        assert "lowest in 94d of tracking" in out
+
+    def test_a_mediocre_sale_says_what_was_better(self):
+        out = build_digest({"items": [_item(
+            sale_signal="on_sale_per_page",
+            price_standing=_standing(is_lowest=False, days_since_lower=61,
+                                     prior_low=32.0, prior_low_on="2026-04-03"))]})
+        assert "not its lowest: $32 back on Apr 03, 61d ago" in out
+
+    def test_price_dropped_line_gets_the_note_too(self):
+        out = build_digest({"items": [_item(
+            sale_signal="price_dropped", prior_price=60.0,
+            price_standing=_standing())]})
+        assert "lowest in 94d of tracking" in out
+
+    def test_absent_standing_adds_nothing(self):
+        """A newly-added URL has no history - the line must read as before."""
+        out = build_digest({"items": [_item(sale_signal="on_sale_per_page")]})
+        assert "lowest" not in out
+        assert "not its lowest" not in out
+
+    def test_unparseable_date_degrades_to_a_dateless_phrase(self):
+        out = build_digest({"items": [_item(
+            sale_signal="on_sale_per_page",
+            price_standing=_standing(is_lowest=False, days_since_lower=5,
+                                     prior_low=32.0, prior_low_on="not-a-date"))]})
+        assert "not its lowest: $32 earlier, 5d ago" in out
+
+    def test_missing_prior_low_omits_the_note(self):
+        out = build_digest({"items": [_item(
+            sale_signal="on_sale_per_page",
+            price_standing=_standing(is_lowest=False, days_since_lower=5))]})
+        assert "not its lowest" not in out
+
+    def test_priority_line_shows_it_even_with_no_sale(self):
+        """The watch block answers "should I buy today" on a quiet day too."""
+        item = _item(price_standing=_standing(
+            is_lowest=False, days_since_lower=61, prior_low=32.0,
+            prior_low_on="2026-04-03"))
+        item["priority"] = True
+        out = build_digest({"items": [item]})
+        assert "Watching now" in out
+        assert "not its lowest: $32 back on Apr 03, 61d ago" in out
+
+    def test_roster_line_stays_uncluttered(self):
+        """~340 unchanged items ride the roster; the note would be noise there."""
+        out = build_digest({"items": [_item(price_standing=_standing())]})
+        assert "## All items by shop" in out
+        assert "lowest in 94d" not in out

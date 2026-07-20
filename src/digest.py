@@ -341,6 +341,50 @@ def _color_note(item: dict) -> str | None:
     return f"colors: {', '.join(available)} ({'; '.join(flags)})"
 
 
+def _price_standing_note(
+    item: dict, currency: str | None, fx_rates: dict | None = None,
+) -> str | None:
+    """Deal-quality note: how today's price ranks against the item's own history.
+
+    A page's "was $80" only says what the shop claims. This says what we've
+    actually watched the price do, which is the difference between a markdown
+    worth acting on and one worth waiting out:
+
+        ``lowest in 94d of tracking``
+        ``not its lowest: $32 back on Apr 03, 61d ago``
+
+    Colon rather than a dash inside the phrase — pieces are already joined with
+    " — ", and ``_standing_discount_line``'s "no real drop: …" set the precedent.
+
+    ``None`` when ``price_standing`` declined to make a claim (no history, or
+    too little of it), so a newly-added URL adds no note at all.
+    """
+    st = (item.get("result") or {}).get("price_standing") or {}
+    if not st:
+        return None
+    tracked = st.get("tracked_days")
+    if st.get("is_lowest"):
+        return f"**lowest in {tracked}d of tracking**"
+    low = _fmt_price(st.get("prior_low"), currency, fx_rates)
+    if not low:
+        return None
+    when = _fmt_day(st.get("prior_low_on"))
+    days = st.get("days_since_lower")
+    tail = f", {days}d ago" if days else ""
+    return f"not its lowest: {low} back on {when}{tail}" if when else \
+        f"not its lowest: {low} earlier{tail}"
+
+
+def _fmt_day(iso: str | None) -> str | None:
+    """``"2026-04-03"`` -> ``"Apr 03"``; ``None`` when unparseable."""
+    if not iso:
+        return None
+    try:
+        return date.fromisoformat(iso).strftime("%b %d")
+    except (ValueError, TypeError):
+        return None
+
+
 def _variant_extra_pieces(item: dict) -> list[str]:
     """Transition news + colour matrix, appended after the size note on a line."""
     pieces: list[str] = []
@@ -426,6 +470,11 @@ def _on_sale_line(item: dict, fx_rates: dict | None = None, marker: str = "") ->
         pieces.append(price_part)
     if r.get("prior_price") is not None:
         pieces.append(f"down from {_fmt_price(r['prior_price'], currency, fx_rates)} last checked")
+    # Deal quality, straight after the price facts — the reader has the numbers
+    # in view, and this is the sentence that decides whether to click.
+    standing = _price_standing_note(item, currency, fx_rates)
+    if standing:
+        pieces.append(standing)
     if r.get("stock_signal") == "newly_low_stock":
         pieces.append("low stock")
     if r.get("stock_signal") == "back_in_stock":
@@ -739,6 +788,12 @@ def _priority_line(item: dict, fx_rates: dict | None = None) -> str:
         pieces.append(
             f"down from {_fmt_price(r['prior_price'], currency, fx_rates)} last checked"
         )
+    # Deal quality. Shown here even when the item *isn't* on sale — for something
+    # the user is actively watching, "not its lowest, $32 back in April" is the
+    # answer to "should I buy today", and a no-sale day is when they ask it.
+    standing = _price_standing_note(item, currency, fx_rates)
+    if standing:
+        pieces.append(standing)
 
     # Stock verdict — always explicit, with the change flavour when there is one.
     stock = r.get("stock_signal")
