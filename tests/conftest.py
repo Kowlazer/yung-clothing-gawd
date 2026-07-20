@@ -8,13 +8,19 @@ def _fast_rate_limiters():
     """Zero the production RateLimiter intervals so tests never really sleep.
 
     The product extractor and the homepage fetcher each hold a module-level
-    ``RateLimiter`` singleton (5 s / 2 s gaps in prod). Tests that exercise the
-    real fetch paths through ``httpx_mock`` would otherwise block on those
-    sleeps. Zeroing the interval makes ``acquire()`` a no-op. A dedicated
-    RateLimiter unit test constructs its own instance with a real interval, so
-    its timing behaviour is still covered.
+    limiter singleton (the shared adaptive platform gate / a fixed 2 s gap in
+    prod). Tests that exercise the real fetch paths through ``httpx_mock`` would
+    otherwise block on those sleeps. Zeroing the interval makes ``acquire()`` a
+    no-op. Dedicated unit tests construct their own instances with real
+    intervals, so the timing and AIMD behaviour are still covered.
+
+    The platform gate is process-global and *stateful across a run* by design,
+    so it's re-zeroed (and its clean streak cleared) before every test — a test
+    that provokes a 429 would otherwise widen the gate for every test after it.
     """
-    from src import claude_fuzzy, main
+    from src import claude_fuzzy, http_util, main
+    http_util.PLATFORM_LIMITER._interval = 0.0
+    http_util.PLATFORM_LIMITER._clean = 0
     main._SHOPIFY_LIMITER._interval = 0.0
     claude_fuzzy._HOMEPAGE_LIMITER._interval = 0.0
     yield

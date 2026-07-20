@@ -261,3 +261,129 @@ class TestRateLimiter:
         clock["t"] = 1010.0           # 10 s elapsed > 5 s interval
         lim.acquire()
         assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
+# AdaptiveRateLimiter (AIMD platform gate)
+# ---------------------------------------------------------------------------
+
+def _adaptive(**kw):
+    from src import http_util
+    defaults = dict(start=1.0, min_interval=1.0, max_interval=5.0,
+                    growth=2.0, decay_step=0.5, decay_after=3)
+    defaults.update(kw)
+    start = defaults.pop("start")
+    return http_util.AdaptiveRateLimiter(start, **defaults)
+
+
+class TestAdaptiveRateLimiter:
+    def test_starts_narrow(self):
+        assert _adaptive().interval == 1.0
+
+    def test_throttle_widens_multiplicatively(self):
+        lim = _adaptive()
+        lim.record_throttled("shop.com")
+        assert lim.interval == 2.0
+        lim.record_throttled("shop.com")
+        assert lim.interval == 4.0
+
+    def test_widening_is_capped_at_the_old_fixed_gap(self):
+        # The whole safety argument: the worst this can degrade to is the flat
+        # 5 s gate it replaced — never slower.
+        lim = _adaptive()
+        for _ in range(10):
+            lim.record_throttled("shop.com")
+        assert lim.interval == 5.0
+
+    def test_clean_stretch_decays_one_step(self, monkeypatch):
+        from src import http_util
+        monkeypatch.setattr(http_util.time, "sleep", lambda s: None)
+        lim = _adaptive()                 # decay_after=3
+        lim.record_throttled("shop.com")  # -> 2.0
+        for _ in range(3):
+            lim.acquire()
+        assert lim.interval == 1.5
+
+    def test_decay_stops_at_the_floor(self, monkeypatch):
+        from src import http_util
+        monkeypatch.setattr(http_util.time, "sleep", lambda s: None)
+        lim = _adaptive()
+        for _ in range(30):               # far more clean requests than needed
+            lim.acquire()
+        assert lim.interval == 1.0
+
+    def test_throttle_resets_the_clean_streak(self, monkeypatch):
+        # Two clean acquisitions then a throttle must not leave the counter
+        # primed to decay immediately after — AIMD decays slowly on purpose.
+        from src import http_util
+        monkeypatch.setattr(http_util.time, "sleep", lambda s: None)
+        lim = _adaptive()
+        lim.record_throttled("a.com")     # -> 2.0
+        lim.acquire()
+        lim.acquire()
+        lim.record_throttled("a.com")     # -> 4.0, streak cleared
+        lim.acquire()
+        assert lim.interval == 4.0        # only 1 clean since; decay_after is 3
+
+    def test_zeroed_interval_short_circuits(self, monkeypatch):
+        # The test/no-delay configuration (conftest zeroes the gate): acquire()
+        # must not sleep, and must not run the feedback loop.
+        from src import http_util
+        sleeps: list[float] = []
+        monkeypatch.setattr(http_util.time, "sleep", sleeps.append)
+        lim = _adaptive()
+        lim._interval = 0.0
+        for _ in range(10):
+            lim.acquire()
+        assert sleeps == []
+        assert lim.interval == 0.0
+
+    def test_persistent_throttle_widens_the_global_gate(self, monkeypatch):
+        # The wiring: get_with_retry feeds the gate the same persistent-throttle
+        # signal the circuit breaker consumes.
+        from src import http_util
+        from src.http_util import get_with_retry, HostCircuitBreaker
+        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive())
+        client = _FakeClient([_FakeResp(429) for _ in range(5)])
+        get_with_retry(client, "http://slow.com/i", max_retries=2,
+                       sleep=lambda s: None, breaker=HostCircuitBreaker(threshold=99))
+        assert http_util.PLATFORM_LIMITER.interval == 2.0
+
+    def test_recovered_429_leaves_the_global_gate_alone(self, monkeypatch):
+        # A blip that recovers on retry is not a storm — same standard the
+        # circuit breaker holds.
+        from src import http_util
+        from src.http_util import get_with_retry
+        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive())
+        client = _FakeClient([_FakeResp(429, {"Retry-After": "0"}), _FakeResp(200)])
+        resp = get_with_retry(client, "http://ok.com/i", max_retries=2,
+                              sleep=lambda s: None, breaker=None)
+        assert resp.status_code == 200
+        assert http_util.PLATFORM_LIMITER.interval == 1.0
+
+    def test_gate_widens_even_with_the_breaker_disabled(self, monkeypatch):
+        # breaker=None turns off per-host short-circuiting only; the platform
+        # gate is a separate consumer of the same signal.
+        from src import http_util
+        from src.http_util import get_with_retry
+        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive())
+        client = _FakeClient([_FakeResp(429) for _ in range(5)])
+        get_with_retry(client, "http://slow.com/i", max_retries=2,
+                       sleep=lambda s: None, breaker=None)
+        assert http_util.PLATFORM_LIMITER.interval == 2.0
+
+    def test_persistent_503_does_not_widen_the_global_gate(self, monkeypatch):
+        # A permanently-broken shop 503s on every item of every run. Harmless to
+        # a per-host breaker; fatal to a global gate, which it would pin at the
+        # ceiling forever. Only 429 means "you are being rate limited".
+        # (Observed live: blackrabbitco on the 2026-07-19 verification run.)
+        from src import http_util
+        from src.http_util import get_with_retry, HostCircuitBreaker
+        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive())
+        breaker = HostCircuitBreaker(threshold=2)
+        for _ in range(4):
+            client = _FakeClient([_FakeResp(503) for _ in range(5)])
+            get_with_retry(client, "http://dead.com/i", max_retries=2,
+                           sleep=lambda s: None, breaker=breaker)
+        assert http_util.PLATFORM_LIMITER.interval == 1.0   # untouched
+        assert breaker.is_tripped("dead.com")               # breaker still acts

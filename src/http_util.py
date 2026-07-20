@@ -6,6 +6,10 @@ a ``Retry-After``-aware retry wrapper, used by both the product-price extractor
 so neither hammers shared platform infrastructure — Shopify rate-limits by source
 IP across every store it hosts, so concurrent / bursty requests from one runner
 trip a platform-level 429 even though each store is a different domain.
+
+``AdaptiveRateLimiter`` is the same gate with a feedback loop: it widens its gap
+when hosts actually start throttling us and narrows it back on a calm run, so we
+don't pay storm-day pacing on the ~360 days a year that aren't a storm.
 """
 
 from __future__ import annotations
@@ -149,6 +153,119 @@ class RateLimiter:
             self._last = time.monotonic()
 
 
+# ---------------------------------------------------------------------------
+# Adaptive (AIMD) platform gate
+# ---------------------------------------------------------------------------
+# The fixed 5 s Shopify gate was set during the June/July 2026 429 storm, when a
+# platform-level per-IP throttle was blanking the digest. It works, but it is
+# priced for the worst day of the year and charged on every day: the gate applies
+# to every `/products/` URL, and at ~300 of them a run it *is* the runtime —
+# measured 25m46s of the 2026-07-19 run's 37m09s was gate sleep, on a day with 14
+# total 429s and zero circuit-breaker trips.
+#
+# So pace by observation instead of by worst case. The limiter starts narrow and
+# widens multiplicatively the moment a host persistently throttles us (the same
+# signal the circuit breaker already trusts — a 429/503 that survived the whole
+# Retry-After ladder, not a blip that recovered), then decays back one step at a
+# time across a stretch of clean requests. Standard AIMD: fast up, slow down.
+#
+# The safety argument is the ceiling. ``max_interval`` is the old fixed 5 s gap,
+# and three persistent throttles take us there (1 -> 2 -> 4 -> 5) — so the worst
+# case this can degrade to is exactly today's behaviour, reached within a handful
+# of items, while the common case runs ~5x faster. The circuit breaker and the
+# per-host Retry-After ladder are untouched and still do the per-host work; this
+# knob only governs *platform-wide* pacing.
+#
+# Only a persistent **429** feeds it — see the note at the call site in
+# ``get_with_retry`` for why 503 is deliberately excluded.
+_ADAPT_START_INTERVAL = 1.0    # seconds; calm-day gap
+_ADAPT_MIN_INTERVAL = 1.0      # never burst faster than this
+_ADAPT_MAX_INTERVAL = 5.0      # the old fixed gap — our worst case, not our default
+_ADAPT_GROWTH = 2.0            # multiplicative increase per persistent throttle
+_ADAPT_DECAY_STEP = 0.5        # seconds shaved per clean stretch
+_ADAPT_DECAY_AFTER = 40        # clean acquisitions before one decay step
+
+
+class AdaptiveRateLimiter(RateLimiter):
+    """A ``RateLimiter`` whose gap responds to observed throttling (see above).
+
+    ``record_throttled()`` multiplies the gap (capped at ``max_interval``);
+    every ``decay_after`` acquisitions with no throttle in between shave
+    ``decay_step`` off it (floored at ``min_interval``). Both the gap and the
+    clean-streak counter live under the base class's lock, so the whole thing
+    stays safe to share across the extractor's thread pool.
+    """
+
+    def __init__(
+        self,
+        start: float = _ADAPT_START_INTERVAL,
+        *,
+        min_interval: float = _ADAPT_MIN_INTERVAL,
+        max_interval: float = _ADAPT_MAX_INTERVAL,
+        growth: float = _ADAPT_GROWTH,
+        decay_step: float = _ADAPT_DECAY_STEP,
+        decay_after: int = _ADAPT_DECAY_AFTER,
+    ) -> None:
+        super().__init__(start)
+        self._min = min_interval
+        self._max = max_interval
+        self._growth = growth
+        self._decay_step = decay_step
+        self._decay_after = decay_after
+        self._clean = 0
+
+    @property
+    def interval(self) -> float:
+        """Current gap in seconds — read by tests and the end-of-run log line."""
+        with self._lock:
+            return self._interval
+
+    def record_throttled(self, host: str = "") -> None:
+        """Widen the gap: a host just throttled us past its whole retry ladder."""
+        with self._lock:
+            if self._interval >= self._max:
+                self._clean = 0
+                return
+            prev = self._interval
+            self._interval = min(self._max, self._interval * self._growth)
+            self._clean = 0
+        log.info(
+            "http_util: %s persistently throttled — widening the platform gate "
+            "%.2fs -> %.2fs", host or "a host", prev, self._interval,
+        )
+
+    def acquire(self) -> None:
+        # A zeroed interval is the test/no-delay configuration; skip the whole
+        # feedback loop so a suite that zeroes the gate can't decay-log its way
+        # through thousands of no-op acquisitions.
+        if self._interval <= 0:
+            return
+        super().acquire()
+        self._note_clean()
+
+    def _note_clean(self) -> None:
+        """Count one throttle-free acquisition; decay a step at the threshold."""
+        with self._lock:
+            if self._interval <= self._min:
+                return
+            self._clean += 1
+            if self._clean < self._decay_after:
+                return
+            self._clean = 0
+            prev = self._interval
+            self._interval = max(self._min, self._interval - self._decay_step)
+        log.info(
+            "http_util: %d requests without a persistent throttle — narrowing the "
+            "platform gate %.2fs -> %.2fs", self._decay_after, prev, self._interval,
+        )
+
+
+# Process-global adaptive gate for shared-platform (Shopify) traffic. Owned here
+# because the throttle signal that feeds it is observed here, in
+# ``get_with_retry``; ``src/main.py`` decides *which* requests have to pass it.
+PLATFORM_LIMITER = AdaptiveRateLimiter()
+
+
 def parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:
     """Translate a ``Retry-After`` header into seconds to wait.
 
@@ -223,6 +340,21 @@ def get_with_retry(
     # Exhausted retries. If the host is still throttling us, register it with the
     # breaker — enough persistent throttles and it trips, so the rest of the
     # host's items skip the ladder above instead of each paying it in full.
+    if resp.status_code == 429:
+        # Same signal, second consumer: widen the platform-wide gate. Recorded
+        # for *any* throttling host, not just Shopify ones — a per-IP throttle
+        # shows up wherever we happen to be pointed when it starts.
+        #
+        # 429 ONLY, deliberately, even though the breaker below acts on 503 too.
+        # 503 is ambiguous — most often a shop that is simply broken, and a
+        # permanently-down shop 503s on every item of every run. That's harmless
+        # to a *per-host* breaker (it just stops waiting on that host) but it is
+        # exactly the wrong input to a *global* gate: two dead shops would pin
+        # the whole run at the ceiling forever and we'd have gained nothing.
+        # Caught live on the 2026-07-19 verification run, where blackrabbitco
+        # 503d persistently on an otherwise calm day. 429 says "you are being
+        # rate limited" and nothing else; that is the signal this gate wants.
+        PLATFORM_LIMITER.record_throttled(host)
     if breaker is not None and resp.status_code in _RETRY_STATUSES:
         if breaker.record_throttled(host):
             log.info("http_util: %s tripped the rate-limit circuit breaker after "

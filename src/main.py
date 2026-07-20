@@ -54,7 +54,7 @@ from src.watchlist_links import (
     removal_url,
 )
 from src.fx import get_rates
-from src.http_util import RateLimiter
+from src import http_util
 from src.gmail import (
     extract_signals,
     fetch_promotions,
@@ -81,12 +81,17 @@ def _is_shopify_url(url: str) -> bool:
     return "/products/" in url
 
 
-# ≤1 Shopify product extract per 5 s globally. Conservative on purpose: each
-# extract() fires 2-3 sub-requests (.json/.js/HTML) in a burst, so a 5 s gap
-# keeps the *averaged* rate near ~0.5 req/s — well under Shopify's per-IP
-# threshold. Runtime cost (a few extra minutes) is acceptable; a 429-storm that
-# blanks the digest is not.
-_SHOPIFY_LIMITER = RateLimiter(5.0)
+# Global gate on Shopify product extracts. Each extract() fires 2-3 sub-requests
+# (.json/.js/HTML) in a burst, so the gap sets the *averaged* per-IP rate against
+# the platform. It used to be a flat 5 s — safe, but priced for a 429 storm and
+# charged every day: with ~300 `/products/` URLs a run, that gate alone was 25 of
+# the 37 minutes of the 2026-07-19 run, on a day with 14 total 429s.
+#
+# It is now the shared AIMD gate (``http_util.AdaptiveRateLimiter``): starts at
+# 1 s, doubles toward the old 5 s ceiling the moment any host persistently
+# throttles us, decays back on a clean stretch. Storm behaviour is unchanged at
+# the ceiling; calm days run ~5x faster. See the note in ``src/http_util.py``.
+_SHOPIFY_LIMITER = http_util.PLATFORM_LIMITER
 
 
 # ---------------------------------------------------------------------------
@@ -1112,6 +1117,16 @@ def run(cfg: Config | None = None) -> str:
     extracted = _extract_many(
         [u for u, _ in buckets["product_urls"]],
         preferred_sizes=_sizes_for_url,
+    )
+    # Where the adaptive gate ended up — the tuning signal for _ADAPT_* in
+    # src/http_util.py. Sitting at the ceiling every run means the storm is back
+    # and the start value is optimistic; sitting at the floor means calm days are
+    # now the norm and the floor could come down further.
+    log.info(
+        "platform gate finished the item scan at %.2fs (floor %.2fs, ceiling %.2fs)",
+        _SHOPIFY_LIMITER.interval,
+        http_util._ADAPT_MIN_INTERVAL,
+        http_util._ADAPT_MAX_INTERVAL,
     )
 
     # SMS sale_signals share the email signal shape (same {email_id, shop,
