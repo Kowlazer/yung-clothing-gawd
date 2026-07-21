@@ -627,6 +627,109 @@ class TestWatchlistMatch:
         assert items[0]["watchlist_match"] is not None
 
 
+class TestWatchlistMatchSingleTokenGate:
+    """One shared token is evidence only when nothing contradicts it.
+
+    Every case here is a real pair taken off the live catalogue in the
+    2026-07-20 audit (see _match_watchlist's single-token gate)."""
+
+    def _item(self, shop, domain, name):
+        return {
+            "id": "x", "shop": shop, "shop_domain": domain,
+            "item_name": name, "watchlist_match": None,
+        }
+
+    def _matched(self, item, watchlist):
+        items = [item]
+        _match_watchlist(items, watchlist)
+        return items[0]["watchlist_match"]
+
+    def test_keeps_match_when_item_adds_nothing(self):
+        """{sukuna} ⊆ the slug — the item name IS the design."""
+        item = self._item("Xsekai", "xsekai.com", "Sukuna Oversize tee")
+        line = "https://xsekai.com/collections/jjk/products/sukuna-oversize-tee\n"
+        assert self._matched(item, line) is not None
+
+    def test_keeps_colour_only_name(self):
+        """Colours are real evidence — the user buys colour variants, so they
+        must never be stopworded (see the watchlist-colours decision)."""
+        item = self._item("Offscriptstore", "offscriptstore.com", "Red Beanie")
+        line = "https://offscriptstore.com/products/off-script-red-embroidered-beanie\n"
+        assert self._matched(item, line) is not None
+
+    def test_rejects_when_design_tokens_conflict(self):
+        """Amethyst vs fluorite: same product form, different stone."""
+        item = self._item("Reservedforhumans", "reservedforhumans.com",
+                          "Amethyst Spire")
+        line = "https://www.reservedforhumans.com/product/blue-fluorite-spire-1\n"
+        assert self._matched(item, line) is None
+
+    def test_rejects_franchise_token_across_characters(self):
+        """"Bleach" is the series, not the design — Bazzard is not Toshiro."""
+        item = self._item("theanimecollective", "theanimecollective.com",
+                          "Bazzard Black Bleach White T-Shirt")
+        line = ("https://theanimecollective.com/products/"
+                "toshiro-vintage-t-shirt-bleach-tybw\n")
+        assert self._matched(item, line) is None
+
+    def test_rejects_when_item_has_no_garment_category_to_gate_on(self):
+        """A keychain has no category, so only this gate can stop it matching
+        a jogger URL that happens to share the design word."""
+        item = self._item("Dattehameha", "dattehameha.store",
+                          "Hunter License Woven Keychain")
+        line = "https://dattehameha.store/product/hybrid-hunter-jogger\n"
+        assert self._matched(item, line) is None
+
+    def test_two_shared_tokens_are_unaffected_by_the_gate(self):
+        """The gate is single-token only — a same-design match across cuts
+        still rests on >= 2 shared tokens."""
+        item = self._item("Snackyboy", "snackyboy.co.uk",
+                          "Hello World oversized T-shirt")
+        line = ("https://snackyboy.co.uk/collections/new-arrivals/products/"
+                "hello-world-t-shirt\n")
+        assert self._matched(item, line) is not None
+
+
+class TestWatchlistMatchPrintDescriptors:
+    """Print placement / construction words describe how a garment is made,
+    never which design is on it — both cases seen live 2026-07-20."""
+
+    def _item(self, shop, domain, name):
+        return {
+            "id": "x", "shop": shop, "shop_domain": domain,
+            "item_name": name, "watchlist_match": None,
+        }
+
+    def test_sided_is_not_match_evidence(self):
+        items = [
+            self._item("Hokuro", "hokuroclothing.com",
+                       "PRIDE ABOVE ALL 2-SIDED OVERSIZE TEE"),
+            self._item("Hokuro", "hokuroclothing.com",
+                       "SPIRIT BOMB 2-SIDED OVERSIZE TEE"),
+        ]
+        watchlist = ("https://www.hokuroclothing.com/collections/new-arrivals/"
+                     "products/laughing-sail-2-sided-oversize-vintage-tee\n")
+        _match_watchlist(items, watchlist)
+        assert [it["watchlist_match"] for it in items] == [None, None]
+
+    def test_backprint_is_not_match_evidence(self):
+        items = [self._item("Pomel", "pomelclothing.com",
+                            "IPPO SPAR BACKPRINT TEE")]
+        _match_watchlist(
+            items, "https://pomelclothing.com/products/kbg-backprint-tee\n",
+        )
+        assert items[0]["watchlist_match"] is None
+
+    def test_design_token_still_matches_through_a_print_descriptor(self):
+        """Stripping the descriptor must not cost a real match."""
+        items = [self._item("Pomel", "pomelclothing.com",
+                            "IPPO SPAR BACKPRINT TEE")]
+        _match_watchlist(
+            items, "https://pomelclothing.com/products/ippo-spar-backprint-tee\n",
+        )
+        assert items[0]["watchlist_match"] is not None
+
+
 class TestWatchlistMatchNonClothingSection:
     """The Non-clothing section header tags matches with is_clothing=False
     so order_scan can skip fit-review prompts on gadget purchases."""
@@ -705,7 +808,17 @@ class TestWatchlistMatchRegressionsFromRematch20260525:
         _match_watchlist(items, watchlist)
         assert items[0]["watchlist_match"] is not None
 
-    def test_case_9_pomel_king_of_counters_via_mesh_shorts_alias(self):
+    def test_case_9_pomel_king_of_counters_no_longer_matches(self):
+        """REVERSED 2026-07-20 by the user, after auditing a live digest.
+
+        This one really is the same product — "King of Counters" is Miyata's
+        epithet — but the matcher had no way to know that: the *only* shared
+        token was "mesh", a fabric word, so it would have matched any other
+        Pomel mesh shorts just as happily. "mesh" now sits with the other
+        fabric stopwords (knit/fleece/denim/…), leaving no shared token at all,
+        and the single-token gate would reject it regardless. Accepted cost of
+        killing the false-positive class that shares only a placement, fabric
+        or franchise word (Hokuro 2-SIDED, Pomel backprint, Bleach TYBW)."""
         items = [self._item("Pomel", "pomelclothing.com",
                             "KING OF COUNTERS MESH SHORTS")]
         watchlist = (
@@ -713,8 +826,7 @@ class TestWatchlistMatchRegressionsFromRematch20260525:
             "?variant=12345678901234\n"
         )
         _match_watchlist(items, watchlist)
-        assert items[0]["watchlist_match"] is not None
-        assert "miyata-mesh-shorts" in items[0]["watchlist_match"]["matched_line"]
+        assert items[0]["watchlist_match"] is None
 
     # ----- 1/4/5/6: Xsekai berserk-cluster, should NOT match -----
 
@@ -923,8 +1035,9 @@ class TestSlugTokens:
         toks = _slug_tokens(
             "https://pomelclothing.com/products/miyata-mesh-shorts?variant=42"
         )
-        assert "miyata" in toks and "mesh" in toks
-        assert "shorts" not in toks  # stopword
+        assert "miyata" in toks
+        assert "variant" not in toks and "42" not in toks  # query string dropped
+        assert "shorts" not in toks and "mesh" not in toks  # stopwords
 
     def test_no_url_yields_empty(self):
         from src.order_scan import _slug_tokens

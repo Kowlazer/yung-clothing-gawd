@@ -757,6 +757,15 @@ _STOPWORDS = frozenset({
     # Generic category descriptors that appear across many products.
     "premium", "exclusive", "limited", "edition", "version", "style",
     "anime", "manga", "graphic", "printed", "embroidered", "embroidery",
+    # Print placement / construction descriptors. Same class as "oversize" and
+    # "vintage" — they describe how the garment is made, never which design is
+    # on it, and a shop applies them across its whole range. Both were caught
+    # live: "sided" (from "2-SIDED") matched two unrelated Hokuro tees to one
+    # laughing-sail URL, and "backprint" matched "IPPO SPAR BACKPRINT TEE" to
+    # /kbg-backprint-tee. NB colours are deliberately NOT in this list — the
+    # user buys colour variants of the same design, so "red"/"black" are real
+    # match evidence ("Red Beanie" ↔ /off-script-red-embroidered-beanie).
+    "sided", "print", "prints", "backprint", "frontprint", "allover",
     # Style / aesthetic / origin descriptors. Same problem as
     # "anime"/"manga": appear across many products from the same shop
     # without distinguishing them.
@@ -765,7 +774,7 @@ _STOPWORDS = frozenset({
     # lines — two "vintage washed" tees from the same shop is not a
     # match signal in itself.
     "vintage", "washed", "wash", "faded", "distressed", "knit", "knitted",
-    "woven", "fleece", "cotton", "linen", "denim", "leather",
+    "woven", "fleece", "cotton", "linen", "denim", "leather", "mesh",
     # URL / web-page noise that pollutes Jaccard math when watchlist
     # lines are product URLs.
     "https", "http", "www", "com", "net", "org", "io", "co", "store",
@@ -1476,6 +1485,13 @@ def _match_watchlist(items: list[dict], watchlist_text: str) -> None:
               ``/products/sukuna-oversize-tee``) shares at least one
               non-stopword token with the item name. Catches
               slug-literal matches and product-line SKU aliases.
+      * **Single-token gate** (applied after either path): when the
+        shared content is a lone token, the item's tokens must be a
+        SUBSET of the line's — one token is evidence only when nothing
+        distinctive contradicts it. "Amethyst Spire" sharing only
+        "spire" with /blue-fluorite-spire is a different product;
+        "Sukuna Oversize tee" sharing only "sukuna" with
+        /sukuna-oversize-tee is the same one.
       * **Garment-category gate** (applied after either path): if the
         item name mentions a garment category (tee, hoodie, beanie,
         shorts, ...), the line must mention a matching one — unless
@@ -1537,6 +1553,27 @@ def _match_watchlist(items: list[dict], watchlist_text: str) -> None:
             )
             slug_accept = bool((item_tokens & _slug_tokens(line)) - shop_tokens)
             if not (jaccard_accept or slug_accept):
+                continue
+            # Single-token gate. One shared token is evidence ONLY when the item
+            # name adds nothing the line lacks — i.e. no distinctive token
+            # contradicts it. Audited against the live catalogue 2026-07-20,
+            # where this split all 8 one-token matches correctly:
+            #   keep  "Sukuna Oversize tee" {sukuna} ⊆ /sukuna-oversize-tee
+            #   keep  "Red Beanie" {red} ⊆ /off-script-red-embroidered-beanie
+            #   drop  "Amethyst Spire" vs /blue-fluorite-spire (amethyst≠fluorite)
+            #   drop  "Bazzard…Bleach…" vs /toshiro-…-bleach-tybw — "bleach" is
+            #         the franchise, and Bazzard is not Toshiro
+            #   drop  "Hunter License Keychain" vs /hybrid-hunter-jogger — the
+            #         category gate can't help here (a keychain has no category)
+            # Deliberately conservative, and the asymmetry is the reason: a bad
+            # match can delete the WRONG Doc line, while a missed one just means
+            # the user deletes a line by hand. It does cost genuine SKU aliases
+            # whose Doc URL names the design differently (see the 2026-05-25
+            # case-9 note in tests) — accepted by the user 2026-07-20, since
+            # those only ever matched on a fabric/placement word anyway.
+            # Two or more shared tokens are untouched by this gate.
+            if (len(content_overlap) < 2
+                    and not (item_tokens - shop_tokens) <= line_tokens):
                 continue
             # Garment-category gate. Item naming a garment category
             # requires the line to mention a matching garment category
