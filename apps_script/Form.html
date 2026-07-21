@@ -265,23 +265,51 @@
     }
 
     // -- Watchlist removal: shared submit ---------------------------------
+    // Submissions are queued, never fired in parallel. Each one is a whole-file
+    // read-modify-write of wardrobe.json on the server; overlapping two of them
+    // lost the first one's approval outright (see _withWardrobeLock in Code.gs
+    // for the incident). The server lock is the actual guarantee — this queue
+    // keeps clicks off a lock wait and resolves the rows in click order.
+    var removalQueue = [];
+    var removalBusy = false;
+
+    function runNextRemoval() {
+      if (removalBusy || !removalQueue.length) { return; }
+      removalBusy = true;
+      removalQueue.shift()();
+    }
+
     function doRemoval(itemId, sig, decision, btns, errBox, onDone) {
       if (errBox) { errBox.textContent = ''; }
       var saved = btns.map(function (b) { return b.textContent; });
       btns.forEach(function (b) { b.disabled = true; b.textContent = 'Working…'; });
-      google.script.run
-        .withSuccessHandler(function (res) { onDone(res); })
-        .withFailureHandler(function (err) {
-          btns.forEach(function (b, i) { b.disabled = false; b.textContent = saved[i]; });
-          var msg = (err && err.message) ? err.message : String(err);
-          if (errBox) { errBox.textContent = msg; } else { alert(msg); }
-        })
-        .submitRemoval({ item: itemId, sig: sig, decision: decision });
+      removalQueue.push(function () {
+        google.script.run
+          .withSuccessHandler(function (res) {
+            removalBusy = false;
+            onDone(res);
+            runNextRemoval();
+          })
+          .withFailureHandler(function (err) {
+            removalBusy = false;
+            btns.forEach(function (b, i) { b.disabled = false; b.textContent = saved[i]; });
+            var msg = (err && err.message) ? err.message : String(err);
+            if (errBox) { errBox.textContent = msg; } else { alert(msg); }
+            runNextRemoval();
+          })
+          .submitRemoval({ item: itemId, sig: sig, decision: decision });
+      });
+      runNextRemoval();
     }
 
     function removalDoneText(res) {
       if (res.decision === 'decline') { return 'Kept on the watchlist — won’t ask again.'; }
-      if (res.doc_status === 'removed') { return 'Removed from the watchlist Doc and marked as bought.'; }
+      if (res.doc_status === 'removed') {
+        var also = res.siblings_resolved
+          ? ' (' + res.siblings_resolved + ' other purchase(s) shared that line and were marked bought too)'
+          : '';
+        return 'Removed from the watchlist Doc and marked as bought.' + also;
+      }
       if (res.doc_status === 'not_found') {
         return 'Marked as bought. The Doc line wasn’t found (already removed?) — nothing to delete.';
       }
@@ -340,6 +368,9 @@
       }
       root.appendChild(el('div', { class: 'meta', text: items.length + ' purchased item(s) still listed.' }));
       var ul = el('ul', { class: 'pending' });
+      // id -> that row's resolve(), so an approval that also clears its siblings
+      // (same Doc line, deleted once) can settle their rows too.
+      var rowResolvers = {};
       items.forEach(function (it) {
         var sub = [it.shop, it.size ? ('size ' + it.size) : '', it.color].filter(Boolean).join(' · ');
         var status = el('span', { class: 'meta' });
@@ -351,12 +382,16 @@
           it.matched_line ? el('div', { class: 'docline', text: it.matched_line }) : null,
           el('div', { class: 'btnrow' }, [approve, decline, status])
         ]));
+        var settled = false;
         function resolve(text, cls) {
+          if (settled) { return; }
+          settled = true;
           approve.parentNode.removeChild(approve);
           decline.parentNode.removeChild(decline);
           status.className = cls;
           status.textContent = text;
         }
+        rowResolvers[it.id] = resolve;
         approve.addEventListener('click', function () {
           doRemoval(it.id, it.sig, 'approve', [approve, decline], null, function (res) {
             var t = res.doc_status === 'removed' ? '✓ Removed from Doc'
@@ -364,6 +399,11 @@
                   : res.doc_status === 'ambiguous' ? '✓ Bought (remove line manually)'
                   : '✓ Done';
             resolve(t, 'ok');
+            (res.sibling_ids || []).forEach(function (sid) {
+              if (rowResolvers[sid]) {
+                rowResolvers[sid]('✓ Bought (shared that Doc line)', 'ok');
+              }
+            });
           });
         });
         decline.addEventListener('click', function () {

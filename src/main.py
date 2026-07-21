@@ -886,8 +886,47 @@ def _fit_feedback_data(
     return render, review_all_url(cfg.fit_form_base_url, cfg.fit_link_secret)
 
 
+def _drop_removed_doc_lines(
+    pending: list[dict], watchlist_text: str,
+) -> list[dict]:
+    """Drop removal candidates whose matched Doc line is already gone.
+
+    The nudge exists for one purpose: get a line deleted off the watchlist Doc.
+    Once the line isn't there any more there is nothing left to approve, and the
+    approve-link can only ever report "line not found" — so a candidate in that
+    state is pure noise that repeats in every digest forever.
+
+    Lines vanish without the item's own ``approved_for_removal`` ever being set
+    two ways: the user edits the Doc by hand, or *another* wardrobe item matched
+    the same line and its approval deleted it (one Doc URL routinely matches two
+    purchases from that shop). The Apps Script side now resolves those siblings
+    at approval time, but this read-time filter is what makes it self-healing —
+    it needs no write, so it also clears items stranded before that fix and any
+    hand-edit of the Doc.
+
+    A blank ``watchlist_text`` (fetch failed / empty Doc) skips the filter
+    entirely: no evidence is not evidence that every line is gone.
+    """
+    lines = {ln.strip() for ln in (watchlist_text or "").splitlines() if ln.strip()}
+    if not lines:
+        return pending
+
+    def _still_listed(item: dict) -> bool:
+        line = ((item.get("watchlist_match") or {}).get("matched_line") or "").strip()
+        # No stored line to look for — keep it rather than guess.
+        return not line or line in lines
+
+    kept = [it for it in pending if _still_listed(it)]
+    if len(kept) != len(pending):
+        log.info(
+            "removal nudge: dropped %d candidate(s) whose Doc line is already gone",
+            len(pending) - len(kept),
+        )
+    return kept
+
+
 def _watchlist_removal_data(
-    wardrobe: dict | None, cfg: Config,
+    wardrobe: dict | None, cfg: Config, watchlist_text: str = "",
 ) -> tuple[list[dict], str | None]:
     """Build the render list + review-all link for purchased items still listed
     on the watchlist Doc (pending a remove-from-Doc decision).
@@ -898,10 +937,15 @@ def _watchlist_removal_data(
     carries the matched Doc line (so the digest can show *how the item is listed*)
     plus a signed per-item ``url``; the secret never leaves this layer (digest.py
     only sees the finished links).
+
+    ``watchlist_text`` is the **raw** Doc text (before the exclusion filter), used
+    to drop candidates whose line is already gone — see ``_drop_removed_doc_lines``.
     """
     if not (cfg.fit_form_base_url and cfg.fit_link_secret):
         return [], None
-    pending = pending_removal_items(_wardrobe_items(wardrobe, cfg))
+    pending = _drop_removed_doc_lines(
+        pending_removal_items(_wardrobe_items(wardrobe, cfg)), watchlist_text,
+    )
     if not pending:
         return [], None
     # Newest purchases first — the daily digest renders only a capped slice, so
@@ -1042,8 +1086,10 @@ def run(cfg: Config | None = None) -> str:
     body_scans = state.get("body_scans") or {}
 
     log.info("fetching watchlist")
-    text = fetch_watchlist(cfg.watchlist_url)
-    text = _apply_wardrobe_exclusions(text, wardrobe)
+    # Keep the unfiltered Doc text: the removal nudge needs to know which lines
+    # are *actually* still on the Doc, which the exclusion-filtered copy can't say.
+    doc_text = fetch_watchlist(cfg.watchlist_url)
+    text = _apply_wardrobe_exclusions(doc_text, wardrobe)
     entries = classify(text)
     # "Shops to track sales for:" Doc section — the SMS/email sale attribution
     # allowlist, managed in the Doc (unioned with the SMS_SALE_SHOPS env var).
@@ -1289,7 +1335,9 @@ def run(cfg: Config | None = None) -> str:
     # Watchlist-removal nudge: signed approve-links for purchased items still
     # listed on the watchlist Doc. Approving in the web form deletes the Doc line
     # and records the removal in wardrobe.json (the cron only reads the wardrobe).
-    removal_pending, removal_review_all = _watchlist_removal_data(wardrobe, cfg)
+    removal_pending, removal_review_all = _watchlist_removal_data(
+        wardrobe, cfg, doc_text,
+    )
 
     # Review-request aggregation: recent post-purchase "leave a review" emails,
     # deduped one-per-order, each linking to the email. Failure-isolated +

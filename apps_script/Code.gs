@@ -40,6 +40,11 @@ var SHOPS_SECTION_HEADER = 'shops and urls:';
 // of bodyspec.nearest_result's max_gap_days default (src/order_scan.py --max-gap-days).
 var BODY_SCAN_MAX_GAP_DAYS = 90;
 
+// How long a submission waits for the wardrobe write lock before giving up.
+// Generous because the work under the lock is two-to-three network round-trips
+// (Gist GET + optional raw_url GET + Gist PATCH) on a >1 MB file.
+var LOCK_TIMEOUT_MS = 45000;
+
 // Allowed enum values — mirror the schema in src/order_scan.py. Anything not in
 // these sets is dropped server-side so a tampered POST can't write junk.
 var FIT_VALUES = ['too_small', 'small', 'tts', 'large', 'too_large'];
@@ -171,6 +176,37 @@ function _scansFrom(gist) {
 /** Read just wardrobe.json (its own Gist GET). Used where scans aren't needed. */
 function _readWardrobe() {
   return _normaliseWardrobe(_fileJson(_readGist(), WARDROBE_FILE, {}));
+}
+
+/**
+ * Run a wardrobe read-modify-write under the script lock.
+ *
+ * Every submit path here re-reads the whole of wardrobe.json, mutates it, and
+ * PATCHes the whole file back. Two of those overlapping is a lost update: both
+ * read the same revision, both write, and the second silently erases the first.
+ * That is not theoretical — the review-all page puts a button on every row and
+ * fires each click straight at the server, so working down the list produces
+ * exactly this overlap. Observed 2026-07-20: of seven approvals clicked in one
+ * sitting, three vanished from wardrobe.json (their Doc lines *were* deleted —
+ * Doc edits don't go through this file — so the digest kept nudging about lines
+ * that no longer existed).
+ *
+ * getScriptLock (not user/document) because the contended resource is the one
+ * shared Gist, not anything per-user. Everything that touches the wardrobe must
+ * go through here or the guarantee is void.
+ */
+function _withWardrobeLock(fn) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(LOCK_TIMEOUT_MS);
+  } catch (err) {
+    throw new Error('Another submission is still saving — give it a moment and try again.');
+  }
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function _writeWardrobe(wardrobe) {
@@ -510,7 +546,10 @@ function submitFitReview(payload) {
   if (FIT_VALUES.indexOf(payload.fit) === -1) {
     throw new Error('Pick an overall fit before submitting.');
   }
+  return _withWardrobeLock(function () { return _submitFitReviewLocked(payload); });
+}
 
+function _submitFitReviewLocked(payload) {
   // Read-modify-write: re-read so a concurrent order_scan/backfill write isn't
   // clobbered by a stale copy held while the form was open. One GET pulls both
   // the wardrobe and the cached DEXA scans.
@@ -686,6 +725,9 @@ function _removeDocLine(matchedLine) {
  * and audit-log. On **decline**: just flip the flag to ``false`` so the digest
  * stops re-surfacing it. Either way the item itself stays in the wardrobe — the
  * Doc becomes a disposable view; wardrobe.json is the durable record.
+ *
+ * Deleting the line also resolves every OTHER pending item matched to that same
+ * line (see _resolveSiblings) — one Doc line routinely matches two purchases.
  */
 function submitRemoval(payload) {
   var secret = _prop('FIT_LINK_SECRET');
@@ -693,7 +735,59 @@ function submitRemoval(payload) {
     throw new Error('Could not verify this submission.');
   }
   var decision = payload.decision === 'decline' ? 'decline' : 'approve';
+  return _withWardrobeLock(function () {
+    return _submitRemovalLocked(payload, decision);
+  });
+}
 
+/**
+ * Mark one item bought: flip its flag and add the watchlist_exclusions row the
+ * daily cron reads to stop price-checking the line. Idempotent on the exclusion
+ * (one row per item id).
+ */
+function _recordRemoval(wardrobe, item, matchedLine) {
+  item.watchlist_match.approved_for_removal = true;
+  for (var i = 0; i < wardrobe.watchlist_exclusions.length; i++) {
+    if (wardrobe.watchlist_exclusions[i].item_id === item.id) { return; }
+  }
+  wardrobe.watchlist_exclusions.push({
+    matched_line: matchedLine,
+    added_at: new Date().toISOString(),
+    item_id: item.id
+  });
+}
+
+/**
+ * Resolve every other still-pending item matched to the line we just deleted.
+ *
+ * Two purchases sharing one Doc line is common — the matcher links a whole
+ * order's worth of items to whichever product URL of that shop is on the Doc
+ * (a keychain and a jogger from one shop both matched one jogger URL; two
+ * different tees both matched one tee URL). Once the line is gone the siblings
+ * have nothing left to remove, but they stay `approved_for_removal: null`, so
+ * they nag in every future digest and their approve-link can only ever report
+ * "line not found". Returns the items resolved (for the audit log).
+ */
+function _resolveSiblings(wardrobe, item, matchedLine) {
+  var target = String(matchedLine || '').trim();
+  var out = [];
+  if (!target) { return out; }
+  var items = wardrobe.items || [];
+  for (var i = 0; i < items.length; i++) {
+    var other = items[i];
+    if (other.id === item.id) { continue; }
+    var m = other.watchlist_match;
+    if (!m || !(m.approved_for_removal === null || m.approved_for_removal === undefined)) {
+      continue;
+    }
+    if (String(m.matched_line || '').trim() !== target) { continue; }
+    _recordRemoval(wardrobe, other, target);
+    out.push(other);
+  }
+  return out;
+}
+
+function _submitRemovalLocked(payload, decision) {
   // Read-modify-write: re-read so a concurrent order_scan/fit write isn't
   // clobbered by a stale copy held while the page was open.
   var wardrobe = _normaliseWardrobe(_fileJson(_readGist(), WARDROBE_FILE, {}));
@@ -716,27 +810,26 @@ function submitRemoval(payload) {
   // user is told the line needs a manual look.
   var docResult = _removeDocLine(matchedLine);
 
-  match.approved_for_removal = true;
-  var dup = false;
-  for (var i = 0; i < wardrobe.watchlist_exclusions.length; i++) {
-    if (wardrobe.watchlist_exclusions[i].item_id === item.id) { dup = true; break; }
-  }
-  if (!dup) {
-    wardrobe.watchlist_exclusions.push({
-      matched_line: matchedLine,
-      added_at: new Date().toISOString(),
-      item_id: item.id
-    });
-  }
+  _recordRemoval(wardrobe, item, matchedLine);
+  // The line is gone for everyone, not just this item — resolve its siblings in
+  // the same write so they stop nagging. Only on a real delete: 'not_found' /
+  // 'ambiguous' leave the Doc as it was, so the siblings' decision still stands.
+  var siblings = docResult.status === 'removed'
+    ? _resolveSiblings(wardrobe, item, matchedLine) : [];
   _writeWardrobe(wardrobe);
   _appendRemovalSheet(item, matchedLine, docResult.status);
+  for (var s = 0; s < siblings.length; s++) {
+    _appendRemovalSheet(siblings[s], matchedLine, 'removed_with_' + item.id);
+  }
 
   return {
     ok: true,
     decision: 'approve',
     item_name: item.item_name || '(unnamed)',
     doc_status: docResult.status,
-    matched_line: matchedLine
+    matched_line: matchedLine,
+    siblings_resolved: siblings.length,
+    sibling_ids: siblings.map(function (s) { return s.id; })
   };
 }
 

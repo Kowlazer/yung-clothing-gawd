@@ -1570,6 +1570,96 @@ class TestFitFeedbackData:
         assert [r["name"] for r in render] == ["New", "Mid", "Old", "Undated"]
 
 
+class TestWatchlistRemovalData:
+    """The removal nudge — in particular that it stops nagging about Doc lines
+    that are already gone (the sibling-approval / hand-edit case)."""
+
+    DOC = "Shops and URLs:\nhttps://shop.com/products/tee\nhttps://shop.com/products/cap\n"
+
+    def _item(self, item_id, name, line, **over):
+        item = {
+            "id": item_id, "item_name": name, "shop": "S",
+            "watchlist_match": {"matched_line": line, "approved_for_removal": None},
+        }
+        item.update(over)
+        return item
+
+    def test_dormant_when_unconfigured(self):
+        wardrobe = {"items": [self._item("a", "Tee", "https://shop.com/products/tee")]}
+        render, all_url = main_mod._watchlist_removal_data(
+            wardrobe, _FAKE_CONFIG, self.DOC,
+        )
+        assert render == [] and all_url is None
+
+    def test_builds_signed_links_for_pending(self):
+        wardrobe = {"items": [self._item("a", "Tee", "https://shop.com/products/tee")]}
+        render, all_url = main_mod._watchlist_removal_data(
+            wardrobe, _configured(), self.DOC,
+        )
+        assert [r["name"] for r in render] == ["Tee"]
+        sig = parse_qs(urlparse(render[0]["url"]).query)["sig"][0]
+        assert _verify("remove:a", sig, "sec") is True
+        assert all_url is not None
+
+    def test_drops_candidate_whose_doc_line_is_gone(self):
+        """A sibling item's approval already deleted the line — nothing left to
+        approve, so it must not keep appearing in the digest."""
+        wardrobe = {"items": [
+            self._item("a", "Tee", "https://shop.com/products/tee"),
+            self._item("b", "Keychain", "https://shop.com/products/deleted"),
+        ]}
+        render, _ = main_mod._watchlist_removal_data(
+            wardrobe, _configured(), self.DOC,
+        )
+        assert [r["name"] for r in render] == ["Tee"]
+
+    def test_self_suppresses_when_every_line_is_gone(self):
+        wardrobe = {"items": [self._item("a", "Tee", "https://shop.com/products/gone")]}
+        render, all_url = main_mod._watchlist_removal_data(
+            wardrobe, _configured(), self.DOC,
+        )
+        assert render == [] and all_url is None
+
+    def test_blank_doc_text_does_not_drop_anything(self):
+        """A failed/empty Doc fetch must not read as 'every line was removed'."""
+        wardrobe = {"items": [self._item("a", "Tee", "https://shop.com/products/tee")]}
+        render, _ = main_mod._watchlist_removal_data(wardrobe, _configured(), "")
+        assert [r["name"] for r in render] == ["Tee"]
+
+    def test_matches_doc_line_ignoring_surrounding_whitespace(self):
+        wardrobe = {"items": [self._item("a", "Tee", "https://shop.com/products/tee")]}
+        render, _ = main_mod._watchlist_removal_data(
+            wardrobe, _configured(), "  https://shop.com/products/tee  \n",
+        )
+        assert [r["name"] for r in render] == ["Tee"]
+
+    def test_decided_items_are_never_pending(self):
+        wardrobe = {"items": [
+            self._item("a", "Approved", "https://shop.com/products/tee",
+                       watchlist_match={"matched_line": "https://shop.com/products/tee",
+                                        "approved_for_removal": True}),
+            self._item("b", "Declined", "https://shop.com/products/cap",
+                       watchlist_match={"matched_line": "https://shop.com/products/cap",
+                                        "approved_for_removal": False}),
+        ]}
+        render, all_url = main_mod._watchlist_removal_data(
+            wardrobe, _configured(), self.DOC,
+        )
+        assert render == [] and all_url is None
+
+    def test_pending_sorted_newest_first(self):
+        wardrobe = {"items": [
+            self._item("a", "Older", "https://shop.com/products/tee",
+                       purchased_at="2025-01-02"),
+            self._item("b", "Newer", "https://shop.com/products/cap",
+                       purchased_at="2026-05-30"),
+        ]}
+        render, _ = main_mod._watchlist_removal_data(
+            wardrobe, _configured(), self.DOC,
+        )
+        assert [r["name"] for r in render] == ["Newer", "Older"]
+
+
 class TestWeeklyFitEmail:
     def _pending(self):
         return [{"name": "Tee", "shop": "S", "size": "M", "color": None,
