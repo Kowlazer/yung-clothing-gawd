@@ -40,6 +40,19 @@ def _reset_circuit_breaker():
 
 
 @pytest.fixture(autouse=True)
+def _reset_proxy_rate_limit_budget():
+    """Clear the per-process reader-proxy 429-recovery budget between tests.
+
+    ``extract._PROXY_RATE_LIMIT_MAX`` caps how many rate-limited items are
+    recovered through the proxy per run; without a reset, a test that spends it
+    would silently stop a later test's 429 from being recovered.
+    """
+    from src import extract
+    extract._reset_proxy_rate_limit_budget()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_browser_fallback(monkeypatch):
     """Keep the browser-render fallback out of every test by default.
 

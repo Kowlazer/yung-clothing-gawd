@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import threading
 import warnings
 from typing import Any
 
@@ -57,6 +58,84 @@ _PROXY_TIMEOUT = 30.0
 _BROWSER_FALLBACK_ENABLED = os.getenv(
     "BROWSER_FALLBACK", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
+
+# ---------------------------------------------------------------------------
+# Reader-proxy recovery for RATE-LIMITED (429) products — budgeted.
+# ---------------------------------------------------------------------------
+# Same egress trick as the blocked (403/503) recovery above, extended to a 429.
+# Shopify rate-limits per *source IP* across every store it hosts, so on a storm
+# day the shared GitHub Actions egress lands in a platform-wide penalty box and
+# hundreds of products come back 429 across dozens of shops at once (observed
+# 2026-07-21: 214 items / 65 hosts, the throttle lasting the whole run with
+# Retry-After >= 15s — so no amount of *direct* retrying/pacing recovers them;
+# only a different egress does). A persistent 429 is therefore recovered through
+# the same reader proxy as a block: it fetches the `.json` from its own
+# un-throttled IP.
+#
+# Two deliberate differences from the blocked path:
+#   * BUDGETED. A wide storm would otherwise fire the free-tier proxy at all 214
+#     items at once, which just gets us throttled by the proxy too (and burns the
+#     clock). The budget caps proxy attempts per process so a common storm
+#     (~dozens of items) is recovered while an extreme one degrades gracefully to
+#     the same last-known-price verdict as before once the budget is spent.
+#   * NEVER escalates to the browser rung. A headless browser shares this exact
+#     throttled IP, so it would get the same 429 — only the proxy's foreign
+#     egress can help. (The browser rung still fires for a *block*, where a real
+#     browser can pass Cloudflare's JS challenge.)
+_DEFAULT_PROXY_RATE_LIMIT_MAX = 40
+
+
+def _read_proxy_rate_limit_max() -> int:
+    """Parse PROXY_RATE_LIMIT_MAX_ITEMS: non-negative int, default 40.
+
+    0 is honoured (budget of zero = the 429 proxy rung disabled); blank/garbage/
+    negative falls back to the default.
+    """
+    raw = os.getenv("PROXY_RATE_LIMIT_MAX_ITEMS", "").strip()
+    try:
+        val = int(raw)
+    except ValueError:
+        return _DEFAULT_PROXY_RATE_LIMIT_MAX
+    return val if val >= 0 else _DEFAULT_PROXY_RATE_LIMIT_MAX
+
+
+_PROXY_RATE_LIMIT_MAX = _read_proxy_rate_limit_max()
+
+_proxy_rl_lock = threading.Lock()
+_proxy_rl_attempts = 0
+_proxy_rl_warned = False
+
+
+def _take_proxy_rate_limit() -> bool:
+    """Consume one attempt from the per-process 429-recovery budget.
+
+    Thread-safe (extract runs in a ThreadPool). Returns False once the budget is
+    exhausted so the caller keeps the item's last-known price (records
+    ``rate_limited``) instead of hammering the proxy.
+    """
+    global _proxy_rl_attempts, _proxy_rl_warned
+    with _proxy_rl_lock:
+        if _proxy_rl_attempts >= _PROXY_RATE_LIMIT_MAX:
+            if not _proxy_rl_warned:
+                _proxy_rl_warned = True
+                log.warning(
+                    "reader-proxy 429-recovery budget exhausted (%d attempts); "
+                    "further rate-limited items keep their last-known price this run",
+                    _PROXY_RATE_LIMIT_MAX,
+                )
+            return False
+        _proxy_rl_attempts += 1
+        return True
+
+
+def _reset_proxy_rate_limit_budget() -> None:
+    """Clear the 429-recovery budget — used between tests; prod gets a fresh
+    process per cron run."""
+    global _proxy_rl_attempts, _proxy_rl_warned
+    with _proxy_rl_lock:
+        _proxy_rl_attempts = 0
+        _proxy_rl_warned = False
+
 
 _SCHEMA_OOS = frozenset({
     "http://schema.org/OutOfStock",
@@ -1080,56 +1159,67 @@ def extract(url: str, *, preferred_sizes: tuple[str, ...] = ()) -> dict:
 
     if resp.status_code != 200:
         kind = _classify_error(None, resp.status_code)
-        # Cloudflare datacenter-IP block (403/503): the page fetches fine from a
-        # residential IP but 403s the GitHub Actions egress, so the item goes
-        # stale every cron run. Recover through the reader proxy (un-blocked
-        # egress). Only here — after a real block — so the happy path is
+        # Recover through the reader proxy (un-blocked egress) for the two error
+        # classes that are really "this IP was refused, a residential one would
+        # succeed", so the item doesn't go stale every cron run:
+        #   * blocked (403/503) — Cloudflare datacenter-IP block; always try.
+        #   * rate_limited (429) — Shopify per-IP throttle storm; try only while
+        #     the per-process budget lasts (see _take_proxy_rate_limit).
+        # Only here, after a direct fetch already failed, so the happy path is
         # untouched.
-        if kind == "blocked":
-            if _PROXY_FALLBACK_ENABLED:
-                # Shopify products: price/variants live in the structured `.json`
-                # (exact compare-at + per-variant availability), so prefer it.
-                if "/products/" in url:
-                    if product_json is None:
-                        product_json = _shopify_json_via_proxy(_shopify_json_url(url))
-                        if product_json is not None:
-                            _borrow_js_availability_via_proxy(product_json, url)
+        proxy_ok = _PROXY_FALLBACK_ENABLED and (
+            kind == "blocked"
+            or (kind == "rate_limited" and _take_proxy_rate_limit())
+        )
+        if proxy_ok:
+            # Shopify products: price/variants live in the structured `.json`
+            # (exact compare-at + per-variant availability), so prefer it.
+            if "/products/" in url:
+                if product_json is None:
+                    product_json = _shopify_json_via_proxy(_shopify_json_url(url))
                     if product_json is not None:
-                        parsed = parse("", url, product_json=product_json,
-                                       preferred_sizes=preferred_sizes)
-                        result.update(parsed)
-                        log.info("recovered blocked Shopify product via .json: %s", url)
-                        return result
-                # Non-Shopify shops (no `.json`), and Shopify products whose `.json`
-                # also didn't come through: fetch the page HTML through the proxy and
-                # run it past the same JSON-LD / OG / microdata / WooCommerce
-                # extractors. The regex price fallback is disabled (proxied HTML is
-                # often a rendered/partial blob whose first `$N` is a banner) so we
-                # adopt a recovered price only from a structured source — otherwise
-                # we keep the last-known price (the prior "blocked" verdict).
-                proxied_html = _fetch_html_via_proxy(url)
-                if proxied_html:
-                    parsed = parse(proxied_html, url, preferred_sizes=preferred_sizes,
-                                   trust_regex_fallback=False)
-                    if parsed.get("current_price") is not None:
-                        result.update(parsed)
-                        log.info("recovered blocked product via proxied HTML: %s", url)
-                        return result
-            # JS-SPA holdout (issue #1's last residual): the proxy's snapshot is
-            # pre-hydration, so a storefront that injects its Product JSON-LD
-            # client-side never surfaces a price above. Render the page in a
-            # real headless browser (budgeted + failure-isolated) and run the
-            # hydrated HTML past the same structured-only extractors — the
-            # regex fallback stays off for exactly the proxied-HTML reason.
-            if _BROWSER_FALLBACK_ENABLED:
-                rendered = browser_fetch.fetch_rendered_html(url)
-                if rendered:
-                    parsed = parse(rendered, url, preferred_sizes=preferred_sizes,
-                                   trust_regex_fallback=False)
-                    if parsed.get("current_price") is not None:
-                        result.update(parsed)
-                        log.info("recovered blocked product via browser render: %s", url)
-                        return result
+                        _borrow_js_availability_via_proxy(product_json, url)
+                if product_json is not None:
+                    parsed = parse("", url, product_json=product_json,
+                                   preferred_sizes=preferred_sizes)
+                    result.update(parsed)
+                    log.info("recovered %s Shopify product via .json: %s", kind, url)
+                    return result
+            # Non-Shopify shops (no `.json`), and Shopify products whose `.json`
+            # also didn't come through: fetch the page HTML through the proxy and
+            # run it past the same JSON-LD / OG / microdata / WooCommerce
+            # extractors. The regex price fallback is disabled (proxied HTML is
+            # often a rendered/partial blob whose first `$N` is a banner) so we
+            # adopt a recovered price only from a structured source — otherwise
+            # we keep the last-known price (the prior error verdict).
+            proxied_html = _fetch_html_via_proxy(url)
+            if proxied_html:
+                parsed = parse(proxied_html, url, preferred_sizes=preferred_sizes,
+                               trust_regex_fallback=False)
+                if parsed.get("current_price") is not None:
+                    result.update(parsed)
+                    log.info("recovered %s product via proxied HTML: %s", kind, url)
+                    return result
+        # JS-SPA holdout (issue #1's last residual): the proxy's snapshot is
+        # pre-hydration, so a storefront that injects its Product JSON-LD
+        # client-side never surfaces a price above. Render the page in a real
+        # headless browser (budgeted + failure-isolated) and run the hydrated
+        # HTML past the same structured-only extractors — the regex fallback
+        # stays off for exactly the proxied-HTML reason.
+        #
+        # BLOCKED ONLY: a headless browser shares this same throttled egress, so
+        # it would get the identical 429 for a rate-limited item — only the
+        # proxy's foreign egress can help there. For a block, the browser passes
+        # Cloudflare's JS challenge, which is the whole point of the rung.
+        if kind == "blocked" and _BROWSER_FALLBACK_ENABLED:
+            rendered = browser_fetch.fetch_rendered_html(url)
+            if rendered:
+                parsed = parse(rendered, url, preferred_sizes=preferred_sizes,
+                               trust_regex_fallback=False)
+                if parsed.get("current_price") is not None:
+                    result.update(parsed)
+                    log.info("recovered blocked product via browser render: %s", url)
+                    return result
         result["error"] = f"HTTP {resp.status_code}"
         result["error_kind"] = kind
         return result

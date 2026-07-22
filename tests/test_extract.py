@@ -1465,6 +1465,110 @@ class TestExtractBlockedRecovery:
         assert html_called == ["https://shop.com/shop/mens-tee"]
 
 
+class _RateLimitedResp:
+    """Stand-in httpx response: a Shopify per-IP throttle 429 with no body.
+
+    Mirrors the synthetic 429 the circuit breaker hands back and a real
+    platform-throttle 429 alike — both drive extract()'s rate_limited branch.
+    """
+    status_code = 429
+    text = ""
+
+    def json(self):
+        raise ValueError("rate limited")
+
+
+class TestExtractRateLimitedRecovery:
+    """A persistent 429 is recovered through the same proxy egress as a block
+    (Shopify per-IP throttle storm), but budgeted and never via the browser."""
+
+    URL = "https://shop.com/products/wave-shorts"
+
+    def _force_429(self, monkeypatch):
+        monkeypatch.setattr(extract, "get_with_retry", lambda client, u: _RateLimitedResp())
+
+    def test_recovers_via_proxy(self, monkeypatch):
+        self._force_429(monkeypatch)
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
+        raw = (FIXTURES / "hokuro_wave_shorts.json").read_text(encoding="utf-8")
+        monkeypatch.setattr(extract, "_fetch_via_proxy",
+                            lambda u: raw if u.endswith(".json") else None)
+        d = extract.extract(self.URL)
+        assert d["current_price"] == 26.0
+        assert d["original_price"] == 58.0
+        assert d["on_sale"] is True
+        assert d["error"] is None and d["error_kind"] is None
+
+    def test_budget_zero_stays_rate_limited(self, monkeypatch):
+        # A budget of 0 disables the 429 proxy rung: the proxy is never called
+        # and the item keeps its rate_limited verdict (last-known price).
+        self._force_429(monkeypatch)
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
+        monkeypatch.setattr(extract, "_PROXY_RATE_LIMIT_MAX", 0)
+        extract._reset_proxy_rate_limit_budget()
+        called = []
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: called.append(u))
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy", lambda u: called.append(u))
+        d = extract.extract(self.URL)
+        assert d["current_price"] is None
+        assert d["error_kind"] == "rate_limited"
+        assert called == []  # budget spent before any network work
+
+    def test_budget_caps_attempts_across_items(self, monkeypatch):
+        # With a budget of 1, the first 429 item is recovered and the second
+        # falls through to rate_limited (the proxy is not tried a second time).
+        self._force_429(monkeypatch)
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
+        monkeypatch.setattr(extract, "_PROXY_RATE_LIMIT_MAX", 1)
+        extract._reset_proxy_rate_limit_budget()
+        raw = (FIXTURES / "hokuro_wave_shorts.json").read_text(encoding="utf-8")
+        json_calls = []
+
+        def fake_json_proxy(u):
+            json_calls.append(u)
+            return raw if u.endswith(".json") else None
+
+        monkeypatch.setattr(extract, "_fetch_via_proxy", fake_json_proxy)
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy", lambda u: None)
+
+        first = extract.extract("https://shop.com/products/one")
+        second = extract.extract("https://shop.com/products/two")
+        assert first["current_price"] == 26.0 and first["error_kind"] is None
+        assert second["current_price"] is None and second["error_kind"] == "rate_limited"
+        # The budget let the first item reach the proxy but capped the second:
+        # no proxy call was ever made for `/two` (the `.js` availability borrow
+        # also hits the proxy, so assert by which item, not an exact call list).
+        assert any(c == "https://shop.com/products/one.json" for c in json_calls)
+        assert all("/two" not in c for c in json_calls)
+
+    def test_never_escalates_to_browser(self, monkeypatch):
+        # A browser render shares the same throttled IP, so a rate-limited item
+        # must NEVER fall through to it — that rung is blocked-only.
+        self._force_429(monkeypatch)
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", True)
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: None)  # .json miss
+        monkeypatch.setattr(extract, "_fetch_html_via_proxy", lambda u: None)  # html miss
+        monkeypatch.setattr(extract, "_BROWSER_FALLBACK_ENABLED", True)
+        browser_calls = []
+        monkeypatch.setattr(
+            extract.browser_fetch, "fetch_rendered_html",
+            lambda u: browser_calls.append(u),
+        )
+        d = extract.extract(self.URL)
+        assert d["error_kind"] == "rate_limited"
+        assert browser_calls == []  # browser rung never fired for a 429
+
+    def test_disabled_stays_rate_limited(self, monkeypatch):
+        self._force_429(monkeypatch)
+        monkeypatch.setattr(extract, "_PROXY_FALLBACK_ENABLED", False)
+        called = []
+        monkeypatch.setattr(extract, "_fetch_via_proxy", lambda u: called.append(u))
+        d = extract.extract(self.URL)
+        assert d["current_price"] is None
+        assert d["error_kind"] == "rate_limited"
+        assert called == []  # proxy never attempted when disabled
+
+
 # Structured product HTML (JSON-LD Product/Offer) as a non-Shopify shop would
 # emit — the price lives in <script>, not visible text, so the proxy must be
 # asked for `html` (not the reader's text output) for this to be recoverable.
