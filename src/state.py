@@ -1,6 +1,6 @@
 """Read and write state to GitHub Gist.
 
-Gist files (14):
+Gist files (15):
   * prices.json       — per-URL price history, pruned after 30 days
   * shop_aliases.json — known shop name → homepage URL
   * codes.json        — promo codes (source: "watchlist" | "email" |
@@ -48,6 +48,11 @@ Gist files (14):
                         SHADOW_MODEL env var is set; owned + pruned by
                         src/shadow_compare.py; reviewed via
                         `python -m src.shadow_report`.
+  * throttle_state.json — cross-run Shopify pacing memory:
+                        {shopify_gate_interval, last_run_stormed, updated_at}.
+                        Written by src/main.py at end of run so tomorrow's gate
+                        starts at the gap this run earned (or the ceiling after a
+                        storm) — see src/http_util.AdaptiveRateLimiter.
 """
 
 from __future__ import annotations
@@ -187,6 +192,7 @@ def read_state(gist_id: str, token: str, *, fresh: bool = False) -> dict:
             "shop_verdicts": _parse_gist_file(files, "shop_verdicts.json", default=[], **opts),
             "restock": _parse_gist_file(files, "restock_state.json", default={}, **opts),
             "shadow_runs": _parse_gist_file(files, "shadow_runs.json", default={}, **opts),
+            "throttle": _parse_gist_file(files, "throttle_state.json", default={}, **opts),
         }
 
 
@@ -295,12 +301,13 @@ def write_state(
     shop_verdicts: list | None = None,
     restock: dict | None = None,
     shadow_runs: dict | None = None,
+    throttle: dict | None = None,
 ) -> None:
     """Prune stale entries, then update Gist files in one PATCH.
 
     ``fx``, ``gmail``, ``voice``, ``sms_aliases``, ``signup``, ``wardrobe``,
-    ``email_sales``, ``body_scans``, ``shop_verdicts``, ``restock``, and
-    ``shadow_runs`` are
+    ``email_sales``, ``body_scans``, ``shop_verdicts``, ``restock``,
+    ``shadow_runs``, and ``throttle`` are
     optional — pass None to leave the corresponding file untouched (e.g. when
     the FX fetch failed
     and the cache shouldn't be overwritten, when Gmail/Voice/signup was
@@ -343,6 +350,8 @@ def write_state(
         files["restock_state.json"] = {"content": json.dumps(restock, indent=2)}
     if shadow_runs is not None:
         files["shadow_runs.json"] = {"content": json.dumps(shadow_runs, indent=2)}
+    if throttle is not None:
+        files["throttle_state.json"] = {"content": json.dumps(throttle, indent=2)}
     with httpx.Client(timeout=_TIMEOUT) as client:
         resp = client.patch(
             f"{_GIST_API}/{gist_id}",

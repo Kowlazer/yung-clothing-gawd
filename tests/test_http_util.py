@@ -264,70 +264,66 @@ class TestRateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# AdaptiveRateLimiter (AIMD platform gate)
+# AdaptiveRateLimiter — adaptive platform gate, AIMD *across runs*
 # ---------------------------------------------------------------------------
 
 def _adaptive(**kw):
     from src import http_util
-    defaults = dict(start=1.0, min_interval=1.0, max_interval=5.0,
-                    growth=2.0, decay_step=0.5, decay_after=3)
+    defaults = dict(start=5.0, min_interval=1.0, max_interval=5.0, decay_step=0.5)
     defaults.update(kw)
     start = defaults.pop("start")
     return http_util.AdaptiveRateLimiter(start, **defaults)
 
 
 class TestAdaptiveRateLimiter:
-    def test_starts_narrow(self):
-        assert _adaptive().interval == 1.0
+    def test_starts_at_the_ceiling_by_default(self):
+        # Proactive pacing: the module default is the safe ceiling, not a burst —
+        # the first request of a run is paced so it can't trip the per-IP throttle.
+        from src import http_util
+        lim = http_util.AdaptiveRateLimiter()
+        assert lim.interval == http_util._ADAPT_MAX_INTERVAL == 5.0
+        assert lim.stormed is False
 
-    def test_throttle_widens_multiplicatively(self):
+    def test_seed_sets_the_starting_gap(self):
+        # main.py seeds the gate from persisted cross-run state at startup.
         lim = _adaptive()
-        lim.record_throttled("shop.com")
-        assert lim.interval == 2.0
-        lim.record_throttled("shop.com")
-        assert lim.interval == 4.0
+        lim.seed(3.5)
+        assert lim.interval == 3.5
 
-    def test_widening_is_capped_at_the_old_fixed_gap(self):
-        # The whole safety argument: the worst this can degrade to is the flat
-        # 5 s gate it replaced — never slower.
-        lim = _adaptive()
-        for _ in range(10):
-            lim.record_throttled("shop.com")
+    def test_seed_clamps_into_range(self):
+        lim = _adaptive(min_interval=3.0, max_interval=5.0)
+        lim.seed(0.5)
+        assert lim.interval == 3.0     # floored
+        lim.seed(99.0)
+        assert lim.interval == 5.0     # capped
+
+    def test_throttle_snaps_to_ceiling_and_flags_stormed(self):
+        # Reactive widening can't save the run; all a throttle does is guarantee
+        # the ceiling and flag the run so tomorrow starts pessimistic.
+        lim = _adaptive(start=3.0)
+        assert lim.stormed is False
+        lim.record_throttled("shop.com")
         assert lim.interval == 5.0
+        assert lim.stormed is True
 
-    def test_clean_stretch_decays_one_step(self, monkeypatch):
-        from src import http_util
-        monkeypatch.setattr(http_util.time, "sleep", lambda s: None)
-        lim = _adaptive()                 # decay_after=3
-        lim.record_throttled("shop.com")  # -> 2.0
-        for _ in range(3):
-            lim.acquire()
-        assert lim.interval == 1.5
+    def test_next_interval_decays_one_step_after_a_clean_run(self):
+        # A fully clean run earns tomorrow a slightly narrower start.
+        lim = _adaptive(start=5.0)
+        assert lim.stormed is False
+        assert lim.next_interval == 4.5
 
-    def test_decay_stops_at_the_floor(self, monkeypatch):
-        from src import http_util
-        monkeypatch.setattr(http_util.time, "sleep", lambda s: None)
-        lim = _adaptive()
-        for _ in range(30):               # far more clean requests than needed
-            lim.acquire()
-        assert lim.interval == 1.0
+    def test_next_interval_is_the_ceiling_after_a_storm(self):
+        lim = _adaptive(start=3.0)
+        lim.record_throttled("shop.com")
+        assert lim.next_interval == 5.0
 
-    def test_throttle_resets_the_clean_streak(self, monkeypatch):
-        # Two clean acquisitions then a throttle must not leave the counter
-        # primed to decay immediately after — AIMD decays slowly on purpose.
-        from src import http_util
-        monkeypatch.setattr(http_util.time, "sleep", lambda s: None)
-        lim = _adaptive()
-        lim.record_throttled("a.com")     # -> 2.0
-        lim.acquire()
-        lim.acquire()
-        lim.record_throttled("a.com")     # -> 4.0, streak cleared
-        lim.acquire()
-        assert lim.interval == 4.0        # only 1 clean since; decay_after is 3
+    def test_next_interval_floors_at_the_minimum(self):
+        lim = _adaptive(start=1.0, min_interval=1.0, decay_step=0.5)
+        assert lim.next_interval == 1.0
 
     def test_zeroed_interval_short_circuits(self, monkeypatch):
         # The test/no-delay configuration (conftest zeroes the gate): acquire()
-        # must not sleep, and must not run the feedback loop.
+        # must not sleep.
         from src import http_util
         sleeps: list[float] = []
         monkeypatch.setattr(http_util.time, "sleep", sleeps.append)
@@ -338,52 +334,56 @@ class TestAdaptiveRateLimiter:
         assert sleeps == []
         assert lim.interval == 0.0
 
-    def test_persistent_throttle_widens_the_global_gate(self, monkeypatch):
+    def test_persistent_throttle_snaps_the_global_gate_to_ceiling(self, monkeypatch):
         # The wiring: get_with_retry feeds the gate the same persistent-throttle
         # signal the circuit breaker consumes.
         from src import http_util
         from src.http_util import get_with_retry, HostCircuitBreaker
-        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive())
+        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive(start=3.0))
         client = _FakeClient([_FakeResp(429) for _ in range(5)])
         get_with_retry(client, "http://slow.com/i", max_retries=2,
                        sleep=lambda s: None, breaker=HostCircuitBreaker(threshold=99))
-        assert http_util.PLATFORM_LIMITER.interval == 2.0
+        assert http_util.PLATFORM_LIMITER.interval == 5.0
+        assert http_util.PLATFORM_LIMITER.stormed is True
 
     def test_recovered_429_leaves_the_global_gate_alone(self, monkeypatch):
         # A blip that recovers on retry is not a storm — same standard the
-        # circuit breaker holds.
+        # circuit breaker holds; the run stays un-stormed so it can still decay.
         from src import http_util
         from src.http_util import get_with_retry
-        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive())
+        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive(start=3.0))
         client = _FakeClient([_FakeResp(429, {"Retry-After": "0"}), _FakeResp(200)])
         resp = get_with_retry(client, "http://ok.com/i", max_retries=2,
                               sleep=lambda s: None, breaker=None)
         assert resp.status_code == 200
-        assert http_util.PLATFORM_LIMITER.interval == 1.0
+        assert http_util.PLATFORM_LIMITER.interval == 3.0
+        assert http_util.PLATFORM_LIMITER.stormed is False
 
-    def test_gate_widens_even_with_the_breaker_disabled(self, monkeypatch):
+    def test_gate_snaps_even_with_the_breaker_disabled(self, monkeypatch):
         # breaker=None turns off per-host short-circuiting only; the platform
         # gate is a separate consumer of the same signal.
         from src import http_util
         from src.http_util import get_with_retry
-        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive())
+        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive(start=3.0))
         client = _FakeClient([_FakeResp(429) for _ in range(5)])
         get_with_retry(client, "http://slow.com/i", max_retries=2,
                        sleep=lambda s: None, breaker=None)
-        assert http_util.PLATFORM_LIMITER.interval == 2.0
+        assert http_util.PLATFORM_LIMITER.interval == 5.0
+        assert http_util.PLATFORM_LIMITER.stormed is True
 
-    def test_persistent_503_does_not_widen_the_global_gate(self, monkeypatch):
+    def test_persistent_503_does_not_touch_the_global_gate(self, monkeypatch):
         # A permanently-broken shop 503s on every item of every run. Harmless to
-        # a per-host breaker; fatal to a global gate, which it would pin at the
-        # ceiling forever. Only 429 means "you are being rate limited".
-        # (Observed live: blackrabbitco on the 2026-07-19 verification run.)
+        # a per-host breaker; fatal to a global gate, which it would flag stormed
+        # and pin at the ceiling forever. Only 429 means "you are being rate
+        # limited". (Observed live: blackrabbitco on the 2026-07-19 run.)
         from src import http_util
         from src.http_util import get_with_retry, HostCircuitBreaker
-        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive())
+        monkeypatch.setattr(http_util, "PLATFORM_LIMITER", _adaptive(start=3.0))
         breaker = HostCircuitBreaker(threshold=2)
         for _ in range(4):
             client = _FakeClient([_FakeResp(503) for _ in range(5)])
             get_with_retry(client, "http://dead.com/i", max_retries=2,
                            sleep=lambda s: None, breaker=breaker)
-        assert http_util.PLATFORM_LIMITER.interval == 1.0   # untouched
+        assert http_util.PLATFORM_LIMITER.interval == 3.0   # untouched
+        assert http_util.PLATFORM_LIMITER.stormed is False
         assert breaker.is_tripped("dead.com")               # breaker still acts

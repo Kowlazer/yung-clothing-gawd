@@ -15,12 +15,13 @@ def _fast_rate_limiters():
     intervals, so the timing and AIMD behaviour are still covered.
 
     The platform gate is process-global and *stateful across a run* by design,
-    so it's re-zeroed (and its clean streak cleared) before every test — a test
-    that provokes a 429 would otherwise widen the gate for every test after it.
+    so it's re-zeroed (and its storm flag cleared) before every test — a test
+    that provokes a 429 would otherwise leave the gate flagged stormed (and
+    pinned at the ceiling) for every test after it.
     """
     from src import claude_fuzzy, http_util, main
     http_util.PLATFORM_LIMITER._interval = 0.0
-    http_util.PLATFORM_LIMITER._clean = 0
+    http_util.PLATFORM_LIMITER._stormed = False
     main._SHOPIFY_LIMITER._interval = 0.0
     claude_fuzzy._HOMEPAGE_LIMITER._interval = 0.0
     yield

@@ -665,13 +665,14 @@ def test_run_threads_data_through_pipeline(monkeypatch):
     def fake_write_state(gist_id, token, *, prices, aliases, codes, fx,
                           gmail=None, voice=None, sms_aliases=None,
                           email_sales=None, body_scans=None, shop_verdicts=None,
-                          shadow_runs=None):
+                          shadow_runs=None, throttle=None):
         captured["write_state"] = {
             "prices": prices, "aliases": aliases,
             "codes": codes, "fx": fx, "gmail": gmail,
             "voice": voice, "sms_aliases": sms_aliases,
             "email_sales": email_sales, "body_scans": body_scans,
             "shop_verdicts": shop_verdicts, "shadow_runs": shadow_runs,
+            "throttle": throttle,
         }
 
     monkeypatch.setattr(main_mod, "write_state", fake_write_state)
@@ -710,6 +711,12 @@ def test_run_threads_data_through_pipeline(monkeypatch):
     ]
     # ...and prior_verdicts from state was threaded into resolve_fuzzy
     assert "prior_verdicts" in captured["resolve_fuzzy_input"]
+
+    # the Shopify pacing gate persists its learned interval for next run (the
+    # cross-run 429-storm fix). A clean run (no throttle) is not flagged stormed.
+    assert captured["write_state"]["throttle"]["last_run_stormed"] is False
+    assert "shopify_gate_interval" in captured["write_state"]["throttle"]
+    assert "updated_at" in captured["write_state"]["throttle"]
 
     # email got a subject reflecting the counts
     assert "Sale check —" in captured["email"]["subject"]

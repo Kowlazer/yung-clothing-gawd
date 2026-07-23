@@ -87,10 +87,13 @@ def _is_shopify_url(url: str) -> bool:
 # charged every day: with ~300 `/products/` URLs a run, that gate alone was 25 of
 # the 37 minutes of the 2026-07-19 run, on a day with 14 total 429s.
 #
-# It is now the shared AIMD gate (``http_util.AdaptiveRateLimiter``): starts at
-# 1 s, doubles toward the old 5 s ceiling the moment any host persistently
-# throttles us, decays back on a clean stretch. Storm behaviour is unchanged at
-# the ceiling; calm days run ~5x faster. See the note in ``src/http_util.py``.
+# It is now the shared adaptive gate (``http_util.AdaptiveRateLimiter``) that
+# learns *across* runs: each run is `seed()`ed at the safe 5 s ceiling (or a gap
+# earned by a streak of clean runs, persisted in the Gist), a persistent throttle
+# snaps it back to the ceiling, and a fully clean run shaves the *next* run's
+# start down one step. This paces proactively from request #1 — the reactive
+# start-at-1s version stormed on 2026-07-21/22 because the per-IP throttle trips
+# before a within-run gate can react. See the note in ``src/http_util.py``.
 _SHOPIFY_LIMITER = http_util.PLATFORM_LIMITER
 
 
@@ -1084,6 +1087,24 @@ def run(cfg: Config | None = None) -> str:
     sms_aliases = dict(state.get("sms_aliases") or {})
     wardrobe = state.get("wardrobe") or {}
     body_scans = state.get("body_scans") or {}
+    prior_throttle = state.get("throttle") or {}
+
+    # Seed the Shopify pacing gate from what prior runs learned (the fix for the
+    # 2026-07-21/22 per-IP rate-limit storm — see src/http_util.py). A clean run
+    # persists a slightly narrower start; a storm persists the ceiling. Absent
+    # state (first run after deploy) -> start at the proven-safe ceiling.
+    _persisted_interval = prior_throttle.get("shopify_gate_interval")
+    _SHOPIFY_LIMITER.seed(
+        _persisted_interval
+        if _persisted_interval is not None
+        else http_util._ADAPT_MAX_INTERVAL
+    )
+    log.info(
+        "seeded Shopify platform gate at %.2fs (persisted=%s, last_run_stormed=%s)",
+        _SHOPIFY_LIMITER.interval,
+        _persisted_interval,
+        prior_throttle.get("last_run_stormed"),
+    )
 
     log.info("fetching watchlist")
     # Keep the unfiltered Doc text: the removal nudge needs to know which lines
@@ -1164,15 +1185,20 @@ def run(cfg: Config | None = None) -> str:
         [u for u, _ in buckets["product_urls"]],
         preferred_sizes=_sizes_for_url,
     )
-    # Where the adaptive gate ended up — the tuning signal for _ADAPT_* in
-    # src/http_util.py. Sitting at the ceiling every run means the storm is back
-    # and the start value is optimistic; sitting at the floor means calm days are
-    # now the norm and the floor could come down further.
+    # Where the adaptive gate ended up + what next run will start at — the tuning
+    # signal for _ADAPT_* in src/http_util.py. stormed=True means a host
+    # persistently 429'd us, so next run seeds at the ceiling; a clean run seeds
+    # one decay step lower. If stormed stays True day after day the floor/decay
+    # aren't the lever — the runner IP is throttled at the source (see the plan's
+    # fallback: egress change).
     log.info(
-        "platform gate finished the item scan at %.2fs (floor %.2fs, ceiling %.2fs)",
+        "platform gate finished the item scan at %.2fs (floor %.2fs, ceiling %.2fs);"
+        " next run seeds at %.2fs (stormed=%s)",
         _SHOPIFY_LIMITER.interval,
         http_util._ADAPT_MIN_INTERVAL,
         http_util._ADAPT_MAX_INTERVAL,
+        _SHOPIFY_LIMITER.next_interval,
+        _SHOPIFY_LIMITER.stormed,
     )
 
     # SMS sale_signals share the email signal shape (same {email_id, shop,
@@ -1410,6 +1436,11 @@ def run(cfg: Config | None = None) -> str:
             body_scans=body_scans_out,
             shop_verdicts=shop_verdicts_store,
             shadow_runs=shadow_runs_store,
+            throttle={
+                "shopify_gate_interval": _SHOPIFY_LIMITER.next_interval,
+                "last_run_stormed": _SHOPIFY_LIMITER.stormed,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
         )
 
     subject = _digest_subject(shop_sales, items, active_email_sales, today=now)

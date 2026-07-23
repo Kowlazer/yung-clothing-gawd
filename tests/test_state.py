@@ -28,7 +28,7 @@ _API_URL = f"https://api.github.com/gists/{GIST_ID}"
 def _gist_response(prices=None, aliases=None, codes=None, fx=None,
                     gmail=None, voice=None, sms_aliases=None, signup=None,
                     email_sales=None, body_scans=None, shop_verdicts=None,
-                    restock=None) -> dict:
+                    restock=None, throttle=None) -> dict:
     """Build a minimal GitHub Gist API response with the given file contents."""
     def _file(content) -> dict:
         return {"content": json.dumps(content)}
@@ -58,6 +58,8 @@ def _gist_response(prices=None, aliases=None, codes=None, fx=None,
         files["shop_verdicts.json"] = _file(shop_verdicts)
     if restock is not None:
         files["restock_state.json"] = _file(restock)
+    if throttle is not None:
+        files["throttle_state.json"] = _file(throttle)
     return {"files": files}
 
 
@@ -158,6 +160,21 @@ class TestReadState:
         httpx_mock.add_response(url=_API_URL, json=_gist_response(prices={}, aliases={}))
         result = read_state(GIST_ID, TOKEN)
         assert result["restock"] == {}
+
+    def test_throttle_file_parsed(self, httpx_mock):
+        throttle = {"shopify_gate_interval": 4.5, "last_run_stormed": False,
+                    "updated_at": _RECENT}
+        httpx_mock.add_response(
+            url=_API_URL,
+            json=_gist_response(prices={}, aliases={}, throttle=throttle),
+        )
+        result = read_state(GIST_ID, TOKEN)
+        assert result["throttle"] == throttle
+
+    def test_missing_throttle_returns_empty_dict(self, httpx_mock):
+        httpx_mock.add_response(url=_API_URL, json=_gist_response(prices={}, aliases={}))
+        result = read_state(GIST_ID, TOKEN)
+        assert result["throttle"] == {}
 
     def test_missing_shop_verdicts_returns_empty_list(self, httpx_mock):
         httpx_mock.add_response(url=_API_URL, json=_gist_response(prices={}, aliases={}))
@@ -344,6 +361,22 @@ class TestWriteState:
         write_state(GIST_ID, TOKEN, {}, {}, [], restock=None)
         body = self._get_patch_body(httpx_mock)
         assert "restock_state.json" not in body["files"]
+
+    def test_patches_throttle_when_provided(self, httpx_mock):
+        self._mock_patch(httpx_mock)
+        throttle = {"shopify_gate_interval": 4.5, "last_run_stormed": False,
+                    "updated_at": _RECENT}
+        write_state(GIST_ID, TOKEN, {}, {}, [], throttle=throttle)
+        body = self._get_patch_body(httpx_mock)
+        assert "throttle_state.json" in body["files"]
+        content = json.loads(body["files"]["throttle_state.json"]["content"])
+        assert content == throttle
+
+    def test_throttle_none_skips_writing(self, httpx_mock):
+        self._mock_patch(httpx_mock)
+        write_state(GIST_ID, TOKEN, {}, {}, [], throttle=None)
+        body = self._get_patch_body(httpx_mock)
+        assert "throttle_state.json" not in body["files"]
 
     def test_patches_voice_when_provided(self, httpx_mock):
         self._mock_patch(httpx_mock)

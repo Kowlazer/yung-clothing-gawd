@@ -7,9 +7,12 @@ so neither hammers shared platform infrastructure — Shopify rate-limits by sou
 IP across every store it hosts, so concurrent / bursty requests from one runner
 trip a platform-level 429 even though each store is a different domain.
 
-``AdaptiveRateLimiter`` is the same gate with a feedback loop: it widens its gap
-when hosts actually start throttling us and narrows it back on a calm run, so we
-don't pay storm-day pacing on the ~360 days a year that aren't a storm.
+``AdaptiveRateLimiter`` is the same gate that learns *across runs*: it starts each
+run proactively at the safe ceiling (or a small speedup earned by a streak of
+clean runs), snaps back to the ceiling the instant a host persistently throttles
+us, and shaves the gap down only after a fully clean run — so we neither expose
+the opening burst that trips a per-IP throttle nor pay storm-day pacing on the
+~360 calm days a year. The learned gap is persisted in the Gist by ``src/main.py``.
 """
 
 from __future__ import annotations
@@ -154,46 +157,54 @@ class RateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# Adaptive (AIMD) platform gate
+# Adaptive platform gate — AIMD across *runs*, not within one
 # ---------------------------------------------------------------------------
 # The fixed 5 s Shopify gate was set during the June/July 2026 429 storm, when a
-# platform-level per-IP throttle was blanking the digest. It works, but it is
-# priced for the worst day of the year and charged on every day: the gate applies
-# to every `/products/` URL, and at ~300 of them a run it *is* the runtime —
-# measured 25m46s of the 2026-07-19 run's 37m09s was gate sleep, on a day with 14
-# total 429s and zero circuit-breaker trips.
+# platform-level per-IP throttle was blanking the digest. It held Shopify at zero
+# failures for two weeks, but it is priced for the worst day of the year and
+# charged on every day: the gate applies to every `/products/` URL, and at ~300 of
+# them a run it *is* the runtime — 25m46s of the 2026-07-19 run's 37m09s was gate
+# sleep, on a day with 14 total 429s and zero circuit-breaker trips.
 #
-# So pace by observation instead of by worst case. The limiter starts narrow and
-# widens multiplicatively the moment a host persistently throttles us (the same
-# signal the circuit breaker already trusts — a 429/503 that survived the whole
-# Retry-After ladder, not a blip that recovered), then decays back one step at a
-# time across a stretch of clean requests. Standard AIMD: fast up, slow down.
+# A first attempt (2026-07-20) paced *reactively within* a run: start at 1 s and
+# widen on the first persistent throttle. It failed loudly — the 2026-07-21/22
+# prod runs stormed (51 hosts, ~314 items rate-limited, gate pinned at 5 s). The
+# reason is structural: Shopify's per-IP throttle is a **penalty box** — once
+# tripped it lasts the whole run (`Retry-After >= 15s` on every 429) — and the
+# very first request of the run was already refused, so by the time the gate
+# observed a throttle and widened (~30 s in) the damage was long done. Reactive
+# slowing cannot un-throttle an already-tripped IP; the only lever is not tripping
+# it, which means pacing proactively from request #1.
 #
-# The safety argument is the ceiling. ``max_interval`` is the old fixed 5 s gap,
-# and three persistent throttles take us there (1 -> 2 -> 4 -> 5) — so the worst
-# case this can degrade to is exactly today's behaviour, reached within a handful
-# of items, while the common case runs ~5x faster. The circuit breaker and the
-# per-host Retry-After ladder are untouched and still do the per-host work; this
-# knob only governs *platform-wide* pacing.
+# So the feedback loop moved to the **across-run** timescale, the right one for a
+# once-daily batch. Each run STARTS at the ceiling (or a gap earned by prior clean
+# runs, persisted in the Gist); a persistent throttle SNAPS it back to the ceiling
+# and flags the run "stormed"; at end of run ``next_interval`` shaves one step off
+# ONLY if the run was fully clean. Over a calm stretch the start ratchets 5 -> 4.5
+# -> 4 -> ... toward the floor (recovering the speed win); one storm snaps it back
+# to 5 s and holds there until calm returns. Multiplicative-increase / additive-
+# decrease, exactly — just clocked in days, not seconds.
 #
-# Only a persistent **429** feeds it — see the note at the call site in
-# ``get_with_retry`` for why 503 is deliberately excluded.
-_ADAPT_START_INTERVAL = 1.0    # seconds; calm-day gap
-_ADAPT_MIN_INTERVAL = 1.0      # never burst faster than this
-_ADAPT_MAX_INTERVAL = 5.0      # the old fixed gap — our worst case, not our default
-_ADAPT_GROWTH = 2.0            # multiplicative increase per persistent throttle
-_ADAPT_DECAY_STEP = 0.5        # seconds shaved per clean stretch
-_ADAPT_DECAY_AFTER = 40        # clean acquisitions before one decay step
+# The floor is deliberately kept ABOVE the 1 s that stormed: even the one calm day
+# at 1 s (07-20) only caught a cool IP. The circuit breaker and per-host
+# Retry-After ladder are untouched and still do all per-host work; this knob
+# governs only platform-wide pacing. Only a persistent **429** feeds it — see the
+# note at the call site in ``get_with_retry`` for why 503 is deliberately excluded.
+_ADAPT_START_INTERVAL = 5.0    # proactive default when nothing is persisted yet
+_ADAPT_MIN_INTERVAL = 3.0      # fastest a clean streak may earn (stays above the 1s that stormed)
+_ADAPT_MAX_INTERVAL = 5.0      # the proven-safe gap; a storm snaps us back here
+_ADAPT_DECAY_STEP = 0.5        # seconds shaved off next run's start after a fully clean run
 
 
 class AdaptiveRateLimiter(RateLimiter):
-    """A ``RateLimiter`` whose gap responds to observed throttling (see above).
+    """A ``RateLimiter`` that learns its gap across runs (see the note above).
 
-    ``record_throttled()`` multiplies the gap (capped at ``max_interval``);
-    every ``decay_after`` acquisitions with no throttle in between shave
-    ``decay_step`` off it (floored at ``min_interval``). Both the gap and the
-    clean-streak counter live under the base class's lock, so the whole thing
-    stays safe to share across the extractor's thread pool.
+    Started each run via ``seed()`` at the ceiling or a gap earned by prior clean
+    runs; ``record_throttled()`` snaps the gap to ``max_interval`` and flags the
+    run ``stormed``; ``next_interval`` is what to persist for next run — the
+    ceiling after a storm, else one ``decay_step`` below where we ended (floored
+    at ``min_interval``). The gap and the storm flag live under the base class's
+    lock, so the whole thing stays safe to share across the extractor's pool.
     """
 
     def __init__(
@@ -202,17 +213,13 @@ class AdaptiveRateLimiter(RateLimiter):
         *,
         min_interval: float = _ADAPT_MIN_INTERVAL,
         max_interval: float = _ADAPT_MAX_INTERVAL,
-        growth: float = _ADAPT_GROWTH,
         decay_step: float = _ADAPT_DECAY_STEP,
-        decay_after: int = _ADAPT_DECAY_AFTER,
     ) -> None:
         super().__init__(start)
         self._min = min_interval
         self._max = max_interval
-        self._growth = growth
         self._decay_step = decay_step
-        self._decay_after = decay_after
-        self._clean = 0
+        self._stormed = False
 
     @property
     def interval(self) -> float:
@@ -220,44 +227,60 @@ class AdaptiveRateLimiter(RateLimiter):
         with self._lock:
             return self._interval
 
-    def record_throttled(self, host: str = "") -> None:
-        """Widen the gap: a host just throttled us past its whole retry ladder."""
+    @property
+    def stormed(self) -> bool:
+        """True once any host has persistently throttled us this run."""
         with self._lock:
-            if self._interval >= self._max:
-                self._clean = 0
+            return self._stormed
+
+    @property
+    def next_interval(self) -> float:
+        """The gap to *start next run* with: the ceiling after a storm, else one
+        decay step below where this run ended (floored) — AIMD across runs."""
+        with self._lock:
+            if self._stormed:
+                return self._max
+            return max(self._min, self._interval - self._decay_step)
+
+    def seed(self, interval: float) -> None:
+        """Set the starting gap from persisted cross-run state (clamped to range).
+
+        A gate explicitly disabled (``interval <= 0`` — the test/no-delay sentinel
+        that ``acquire`` also honors) is left disabled: seeding never re-enables a
+        gate a caller has zeroed.
+        """
+        with self._lock:
+            if self._interval <= 0:
                 return
+            self._interval = max(self._min, min(self._max, interval))
+
+    def record_throttled(self, host: str = "") -> None:
+        """A host throttled us past its whole retry ladder.
+
+        Reactive *widening* can't rescue the current run — the per-IP throttle is
+        a penalty box that persists once tripped — so this just (a) guarantees the
+        safe ceiling even on a run started below it on an earned speedup, and
+        (b) flags the run ``stormed`` so ``next_interval`` persists the ceiling for
+        tomorrow instead of decaying. Logged once, on the first throttle of a run.
+        """
+        with self._lock:
+            first = not self._stormed
             prev = self._interval
-            self._interval = min(self._max, self._interval * self._growth)
-            self._clean = 0
-        log.info(
-            "http_util: %s persistently throttled — widening the platform gate "
-            "%.2fs -> %.2fs", host or "a host", prev, self._interval,
-        )
+            self._stormed = True
+            self._interval = self._max
+        if first:
+            log.info(
+                "http_util: %s persistently throttled — holding the platform gate "
+                "at the %.2fs ceiling and flagging the run stormed (was %.2fs)",
+                host or "a host", self._max, prev,
+            )
 
     def acquire(self) -> None:
-        # A zeroed interval is the test/no-delay configuration; skip the whole
-        # feedback loop so a suite that zeroes the gate can't decay-log its way
-        # through thousands of no-op acquisitions.
+        # A zeroed interval is the test/no-delay configuration; skip the sleep so
+        # a suite that zeroes the gate pays nothing.
         if self._interval <= 0:
             return
         super().acquire()
-        self._note_clean()
-
-    def _note_clean(self) -> None:
-        """Count one throttle-free acquisition; decay a step at the threshold."""
-        with self._lock:
-            if self._interval <= self._min:
-                return
-            self._clean += 1
-            if self._clean < self._decay_after:
-                return
-            self._clean = 0
-            prev = self._interval
-            self._interval = max(self._min, self._interval - self._decay_step)
-        log.info(
-            "http_util: %d requests without a persistent throttle — narrowing the "
-            "platform gate %.2fs -> %.2fs", self._decay_after, prev, self._interval,
-        )
 
 
 # Process-global adaptive gate for shared-platform (Shopify) traffic. Owned here
@@ -341,9 +364,10 @@ def get_with_retry(
     # breaker — enough persistent throttles and it trips, so the rest of the
     # host's items skip the ladder above instead of each paying it in full.
     if resp.status_code == 429:
-        # Same signal, second consumer: widen the platform-wide gate. Recorded
-        # for *any* throttling host, not just Shopify ones — a per-IP throttle
-        # shows up wherever we happen to be pointed when it starts.
+        # Same signal, second consumer: snap the platform-wide gate to its ceiling
+        # and flag the run stormed (so tomorrow starts pessimistic). Recorded for
+        # *any* throttling host, not just Shopify ones — a per-IP throttle shows up
+        # wherever we happen to be pointed when it starts.
         #
         # 429 ONLY, deliberately, even though the breaker below acts on 503 too.
         # 503 is ambiguous — most often a shop that is simply broken, and a

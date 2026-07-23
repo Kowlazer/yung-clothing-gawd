@@ -69,6 +69,12 @@ jobs:
           # Never set this locally: full URLs at INFO are the local
           # debugging contract.
           SALE_CHECK_REDACT_LOGS: "1"
+          # Interim stopgap for the 2026-07-21 per-IP rate-limit storm: recover
+          # more 429'd Shopify products through the reader proxy while the
+          # proactive cross-run pacing gate (src/http_util.py) proves out. Kept
+          # modest — the free r.jina.ai tier self-throttles higher, and each
+          # recovery adds latency against the 90-min job cap. Default is 40.
+          PROXY_RATE_LIMIT_MAX_ITEMS: "80"
           WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
