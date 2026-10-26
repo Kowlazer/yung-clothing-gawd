@@ -388,3 +388,21 @@ class TestExtractOrderNumber:
 
     def test_empty(self):
         assert extract_order_number("") is None
+
+    def test_letters_only_candidate_rejected(self):
+        # Marketing-flow "thanks for your order" copy: the word after "order"
+        # is prose, not a number (real case parsed to "COME").
+        assert extract_order_number("Thanks for your order WELCOME back") is None
+        assert extract_order_number("your ordercome see us") is None
+
+    def test_skips_prose_then_finds_real_number(self):
+        body = "Thanks for your order, friend! Order #40917 summary"
+        assert extract_order_number(body) == "40917"
+
+    def test_plain_space_separated_number(self):
+        assert extract_order_number(
+            "Hello, your order 40917 has been received!") == "40917"
+        assert extract_order_number("PeakWear Order 52210 Your order") == "52210"
+
+    def test_word_boundary_ignores_reorder(self):
+        assert extract_order_number("reorder ABCD1 now") is None

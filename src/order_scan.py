@@ -129,6 +129,11 @@ from urllib.parse import (
 )
 
 from src import bodyspec, log_privacy, order_classify
+from src.order_dedupe import (
+    apply_dedupe,
+    dedupe_records_by_order_number,
+    drop_duplicate_orders,
+)
 from src.classify import _NON_CLOTHING_HEADER_RE
 from src.config import Config, load_config
 from src.wardrobe_categories import NON_CLOTHING, normalise_category
@@ -2430,6 +2435,19 @@ def _run_scan(
                 max_emails, len(order_records), len(ship_records),
             )
 
+    # Collapse duplicate confirmations of one order before paying Claude for
+    # them: same shop domain + same order number (vs this batch AND the stored
+    # wardrobe). The dropped emails still count as processed below so they're
+    # never re-fetched. See src/order_dedupe.py.
+    order_records, dup_records = dedupe_records_by_order_number(
+        order_records, wardrobe.get("items") or [],
+    )
+    if dup_records:
+        log.info(
+            "order_scan: skipped %d duplicate order email(s) (same shop + order number)",
+            len(dup_records),
+        )
+
     items: list[dict] = []
     if order_records:
         log.info("order_scan: calling Claude for items extraction")
@@ -2463,12 +2481,26 @@ def _run_scan(
             extracted.get("orders", []), meta_by_id, links_by_id, images_by_id,
         )
 
-        # Stash order_number on the first item per order so shipment
-        # linkage can match by number. Internal-only field; stripped
-        # before persistence.
+        # Stash order_number on every item: ``_order_number`` (internal) lets
+        # shipment linkage match by number; ``order_number`` is persisted so a
+        # re-sent confirmation arriving in a LATER scan is still caught by the
+        # (domain, order number) dedupe above.
         order_number_by_eid = {r["email_id"]: r["order_number"] for r in order_records}
         for it in items:
-            it["_order_number"] = order_number_by_eid.get(it["order_email_id"])
+            num = order_number_by_eid.get(it["order_email_id"])
+            it["_order_number"] = num
+            if num:
+                it["order_number"] = num
+
+        # Fallback for duplicates with no usable order number (e.g. a
+        # marketing-flow "Thanks for your order!" alongside the real receipt):
+        # same shop + identical item list within a few days.
+        items, dropped_orders = drop_duplicate_orders(items, wardrobe.get("items") or [])
+        for dup_eid, kept_eid in dropped_orders:
+            log.info(
+                "order_scan: dropped duplicate order email %s (same items as %s)",
+                dup_eid, kept_eid,
+            )
 
     if ship_records:
         _link_shipments_to_orders(items, ship_records)
@@ -2485,6 +2517,7 @@ def _run_scan(
         other_ids
         + excluded_ids
         + [r["email_id"] for r in order_records]
+        + [r["email_id"] for r in dup_records]
         + [s["email_id"] for s in ship_records]
     )
     return items, processed_ids
@@ -3905,10 +3938,20 @@ def _run_message_scan(
             "purchased_at": pdate,
             "shop": shop,
             "shop_domain": domain,
+            "order_number": extract_order_number(item_body),
             "product_links": _links_for_domain(
                 em.get("product_links") or [], domain),
             "product_images": em.get("product_images") or [],
         })
+
+    order_records, dup_records = dedupe_records_by_order_number(
+        order_records, wardrobe.get("items") or [],
+    )
+    if dup_records:
+        log.info(
+            "order_scan: targeted scrape — skipped %d duplicate order email(s) "
+            "(same shop + order number)", len(dup_records),
+        )
 
     if not order_records:
         return [], processed_ids
@@ -3933,6 +3976,16 @@ def _run_message_scan(
     images_by_id = {r["email_id"]: r.get("product_images") or [] for r in order_records}
     items = _materialise_items(
         extracted.get("orders", []), meta_by_id, links_by_id, images_by_id)
+    number_by_eid = {r["email_id"]: r.get("order_number") for r in order_records}
+    for it in items:
+        if number_by_eid.get(it["order_email_id"]):
+            it["order_number"] = number_by_eid[it["order_email_id"]]
+    items, dropped_orders = drop_duplicate_orders(items, wardrobe.get("items") or [])
+    for dup_eid, kept_eid in dropped_orders:
+        log.info(
+            "order_scan: targeted scrape — dropped duplicate order email %s "
+            "(same items as %s)", dup_eid, kept_eid,
+        )
     log.info("order_scan: targeted scrape — materialised %d item(s)", len(items))
     return items, processed_ids
 
@@ -4027,6 +4080,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "needs BODYSPEC_USERNAME / BODYSPEC_PASSWORD).",
     )
     p.add_argument(
+        "--dedupe-orders", action="store_true",
+        help="Skip scanning; find orders stored twice (the same purchase "
+             "ingested from two confirmation emails), copy any fit review / "
+             "photo / watchlist decision onto the kept copy, and remove the "
+             "duplicate items. Keeps the earliest email's copy. Honors "
+             "--dry-run / SALE_CHECK_DRY_RUN (prints the plan, writes nothing).",
+    )
+    p.add_argument(
         "--classify", action="store_true",
         help="Skip scanning; stamp a durable garment `category` (and derived "
              "`is_clothing`) onto stored items via Claude, so the wardrobe "
@@ -4113,6 +4174,40 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _run_dedupe_orders(cfg: Config, state: dict, wardrobe: dict, *, dry_run: bool) -> int:
+    """``--dedupe-orders``: remove stored duplicate orders (see src/order_dedupe.py)."""
+    before = len(wardrobe["items"])
+    reports = apply_dedupe(wardrobe)
+    if not reports:
+        print("No duplicate orders found.")
+        return 0
+    removed = before - len(wardrobe["items"])
+    print(f"Found {len(reports)} duplicate order(s) — {removed} item(s) to remove:")
+    for r in reports:
+        print(
+            f"\n  {r['shop']}: email {r['duplicate_email_id']} ({r['purchased_at']}) "
+            f"duplicates {r['kept_email_id']} ({r['kept_purchased_at']})"
+        )
+        for name in r["items"]:
+            print(f"    - {name}")
+        for item_id, fields in r["carried"].items():
+            print(f"    carried onto kept item {item_id}: {', '.join(fields)}")
+    if dry_run:
+        print("\nDRY RUN — nothing written. Re-run without SALE_CHECK_DRY_RUN / --dry-run to apply.")
+        return 0
+    log.info("order_scan: writing wardrobe to gist")
+    write_state(
+        cfg.gist_id,
+        cfg.github_token,
+        prices=state.get("prices") or {},
+        aliases=state.get("aliases") or {},
+        codes=state.get("codes") or [],
+        wardrobe=wardrobe,
+    )
+    print(f"\nRemoved {removed} duplicate item(s).")
+    return 0
+
+
 def _is_dry_run(cli_flag: bool) -> bool:
     if cli_flag:
         return True
@@ -4135,6 +4230,11 @@ def run(argv: list[str] | None = None, cfg: Config | None = None) -> int:
     dropped = _drop_excluded_items(wardrobe, cfg.excluded_shops)
     if dropped:
         log.info("order_scan: dropped %d item(s) from excluded shops", dropped)
+
+    # Duplicate-order cleanup is its own mode — pure wardrobe rewrite, no Gmail,
+    # no Claude. Short-circuit before any scanning happens.
+    if args.dedupe_orders:
+        return _run_dedupe_orders(cfg, state, wardrobe, dry_run=dry_run)
 
     # Category classification backfill is its own mode — never touches Gmail or
     # the interactive passes. Short-circuit before any scanning happens.

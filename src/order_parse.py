@@ -464,9 +464,10 @@ def extract_tracking_url(body: str) -> str | None:
 # to link a shipping email back to its original order email when both
 # bodies mention the same number.
 _ORDER_NUMBER_RE = re.compile(
-    r"order\s*(?:#|number|id|no\.?)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-]{3,})",
+    r"\border\s*(?:#|number|id|no\.?)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-]{3,})",
     re.I,
 )
+_DIGIT_RE = re.compile(r"\d")
 
 
 def extract_order_number(body: str) -> str | None:
@@ -475,11 +476,20 @@ def extract_order_number(body: str) -> str | None:
     Looks for "Order #..." / "Order number: ..." / "Order ID ..." with a
     minimum 4-character alphanumeric suffix to filter out false matches
     like "Order #1" or "Order: us" headings. Used to link shipping
-    emails back to their original order.
+    emails back to their original order, and (since 2026-10) as the key
+    that collapses duplicate confirmations of one order in ``order_scan``.
+
+    A candidate must contain at least one **digit**. Every real order number
+    seen in the wild does, while prose that happens to follow the word
+    "order" doesn't — a marketing-flow "Thanks for your order!" email
+    (seen live 2026-08) parsed to ``"COME"``, which as a dedupe
+    key could merge unrelated orders. Letter-only candidates are skipped and
+    the search continues, so a later real "Order #1234" still wins.
     """
     if not body:
         return None
-    m = _ORDER_NUMBER_RE.search(body)
-    if not m:
-        return None
-    return m.group(1).upper()
+    for m in _ORDER_NUMBER_RE.finditer(body):
+        candidate = m.group(1)
+        if _DIGIT_RE.search(candidate):
+            return candidate.upper()
+    return None
