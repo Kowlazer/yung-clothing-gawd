@@ -742,10 +742,12 @@ function shopColor(shop){ let h=0; for(const ch of (shop||'')) h=(h*31+ch.charCo
 
 // Placeable [start,end] span (local midnights) for a sale on the grid, or null
 // when it carries no date at all (→ agenda strip). An end-only "active" sale
-// runs today→end; a start-only "upcoming" sale is a single-day marker.
+// runs today→end (or sits on its end day when it ended yesterday and is only
+// still listed via the grace day); a start-only "upcoming" sale is a
+// single-day marker.
 function saleSpan(e, today){
   const s0 = calParseISO(e.starts_on), e0 = calParseISO(e.ends_on);
-  const s = s0 || (e0 ? today : null);
+  const s = s0 || (e0 ? (e0 < today ? e0 : today) : null);
   let end = e0 || s0;
   if(!s || !end) return null;
   if(end < s) end = s;                 // guard a mis-resolved end before start
