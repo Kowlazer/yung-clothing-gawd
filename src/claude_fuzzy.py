@@ -51,7 +51,9 @@ Output:
                            "status": yes|no|unclear,
                            "description": str|None,
                            "starts_on": str|None,    # ISO YYYY-MM-DD
-                           "ends_on": str|None}],
+                           "ends_on": str|None,
+                           "discount_pct": float|None,
+                           "sitewide": bool|None}],
         "unresolved":    [str, ...],   # shop names where no candidates surfaced
         "shop_verdicts": [{"shop", "hash", "status", "description"}],
                           # fresh homepage verdicts judged this run (cache
@@ -599,7 +601,25 @@ sale ends.
 
 Only resolve dates you can actually ground in the email's wording — never
 guess a window. Both fields are null for "no" / "unclear", and for "yes"
-emails that give no dates at all.
+emails that give no dates at all. An "extended!" / "last chance" email for a
+sale that's already running is still "yes" — give its new end date.
+
+## Discount (`discount_pct` / `sitewide`)
+
+For "yes" emails, also return the headline discount so the tool can estimate
+prices on the user's watchlist items:
+
+  - discount_pct: the headline percentage off as a number (30 for "30% off").
+                  For "up to 70% off" use 70. Null when the offer has no
+                  percentage (dollar-off, BOGO, free shipping, gift with
+                  purchase, fixed-price deals like "$12 leggings").
+  - sitewide:     true ONLY when that percentage applies to (nearly)
+                  everything — "sitewide", "storewide", "everything",
+                  "entire order", "all orders". False for "up to X%",
+                  "select styles", a named category or collection, or
+                  member-only pricing. Null when there's no percentage.
+
+Both are null for "no" / "unclear".
 
 # Identifiers
 
@@ -684,6 +704,10 @@ TOOL_SCHEMA: dict[str, Any] = {
                                       "description": "ISO YYYY-MM-DD; first active day, or null"},
                         "ends_on": {"type": ["string", "null"],
                                     "description": "ISO YYYY-MM-DD; last active day, or null"},
+                        "discount_pct": {"type": ["number", "null"],
+                                         "description": "headline % off (30 for 30% off), or null"},
+                        "sitewide": {"type": ["boolean", "null"],
+                                     "description": "true only if the % applies to (nearly) everything"},
                     },
                     "required": ["id", "email_id", "shop", "status"],
                 },

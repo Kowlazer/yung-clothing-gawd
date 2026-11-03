@@ -952,26 +952,102 @@ def _email_sale_countdown(entry: dict, today: date) -> str:
     return f"{verb} {rel} ({on.strftime('%a %b %d')})"
 
 
+# Per-shop caps under an announced sale, so a chatty shop or a big watchlist
+# can't swamp the section on a Black Friday day.
+_MAX_EXTRA_OFFERS = 3
+_MAX_SALE_ITEMS = 6
+
+
+def _shop_key(shop: str | None) -> str:
+    return "".join(ch for ch in (shop or "").lower() if ch.isalnum())
+
+
+def _announced_item_line(item: dict, group: dict, fx_rates: dict | None) -> str:
+    """One watchlist item under a shop's announced sale (issue #34).
+
+    Estimates the sale price only for a clear sitewide percentage on an item
+    that's in stock and not already marked down (a sitewide % often doesn't
+    stack on markdowns). Everything else gets today's price alone; the next
+    run's page check shows the real price either way.
+    """
+    r = item["result"]
+    entry = r.get("updated_entry") or r.get("last_known") or {}
+    head = f"[{_label(item)}]({item['url']})"
+    price = entry.get("current_price")
+    if price is None:
+        return head
+    currency = entry.get("currency")
+    shown = _fmt_price(price, currency, fx_rates)
+    if entry.get("in_stock") is False:
+        return f"{head} — {shown} (out of stock)"
+    original = entry.get("original_price")
+    if original is not None and original > price:
+        was = _fmt_price(original, currency, fx_rates)
+        return f"{head} — {shown}, already marked down from {was}"
+    pct = group.get("discount_pct")
+    if group.get("sitewide") is True and pct:
+        estimate = _fmt_price(round(price * (1 - pct / 100), 2), currency, fx_rates)
+        return f"{head} — {shown} → ~{estimate} at {pct:g}% off"
+    return f"{head} — {shown}"
+
+
 def _email_sales_section(
-    active_sales: list[dict], today: date | None = None,
+    active_sales: list[dict],
+    today: date | None = None,
+    items: list[dict] | None = None,
+    fx_rates: dict | None = None,
 ) -> str | None:
     """Sales announced by email/SMS, persisted until they end (src/email_sales.py).
 
-    Rendered upcoming-first (the caller pre-sorts) so the user sees what's
-    coming before what's already live. Each line carries the shop, the terse
-    description, and a countdown when a date is known.
+    One line per shop (``email_sales.group_by_shop``, issue #33), upcoming-first
+    so the user sees what's coming before what's already live. Each line
+    carries the shop, the best offer, and a countdown when a date is known;
+    nested under it are the shop's other distinct offers, then the user's
+    watchlist items at the shop, each with an estimated price (issue #34).
     """
     if not active_sales:
         return None
     today = today or datetime.now(timezone.utc).date()
+    items_by_shop: dict[str, list[dict]] = {}
+    for i in items or []:
+        if i.get("is_uncertain") or not i.get("shop"):
+            continue
+        items_by_shop.setdefault(_shop_key(i["shop"]), []).append(i)
+
     lines: list[str] = []
-    for e in active_sales:
-        shop = (e.get("shop") or "(unknown shop)").strip()
-        desc = (e.get("description") or "").strip()
-        countdown = _email_sale_countdown(e, today)
+    for g in email_sales.group_by_shop(active_sales, today):
+        shop = g["shop"] or "(unknown shop)"
+        desc = (g.get("description") or "").strip()
+        countdown = _email_sale_countdown(g, today)
         head = f"**{shop}**: {desc}" if desc else f"**{shop}**"
         lines.append(f"- {head} — {countdown}" if countdown else f"- {head}")
+
+        offers = g["offers"]
+        for o in offers[:_MAX_EXTRA_OFFERS]:
+            text = f"also: {(o.get('description') or '').strip() or 'another offer'}"
+            when = _email_sale_countdown(o, today)
+            lines.append(f"  - {text} — {when}" if when else f"  - {text}")
+        more = len(offers) - _MAX_EXTRA_OFFERS
+        if more > 0:
+            lines.append(f"  - +{more} more offer{'s' if more != 1 else ''}")
+
+        shop_items = sorted(
+            items_by_shop.get(_shop_key(shop), []),
+            key=lambda i: (_item_in_stock(i) is False, _label(i).lower()),
+        )
+        for i in shop_items[:_MAX_SALE_ITEMS]:
+            lines.append(f"  - {_announced_item_line(i, g, fx_rates)}")
+        more = len(shop_items) - _MAX_SALE_ITEMS
+        if more > 0:
+            lines.append(
+                f"  - +{more} more watchlist item{'s' if more != 1 else ''} from {shop}"
+            )
     return _section("Sales announced by email", lines)
+
+
+def _item_in_stock(item: dict) -> bool | None:
+    r = item["result"]
+    return (r.get("updated_entry") or r.get("last_known") or {}).get("in_stock")
 
 
 def _possible_email_sales_section(unclear_sales: list[dict]) -> str | None:
@@ -1506,7 +1582,7 @@ def build_digest(data: dict) -> str:
     sections: list[str | None] = [
         priority_section,
         _shops_on_sale_section(clothing_shop_sales),
-        _email_sales_section(email_sale_announcements, today),
+        _email_sales_section(email_sale_announcements, today, items, fx_rates),
         _possible_email_sales_section(email_unclear),
         _untracked_sms_section(untracked_sms),
         _section("Items on sale (specific URLs)", cl["on_sale"]),

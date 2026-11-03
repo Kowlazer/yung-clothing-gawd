@@ -82,6 +82,8 @@ _SECTION_KIND = (
     ("sales announced by email", "drop"),
 )
 
+_SUB_ITEM_STYLE = "margin:2px 0 2px 1.4em;list-style:circle;font-size:0.95em;color:#444;"
+
 _PILL_BASE = (
     "display:inline-block;font-size:11px;font-weight:800;letter-spacing:.04em;"
     "text-transform:uppercase;padding:2px 7px;border-radius:4px;margin-right:6px;"
@@ -166,6 +168,11 @@ def markdown_to_html(md: str) -> str:
                 html_lines.append("<ul>")
                 in_list = True
             content = stripped[2:]
+            if line.startswith("  "):
+                # Indented bullet = a detail under the line above (the offers
+                # and watchlist items under an announced sale).
+                html_lines.append(f'  <li style="{_SUB_ITEM_STYLE}">{_inline(content)}</li>')
+                continue
             attr = ""
             prefix = ""
             for marker, (kind, label) in _BADGE_BY_MARKER.items():

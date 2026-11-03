@@ -722,27 +722,36 @@ def build_sales_section(
 
     ``entries`` is the raw ``email_sales.json`` list (as read from the Gist).
     Reuses ``src/email_sales.py`` — the same pure logic the daily digest uses —
-    to drop expired announcements and order them upcoming-first, then annotates
-    each with its countdown ``phase`` / ``days`` / label. The frontend places
-    dated ones on the month grid and lists undated/active ones in the agenda
-    strip below it.
+    to drop expired announcements and fold them into one row per shop
+    (``group_by_shop``, issue #33), ordered upcoming-first, then annotates each
+    with its countdown ``phase`` / ``days`` / label. The frontend places dated
+    ones on the month grid and lists undated/active ones in the agenda strip
+    below it.
 
     Returns ``{"today": iso, "entries": [{shop, description, starts_on,
-    ends_on, phase, days, countdown}, ...]}`` — an empty entries list when
-    nothing is active (the tab then shows an empty month with an empty agenda).
+    ends_on, phase, days, countdown, offers: [{description, countdown}]},
+    ...]}`` — an empty entries list when nothing is active (the tab then shows
+    an empty month with an empty agenda).
     """
     today = today or datetime.now(timezone.utc).date()
     out: list[dict] = []
-    for e in email_sales.active(entries or [], today):
-        phase, days, _on = email_sales.relative_days(e, today)
+    for g in email_sales.group_by_shop(entries or [], today):
+        phase, days, _on = email_sales.relative_days(g, today)
         out.append({
-            "shop": (e.get("shop") or "").strip() or "(unknown shop)",
-            "description": (e.get("description") or "").strip(),
-            "starts_on": e.get("starts_on"),
-            "ends_on": e.get("ends_on"),
+            "shop": g["shop"] or "(unknown shop)",
+            "description": (g.get("description") or "").strip(),
+            "starts_on": g.get("starts_on"),
+            "ends_on": g.get("ends_on"),
             "phase": phase,
             "days": days,
-            "countdown": _sales_countdown(e, today),
+            "countdown": _sales_countdown(g, today),
+            "offers": [
+                {
+                    "description": (o.get("description") or "").strip(),
+                    "countdown": _sales_countdown(o, today),
+                }
+                for o in g["offers"]
+            ],
         })
     return {"today": today.isoformat(), "entries": out}
 

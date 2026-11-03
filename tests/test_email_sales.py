@@ -233,3 +233,101 @@ class TestRelativeDays:
         phase, days, on = email_sales.relative_days(
             self._entry(starts_on="2026-05-17"), _TODAY)
         assert phase == "active"
+
+
+# ---------------------------------------------------------------------------
+# discount fields + one row per shop (issue #33)
+# ---------------------------------------------------------------------------
+
+def _e(shop, desc, *, starts=None, ends=None, pct=None, sitewide=None,
+       seen="2026-05-19T10:00:00+00:00", eid=None):
+    return {"shop": shop, "email_id": eid or desc, "status": "yes",
+            "description": desc, "starts_on": starts, "ends_on": ends,
+            "discount_pct": pct, "sitewide": sitewide,
+            "first_seen": seen, "last_seen": seen}
+
+
+class TestUpsertDiscount:
+    def test_discount_fields_persisted(self):
+        out = email_sales.upsert([], [
+            {"email_id": "m1", "shop": "Aniqi", "status": "yes",
+             "description": "30% off sitewide", "discount_pct": 30, "sitewide": True},
+        ], _NOW)
+        assert out[0]["discount_pct"] == 30.0
+        assert out[0]["sitewide"] is True
+
+    def test_insane_pct_and_non_bool_sitewide_dropped(self):
+        out = email_sales.upsert([], [
+            {"email_id": "m1", "shop": "A", "status": "yes", "discount_pct": 150, "sitewide": True},
+            {"email_id": "m2", "shop": "B", "status": "yes", "discount_pct": 20, "sitewide": "yes"},
+            {"email_id": "m3", "shop": "C", "status": "yes", "discount_pct": None, "sitewide": True},
+        ], _NOW)
+        assert (out[0]["discount_pct"], out[0]["sitewide"]) == (None, None)
+        assert (out[1]["discount_pct"], out[1]["sitewide"]) == (20.0, None)
+        # sitewide means nothing without a percentage.
+        assert (out[2]["discount_pct"], out[2]["sitewide"]) == (None, None)
+
+
+class TestGroupByShop:
+    def test_one_row_per_shop_best_offer_leads(self):
+        groups = email_sales.group_by_shop([
+            _e("Fabletics", "$12 leggings"),
+            _e("Fabletics", "Up to 80% off select styles", pct=80, sitewide=False),
+            _e("fabletics", "40% off sitewide", pct=40, sitewide=True),
+            _e("Aniqi", "20% off", pct=20, sitewide=True),
+        ], _TODAY)
+        assert [g["shop"] for g in groups] == ["Aniqi", "fabletics"]
+        fab = groups[1]
+        assert fab["description"] == "40% off sitewide"
+        assert fab["sitewide"] is True and fab["discount_pct"] == 40
+        assert [o["description"] for o in fab["offers"]] == [
+            "Up to 80% off select styles", "$12 leggings",
+        ]
+        assert fab["emails"] == 3
+
+    def test_extension_moves_end_and_repeat_collapses(self):
+        groups = email_sales.group_by_shop([
+            _e("Wooj", "BF 30% off sitewide, ends Sunday", ends="2026-05-24",
+               pct=30, sitewide=True, seen="2026-05-18T10:00:00+00:00"),
+            _e("Wooj", "EXTENDED! 30% off everything through Monday", ends="2026-05-25",
+               pct=30, sitewide=True, seen="2026-05-19T10:00:00+00:00"),
+        ], _TODAY)
+        assert len(groups) == 1
+        g = groups[0]
+        assert g["ends_on"] == "2026-05-25"
+        assert g["offers"] == []
+        # The newest sighting of the same offer leads.
+        assert g["description"].startswith("EXTENDED!")
+        assert email_sales.relative_days(g, _TODAY)[0] == "ending"
+
+    def test_same_wording_collapses_without_pct(self):
+        groups = email_sales.group_by_shop([
+            _e("Otishi", "Sale on now!", eid="a"),
+            _e("Otishi", "sale on now", eid="b"),
+        ], _TODAY)
+        assert groups[0]["offers"] == []
+
+    def test_upcoming_rides_along_while_live(self):
+        groups = email_sales.group_by_shop([
+            _e("Aniqi", "15% off now", pct=15, sitewide=True),
+            _e("Aniqi", "Black Friday 40% off", starts="2026-05-22",
+               ends="2026-05-25", pct=40, sitewide=True),
+        ], _TODAY)
+        g = groups[0]
+        # The live offer leads even though the upcoming one is bigger.
+        assert g["description"] == "15% off now"
+        assert g["starts_on"] is None and g["ends_on"] is None
+        assert g["offers"][0]["starts_on"] == "2026-05-22"
+
+    def test_upcoming_only_group_spans_its_offers(self):
+        groups = email_sales.group_by_shop([
+            _e("Aniqi", "Early access", starts="2026-05-21"),
+            _e("Aniqi", "BF 40% off", starts="2026-05-22", ends="2026-05-25",
+               pct=40, sitewide=True),
+        ], _TODAY)
+        g = groups[0]
+        assert (g["starts_on"], g["ends_on"]) == ("2026-05-21", "2026-05-25")
+        assert email_sales.relative_days(g, _TODAY) == ("upcoming", 2, date(2026, 5, 21))
+
+    def test_expired_entries_excluded(self):
+        assert email_sales.group_by_shop([_e("Gone", "old", ends="2026-05-10")], _TODAY) == []

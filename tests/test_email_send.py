@@ -156,3 +156,12 @@ class TestSendEmailValidation:
     def test_empty_body_raises(self):
         with pytest.raises(EmailSendError, match="empty"):
             send_email("key", "a@b.com", "c@d.com", "subj", "   \n  ")
+
+
+def test_indented_bullet_renders_as_sub_item():
+    html = markdown_to_html(
+        "## Sales announced by email\n- **Aniqi**: 30% off\n  - also: free tote\n"
+    )
+    assert "<li><strong>Aniqi</strong>: 30% off</li>" in html
+    assert "list-style:circle" in html and "also: free tote</li>" in html
+    assert html.count("<ul>") == 1

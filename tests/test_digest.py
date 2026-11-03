@@ -2027,3 +2027,79 @@ class TestPriceStandingNote:
         out = build_digest({"items": [_item(price_standing=_standing())]})
         assert "## All items by shop" in out
         assert "lowest in 94d" not in out
+
+
+class TestEmailSalesGroupedWithItems:
+    """One line per shop (#33) with watchlist items + estimates under it (#34)."""
+    _TODAY = date(2026, 5, 19)
+
+    def _sale(self, desc, **kw):
+        return {"shop": "Aniqi", "description": desc, "starts_on": None,
+                "ends_on": None, "discount_pct": None, "sitewide": None, **kw}
+
+    def _entry(self, **kw):
+        return {"label": "Cool Shirt", "current_price": 48.0, "original_price": None,
+                "currency": "USD", "in_stock": True, **kw}
+
+    def _section(self, sales, items):
+        out = build_digest({"email_sales": sales, "items": items, "today": self._TODAY})
+        return out.split("## Sales announced by email")[1].split("\n## ")[0]
+
+    def test_overlapping_emails_render_one_shop_line(self):
+        sec = self._section([
+            self._sale("30% off sitewide", discount_pct=30, sitewide=True),
+            self._sale("30% off everything, last chance!", discount_pct=30, sitewide=True),
+            self._sale("Free tote with $100"),
+        ], [])
+        assert sec.count("**Aniqi**") == 1
+        assert "  - also: Free tote with $100" in sec
+        assert "last chance" not in sec
+
+    def test_sitewide_pct_estimates_price(self):
+        sec = self._section(
+            [self._sale("30% off sitewide", discount_pct=30, sitewide=True)],
+            [_item(url="https://aniqi.example/products/tee", shop="aniqi",
+                   updated_entry=self._entry())],
+        )
+        assert ("  - [Cool Shirt](https://aniqi.example/products/tee)"
+                " — $48 → ~$33.60 at 30% off") in sec
+
+    def test_no_estimate_for_partial_or_oos(self):
+        sec = self._section(
+            [self._sale("Up to 50% off", discount_pct=50, sitewide=False)],
+            [_item(url="https://a.example/2", shop="Aniqi",
+                   updated_entry=self._entry(label="Gone", in_stock=False)),
+             _item(url="https://a.example/1", shop="Aniqi",
+                   updated_entry=self._entry(label="Plain"))],
+        )
+        assert "[Plain](https://a.example/1) — $48\n" in sec + "\n"
+        assert "→" not in sec
+        assert "[Gone](https://a.example/2) — $48 (out of stock)" in sec
+        # In-stock items list before out-of-stock ones.
+        assert sec.index("Plain") < sec.index("Gone")
+
+    def test_no_estimate_when_already_marked_down(self):
+        sec = self._section(
+            [self._sale("30% off sitewide", discount_pct=30, sitewide=True)],
+            [_item(url="https://a.example/3", shop="Aniqi",
+                   updated_entry=self._entry(label="Marked", current_price=40.0,
+                                             original_price=60.0))],
+        )
+        assert "— $40, already marked down from $60" in sec
+        assert "→" not in sec
+
+    def test_other_shops_and_uncertain_items_not_listed(self):
+        sec = self._section(
+            [self._sale("30% off sitewide", discount_pct=30, sitewide=True)],
+            [_item(url="https://o.example/1", shop="Other"),
+             _item(url="https://a.example/1", shop="Aniqi", is_uncertain=True)],
+        )
+        assert "o.example" not in sec and "a.example" not in sec
+
+    def test_item_list_capped(self):
+        items = [_item(url=f"https://a.example/{n}", shop="Aniqi",
+                       updated_entry=self._entry(label=f"Tee {n:02d}"))
+                 for n in range(9)]
+        sec = self._section([self._sale("Sale")], items)
+        assert sec.count("a.example") == 6
+        assert "  - +3 more watchlist items from Aniqi" in sec

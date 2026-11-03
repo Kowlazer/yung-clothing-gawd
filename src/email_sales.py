@@ -22,9 +22,16 @@ Persisted entry shape (one per announcement, file ``email_sales.json``)::
       "description": "Memorial Day sale, 30% off sitewide" | null,
       "starts_on": "2026-05-24" | null,    # resolved by Claude, ISO date
       "ends_on":   "2026-05-26" | null,
+      "discount_pct": 30.0 | null,         # headline % off, by Claude
+      "sitewide": true | false | null,     # % applies to (nearly) everything
       "first_seen": "<iso ts>",
       "last_seen":  "<iso ts>"
     }
+
+Storage stays one entry per email, but a shop that sends "early access" →
+"it's live" → "extended!" → "last chance" would otherwise render four
+overlapping lines, so ``group_by_shop`` folds the active entries into one
+row per shop for display (issue #33).
 
 Lifecycle rules (all pure, ``today`` is a ``datetime.date``):
 
@@ -75,6 +82,24 @@ def _norm_date_str(value: str | None) -> str | None:
     """Normalise an incoming date to a canonical ``YYYY-MM-DD`` string or None."""
     d = _parse_date(value)
     return d.isoformat() if d else None
+
+
+def _norm_pct(value) -> float | None:
+    """A sane headline percentage (0 < pct < 100) or None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not 0 < pct < 100:
+        return None
+    return round(pct, 1)
+
+
+def _norm_sitewide(value) -> bool | None:
+    """Strict tri-state: only a real bool counts (a stray "yes" string doesn't)."""
+    return value if isinstance(value, bool) else None
 
 
 def _effective_end(entry: dict) -> date | None:
@@ -144,6 +169,8 @@ def upsert(prior: list[dict], judged: list[dict], now_iso: str) -> list[dict]:
         desc = (j.get("description") or "").strip() or None
         starts = _norm_date_str(j.get("starts_on"))
         ends = _norm_date_str(j.get("ends_on"))
+        pct = _norm_pct(j.get("discount_pct"))
+        sitewide = _norm_sitewide(j.get("sitewide")) if pct is not None else None
         k = (shop.lower(), email_id)
         if k in index:
             e = out[index[k]]
@@ -154,6 +181,9 @@ def upsert(prior: list[dict], judged: list[dict], now_iso: str) -> list[dict]:
                 e["starts_on"] = starts
             if ends:
                 e["ends_on"] = ends
+            if pct is not None:
+                e["discount_pct"] = pct
+                e["sitewide"] = sitewide
         else:
             out.append({
                 "shop": shop,
@@ -162,6 +192,8 @@ def upsert(prior: list[dict], judged: list[dict], now_iso: str) -> list[dict]:
                 "description": desc,
                 "starts_on": starts,
                 "ends_on": ends,
+                "discount_pct": pct,
+                "sitewide": sitewide,
                 "first_seen": now_iso,
                 "last_seen": now_iso,
             })
@@ -259,3 +291,96 @@ def relative_days(
     if eff is not None and eff >= today:
         return ("ending", (eff - today).days, eff)
     return ("active", None, None)
+
+
+# ---------------------------------------------------------------------------
+# One row per shop (issue #33)
+# ---------------------------------------------------------------------------
+
+def _offer_rank(entry: dict) -> tuple:
+    """Higher is better: a sitewide % beats an "up to"/category %, then the
+    bigger %, then the newest sighting."""
+    pct = entry.get("discount_pct") or 0
+    sitewide = 1 if (entry.get("sitewide") is True and pct) else 0
+    return (sitewide, pct, str(entry.get("last_seen") or ""))
+
+
+def _desc_key(entry: dict) -> str:
+    text = (entry.get("description") or "").lower()
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in text).split())
+
+
+def _same_offer(a: dict, b: dict) -> bool:
+    """Two emails restating one offer: same known % and scope, or the same
+    wording. "Extended!" / "last chance" repeats collapse here; their later end
+    date is already folded into the group window."""
+    pct = a.get("discount_pct")
+    if pct is not None and pct == b.get("discount_pct") and a.get("sitewide") == b.get("sitewide"):
+        return True
+    da = _desc_key(a)
+    return bool(da) and da == _desc_key(b)
+
+
+def _build_group(entries: list[dict], today: date) -> dict:
+    ongoing = [e for e in entries if relative_days(e, today)[0] != "upcoming"]
+    upcoming = [e for e in entries if relative_days(e, today)[0] == "upcoming"]
+    # The window describes what's live now when anything is; an upcoming sale
+    # at the same shop rides along as an extra offer with its own countdown.
+    primary = ongoing or upcoming
+    ranked = sorted(primary, key=_offer_rank, reverse=True)
+    head = ranked[0]
+
+    ends = [d for d in (_parse_date(e.get("ends_on")) for e in primary) if d]
+    if ongoing:
+        starts_on = None
+    else:
+        starts = [d for d in (_parse_date(e.get("starts_on")) for e in primary) if d]
+        starts_on = min(starts).isoformat() if starts else None
+
+    offers: list[dict] = []
+    seen = [head]
+    rest = ranked[1:] + sorted(
+        upcoming if ongoing else [],
+        key=lambda e: _parse_date(e.get("starts_on")) or date.max,
+    )
+    for e in rest:
+        if any(_same_offer(e, s) for s in seen):
+            continue
+        seen.append(e)
+        offers.append({
+            "description": e.get("description"),
+            "starts_on": e.get("starts_on"),
+            "ends_on": e.get("ends_on"),
+            "discount_pct": e.get("discount_pct"),
+            "sitewide": e.get("sitewide"),
+        })
+
+    return {
+        "shop": (head.get("shop") or "").strip(),
+        "description": head.get("description"),
+        "discount_pct": head.get("discount_pct"),
+        "sitewide": head.get("sitewide"),
+        "starts_on": starts_on,
+        "ends_on": max(ends).isoformat() if ends else None,
+        "offers": offers,
+        "emails": len(entries),
+    }
+
+
+def group_by_shop(entries: list[dict], today: date | None = None) -> list[dict]:
+    """Fold the active announcements into one display row per shop.
+
+    Each row carries the best offer as its ``description`` / ``discount_pct`` /
+    ``sitewide`` (see ``_offer_rank``), a window spanning the live offers
+    (latest ``ends_on`` wins, so "extended to Monday" just moves the end), and
+    ``offers``: the shop's other distinct offers, upcoming ones last. A row has
+    the same ``starts_on`` / ``ends_on`` keys as an entry, so ``relative_days``
+    and ``_sort_key`` work on it unchanged. Ordered upcoming-first like
+    ``active``.
+    """
+    today = _today(today)
+    by_shop: dict[str, list[dict]] = {}
+    for e in active(entries, today):
+        by_shop.setdefault((e.get("shop") or "").strip().lower(), []).append(e)
+    groups = [_build_group(es, today) for es in by_shop.values()]
+    return sorted(groups, key=lambda g: _sort_key(g, today))

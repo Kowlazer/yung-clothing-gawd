@@ -1439,3 +1439,19 @@ def test_build_payload_uses_stored_categories():
     assert p["stats"]["hidden_non_clothing"] == 1
     cats = {c["key"] for c in p["categories"]}
     assert cats == {"tshirt"}          # no "other" bucket
+
+
+def test_build_sales_section_one_row_per_shop_with_offers():
+    today = date(2026, 5, 20)
+    seen = "2026-05-20T00:00:00+00:00"
+    entries = [
+        {"shop": "Fabletics", "email_id": "a", "status": "yes",
+         "description": "$12 leggings", "last_seen": seen},
+        {"shop": "Fabletics", "email_id": "b", "status": "yes",
+         "description": "40% off sitewide", "discount_pct": 40, "sitewide": True,
+         "last_seen": seen},
+    ]
+    out = wb.build_sales_section(entries, today)["entries"]
+    assert len(out) == 1
+    assert out[0]["description"] == "40% off sitewide"
+    assert out[0]["offers"] == [{"description": "$12 leggings", "countdown": ""}]

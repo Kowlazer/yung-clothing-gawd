@@ -262,6 +262,8 @@
   .ag-shop { font-weight: 600; flex: none; }
   .ag-desc { color: var(--muted); font-size: 13.5px; flex: 1; min-width: 0;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ag-offer { display: block; font-size: 12.5px; opacity: .85; padding-top: 2px;
+    overflow: hidden; text-overflow: ellipsis; }
   .ag-badge { font-size: 11.5px; font-weight: 600; color: #059669;
     background: color-mix(in srgb, #059669 14%, transparent);
     padding: 2px 9px; border-radius: 999px; flex: none; }
@@ -821,7 +823,8 @@ function weekRow(days, m, today, dated){
   }
   const barsHtml = bars.map(b => {
     const col = shopColor(b.e.shop);
-    const tip = b.e.shop + (b.e.description ? ' · ' + b.e.description : '') + (b.e.countdown ? ' — ' + b.e.countdown : '');
+    const tip = b.e.shop + (b.e.description ? ' · ' + b.e.description : '') + (b.e.countdown ? ' — ' + b.e.countdown : '')
+      + (b.e.offers||[]).map(o => '\nalso: ' + o.description + (o.countdown ? ' — ' + o.countdown : '')).join('');
     const cls = 'cal-bar' + (b.startsHere?' s':'') + (b.endsHere?' e':'');
     return `<div class="${cls}" style="grid-column:${b.cs+1}/${b.ce+2};grid-row:${b.lane+1};--c:${col}" title="${esc(tip)}"><span>${esc(b.e.shop)}</span></div>`;
   }).join('');
@@ -842,7 +845,9 @@ function agendaStrip(undated, totalCount){
     `<div class="ag-row">`
     + `<span class="ag-dot" style="background:${shopColor(e.shop)}"></span>`
     + `<span class="ag-shop">${esc(e.shop)}</span>`
-    + `<span class="ag-desc">${esc(e.description||'')}</span>`
+    + `<span class="ag-desc">${esc(e.description||'')}`
+    + (e.offers||[]).map(o => `<span class="ag-offer">also: ${esc(o.description)}${o.countdown ? ' — ' + esc(o.countdown) : ''}</span>`).join('')
+    + `</span>`
     + `<span class="ag-badge">Live now</span>`
     + `</div>`).join('');
   return `<section class="cal-agenda">`
